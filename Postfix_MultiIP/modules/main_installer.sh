@@ -105,6 +105,11 @@ setup_opendkim "$DOMAIN_NAME"          # 6. Setup DKIM
     # Setup web and SSL
     setup_nginx "$DOMAIN_NAME" "$HOSTNAME"
     
+    # Now setup DNS (which will add DKIM to Cloudflare)
+    if [ ! -z "$CLOUDFLARE_API_KEY" ]; then
+    setup_cloudflare_dns "$DOMAIN_NAME"  # This will now have DKIM ready
+    fi
+
     if [ ! -z "$CF_API_TOKEN" ]; then
         create_multi_ip_dns_records "$DOMAIN_NAME" "$HOSTNAME"
     fi
