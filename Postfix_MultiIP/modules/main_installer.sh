@@ -94,13 +94,12 @@ first_time_installation_multi_ip() {
         configure_network_interfaces
     fi
     
-    # Setup components
-    setup_mysql_database
-    add_domain_and_user "$DOMAIN_NAME" "$MAIL_USERNAME" "$MAIL_PASSWORD" "$PRIMARY_IP"
-    setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"
-    create_ip_rotation_config
-    setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"
-    setup_opendkim "$DOMAIN_NAME"
+setup_mysql_database                    # 1. First - Install MySQL & postfix-mysql
+add_domain_and_user "$DOMAIN_NAME" "$MAIL_USERNAME" "$MAIL_PASSWORD" "$PRIMARY_IP"  # 2. Add data to MySQL
+setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"  # 3. Setup Dovecot (uses MySQL)
+setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"  # 4. NOW setup Postfix (MySQL is ready)
+create_ip_rotation_config               # 5. Configure IP rotation for Postfix
+setup_opendkim "$DOMAIN_NAME"          # 6. Setup DKIM
     
     # Setup web and SSL
     setup_nginx "$DOMAIN_NAME" "$HOSTNAME"
