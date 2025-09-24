@@ -71,6 +71,7 @@ modules=(
     "mailwizz_integration.sh"
     "utility_scripts.sh"
     "main_installer.sh"
+    "main_installer_part2.sh"
 )
 
 for module in "${modules[@]}"; do
