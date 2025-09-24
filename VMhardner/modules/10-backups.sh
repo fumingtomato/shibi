@@ -1,32 +1,46 @@
 #!/bin/bash
-# VM Host Hardening - VM Backup Configuration Module
+# Module: 10-backups.sh - VM Backup Configuration
+# Part of VM Host Hardening Script
+
+# Source common functions
+if [ -f "$(dirname "$0")/00-common.sh" ]; then
+    source "$(dirname "$0")/00-common.sh"
+else
+    echo "Error: Could not find common functions file"
+    exit 1
+fi
 
 configure_backups() {
     print_header "VM Backup Configuration"
     
-    # Get list of VMs
-    VM_LIST=$(virsh list --all --name)
-    
-    # Check if we have VMs to back up
+    # Get the list of VMs if not already defined
     if [ -z "$VM_LIST" ]; then
-        print_warning "No VMs detected to back up."
-        return
+        VM_LIST=$(virsh list --all --name)
+        if [ -z "$VM_LIST" ]; then
+            print_warning "No VMs detected to back up"
+            return
+        fi
     fi
     
     print_message "Setting up automated VM backups..."
     
-    # Ask for backup directory
-    read -p "Enter path for VM backups [/var/backup/vms]: " BACKUP_DIR
-    BACKUP_DIR=${BACKUP_DIR:-/var/backup/vms}
+    # Ask for backup directory or use default from config
+    if [ -z "$BACKUP_DIR" ]; then
+        read -p "Enter path for VM backups [/var/backup/vms]: " BACKUP_DIR
+        BACKUP_DIR=${BACKUP_DIR:-/var/backup/vms}
+    fi
     
     # Create backup directory if it doesn't exist
     if [ ! -d "$BACKUP_DIR" ]; then
         mkdir -p "$BACKUP_DIR"
         chmod 750 "$BACKUP_DIR"
+        print_message "Created backup directory: $BACKUP_DIR"
+    else
+        print_message "Using existing backup directory: $BACKUP_DIR"
     fi
     
-    # Create backup script if it doesn't exist or is outdated
-    if [ ! -f /usr/local/bin/backup-vms.sh ] || [ "$(grep -c "VM Backup Script" /usr/local/bin/backup-vms.sh)" -eq 0 ]; then
+    # Create backup script if it doesn't exist
+    if [ ! -f /usr/local/bin/backup-vms.sh ]; then
         print_message "Creating VM backup script..."
         
         cat > /usr/local/bin/backup-vms.sh <<EOF
@@ -102,7 +116,7 @@ done
 
 # Cleanup old backups (keep last 3)
 for VM in \$(virsh list --all --name); do
-    if [ -d "\$BACKUP_DIR/\$VM/" ]; then
+    if [ -d "\$BACKUP_DIR/\$VM" ]; then
         VM_BACKUP_COUNT=\$(ls -1 "\$BACKUP_DIR/\$VM/" 2>/dev/null | wc -l)
         if [ \$VM_BACKUP_COUNT -gt 3 ]; then
             # Delete oldest backups
@@ -119,18 +133,20 @@ echo "======== VM Backup Completed: \$(date) ========" >> \$LOG_FILE
 EOF
         
         chmod +x /usr/local/bin/backup-vms.sh
+        print_message "VM backup script created"
+    else
+        print_message "VM backup script already exists"
     fi
     
     # Create a weekly cron job for backups if it doesn't exist
-    if [ ! -f /etc/cron.d/vm-backups ]; then
+    if ! crontab -l 2>/dev/null | grep -q "backup-vms.sh"; then
         print_message "Setting up weekly backup cron job..."
-        cat > /etc/cron.d/vm-backups <<EOF
-# Run VM backups every Sunday at 1:00 AM
-0 1 * * 0 root /usr/local/bin/backup-vms.sh
-EOF
+        (crontab -l 2>/dev/null; echo "0 1 * * 0 /usr/local/bin/backup-vms.sh") | crontab -
+    else
+        print_message "VM backup cron job already exists"
     fi
     
-    # Setup log rotation for backup logs if it doesn't exist
+    # Setup log rotation for backup logs
     if [ ! -f /etc/logrotate.d/vm-backup ]; then
         cat > /etc/logrotate.d/vm-backup <<EOF
 /var/log/vm-backup.log {
@@ -141,8 +157,16 @@ EOF
     notifempty
 }
 EOF
+        print_message "Log rotation configured for VM backups"
+    else
+        print_message "VM backup log rotation already configured"
     fi
     
     print_message "VM backup configuration complete. Backups will run weekly."
     print_message "Backup location: $BACKUP_DIR"
 }
+
+# Execute function if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    configure_backups
+fi
