@@ -1,5 +1,14 @@
 #!/bin/bash
-# VM Host Hardening - System Auditing and Monitoring Module
+# Module: 09-monitoring.sh - System Auditing and Monitoring Configuration
+# Part of VM Host Hardening Script
+
+# Source common functions
+if [ -f "$(dirname "$0")/00-common.sh" ]; then
+    source "$(dirname "$0")/00-common.sh"
+else
+    echo "Error: Could not find common functions file"
+    exit 1
+fi
 
 setup_monitoring() {
     print_header "System Auditing and Monitoring"
@@ -14,13 +23,13 @@ setup_monitoring() {
         fi
         
         # Configure audit settings
-        sed_if_not_exists "^log_file" "log_file = /var/log/audit/audit.log" /etc/audit/auditd.conf
-        sed_if_not_exists "^max_log_file" "max_log_file = 50" /etc/audit/auditd.conf
-        sed_if_not_exists "^max_log_file_action" "max_log_file_action = rotate" /etc/audit/auditd.conf
-        sed_if_not_exists "^space_left" "space_left = 75" /etc/audit/auditd.conf
-        sed_if_not_exists "^space_left_action" "space_left_action = email" /etc/audit/auditd.conf
-        sed_if_not_exists "^admin_space_left" "admin_space_left = 50" /etc/audit/auditd.conf
-        sed_if_not_exists "^admin_space_left_action" "admin_space_left_action = halt" /etc/audit/auditd.conf
+        sed_if_not_exists "log_file" "log_file = /var/log/audit/audit.log" /etc/audit/auditd.conf
+        sed_if_not_exists "max_log_file" "max_log_file = 50" /etc/audit/auditd.conf
+        sed_if_not_exists "max_log_file_action" "max_log_file_action = rotate" /etc/audit/auditd.conf
+        sed_if_not_exists "space_left" "space_left = 75" /etc/audit/auditd.conf
+        sed_if_not_exists "space_left_action" "space_left_action = email" /etc/audit/auditd.conf
+        sed_if_not_exists "admin_space_left" "admin_space_left = 50" /etc/audit/auditd.conf
+        sed_if_not_exists "admin_space_left_action" "admin_space_left_action = halt" /etc/audit/auditd.conf
         
         # Add VM-specific audit rules
         if [ ! -f /etc/audit/rules.d/90-vm-monitoring.rules ]; then
@@ -42,11 +51,10 @@ EOF
             # Restart auditd to apply changes
             service auditd restart
         fi
+        
+        print_message "Audit configuration completed successfully"
     else
-        print_warning "auditd not installed. Installing..."
-        apt-get install -y auditd
-        setup_monitoring  # Recursive call to configure the newly installed service
-        return
+        print_warning "auditd is not installed. Skipping audit configuration."
     fi
     
     # Install and configure logwatch for daily reports if not already done
@@ -65,8 +73,13 @@ Detail = High
 Service = All
 # Add additional services
 Service = libvirt
+Service = sshd
 Service = pam
 EOF
+        
+        print_message "Logwatch configured successfully"
+    else
+        print_message "Logwatch is already installed"
     fi
     
     # Setup VM monitoring script
@@ -107,7 +120,7 @@ df -h >> \$REPORT_FILE
 
 # Check for any issues in logs
 echo -e "\n== Recent Libvirt Errors ==" >> \$REPORT_FILE
-grep -i error /var/log/libvirt/libvirtd.log | tail -20 >> \$REPORT_FILE 2>/dev/null
+grep -i error /var/log/libvirt/libvirtd.log 2>/dev/null | tail -20 >> \$REPORT_FILE
 
 echo "======== End of Report ========" >> \$REPORT_FILE
 echo "" >> \$REPORT_FILE
@@ -117,23 +130,18 @@ CPU_USAGE=\$(top -bn1 | grep "Cpu(s)" | awk '{print \$2 + \$4}' | cut -d. -f1)
 MEMORY_USAGE=\$(free | grep Mem | awk '{print int(\$3/\$2 * 100)}')
 
 if [ "\$CPU_USAGE" -gt 80 ] || [ "\$MEMORY_USAGE" -gt 80 ]; then
-    if command -v mail &> /dev/null; then
-        cat \$REPORT_FILE | mail -s "WARNING: High resource usage on VM host" root
-    else
-        print_warning "Mail command not found. Install mailutils for email notifications."
-    fi
+    cat \$REPORT_FILE | mail -s "WARNING: High resource usage on VM host" root
 fi
 EOF
     
     chmod +x /usr/local/bin/vm-monitor.sh
     
     # Setup cron job for monitoring
-    if ! grep -q "vm-monitor.sh" /etc/cron.d/vm-monitoring 2>/dev/null; then
+    if ! crontab -l 2>/dev/null | grep -q "vm-monitor.sh"; then
         print_message "Setting up cron job for VM monitoring..."
-        cat > /etc/cron.d/vm-monitoring <<EOF
-# Run VM monitoring every 15 minutes
-*/15 * * * * root /usr/local/bin/vm-monitor.sh
-EOF
+        (crontab -l 2>/dev/null; echo "*/15 * * * * /usr/local/bin/vm-monitor.sh") | crontab -
+    else
+        print_message "VM monitoring cron job already exists"
     fi
     
     # Setup log rotation for monitoring logs
@@ -147,7 +155,15 @@ EOF
     notifempty
 }
 EOF
+        print_message "Log rotation configured for VM monitoring logs"
+    else
+        print_message "VM monitoring log rotation already configured"
     fi
     
-    print_message "Monitoring configuration complete."
+    print_message "Monitoring configuration complete"
 }
+
+# Execute function if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    setup_monitoring
+fi
