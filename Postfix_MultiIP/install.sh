@@ -11,7 +11,7 @@ set -e
 INSTALLER_NAME="Multi-IP Bulk Mail Server Installer"
 INSTALLER_VERSION="16.0.0"
 GITHUB_USER="fumingtomato"
-GITHUB_REPO="maileristhegame"
+GITHUB_REPO="shibi"
 GITHUB_BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH"
 INSTALLER_DIR="/tmp/multiip-installer-$$"
