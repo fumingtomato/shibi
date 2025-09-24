@@ -152,6 +152,22 @@ EOF
     return 0
 }
 
+# Function to get DKIM public key value for DNS
+get_dkim_value() {
+    local domain=$1
+    local key_file="/etc/opendkim/keys/${domain}/mail.txt"
+    
+    if [ -f "$key_file" ]; then
+        # Extract just the public key part (p=...) from the DKIM record
+        cat "$key_file" | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r '
+    else
+        echo ""
+    fi
+}
+
+# Export the function so dns_ssl.sh can use it
+export -f get_dkim_value
+
 # Setup SPF record
 setup_spf() {
     local domain=$1
