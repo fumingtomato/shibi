@@ -95,7 +95,8 @@ first_time_installation_multi_ip() {
     fi
     
 setup_mysql                 # 1. First - Install MySQL & postfix-mysql
-add_domain_and_user "$DOMAIN_NAME" "$MAIL_USERNAME" "$MAIL_PASSWORD" "$PRIMARY_IP"  # 2. Add data to MySQL
+add_domain_to_mysql "$DOMAIN_NAME"
+add_email_user "${MAIL_USERNAME}@${DOMAIN_NAME}" "${MAIL_PASSWORD}"
 setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"  # 3. Setup Dovecot (uses MySQL)
 setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"  # 4. NOW setup Postfix (MySQL is ready)
 create_ip_rotation_config               # 5. Configure IP rotation for Postfix
