@@ -5,7 +5,7 @@
 # IP detection, network interface setup, rotation configuration
 # =================================================================
 
-# Function to get all server IPs
+# Function to get all server IPs with IP range support
 get_all_server_ips() {
     print_header "Detecting Server IP Addresses"
     
@@ -21,26 +21,118 @@ get_all_server_ips() {
     read -p "Enter 'yes' to configure multiple IPs, or 'no' for single IP setup: " multi_ip_choice
     
     if [[ "$multi_ip_choice" == "yes" || "$multi_ip_choice" == "y" ]]; then
-        print_message "\nEnter ALL IP addresses you want to use (including ones not yet configured)."
-        print_message "The installer will configure them for you."
+        print_message "\nEnter IP addresses you want to use."
+        print_message "Formats accepted:"
+        print_message "  - Single IP: 208.115.249.246"
+        print_message "  - IP Range: 208.115.249.246-250 (will add .246, .247, .248, .249, .250)"
+        print_message "  - CIDR: 208.115.249.0/29 (will add all IPs in subnet)"
         print_message "Press Enter with empty input when done."
         
         IP_ADDRESSES+=("$PRIMARY_IP")
         IP_COUNT=1
         
         while true; do
-            read -p "Enter IP address #$((IP_COUNT + 1)) (or press Enter to finish): " ip_addr
+            read -p "Enter IP address #$((IP_COUNT + 1)) or range (or press Enter to finish): " ip_input
             
-            if [ -z "$ip_addr" ]; then
+            if [ -z "$ip_input" ]; then
                 break
             fi
             
-            if [[ $ip_addr =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-                IP_ADDRESSES+=("$ip_addr")
-                IP_COUNT=$((IP_COUNT + 1))
-                print_message "Added IP: $ip_addr (will be configured during installation)"
+            # Check if it's a range (e.g., 208.115.249.246-250)
+            if [[ "$ip_input" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.)([0-9]{1,3})-([0-9]{1,3})$ ]]; then
+                local ip_base="${BASH_REMATCH[1]}"
+                local start_octet="${BASH_REMATCH[2]}"
+                local end_octet="${BASH_REMATCH[3]}"
+                
+                if [ "$start_octet" -le "$end_octet" ] && [ "$end_octet" -le 255 ]; then
+                    print_message "Adding IP range: ${ip_base}${start_octet} to ${ip_base}${end_octet}"
+                    for ((i=start_octet; i<=end_octet; i++)); do
+                        local full_ip="${ip_base}${i}"
+                        # Skip if it's the primary IP (already added)
+                        if [ "$full_ip" != "$PRIMARY_IP" ]; then
+                            IP_ADDRESSES+=("$full_ip")
+                            IP_COUNT=$((IP_COUNT + 1))
+                            print_message "  Added IP: $full_ip"
+                        else
+                            print_message "  Skipping $full_ip (already added as primary)"
+                        fi
+                    done
+                else
+                    print_error "Invalid range. End must be >= start and <= 255"
+                fi
+                
+            # Check if it's CIDR notation (e.g., 208.115.249.0/29)
+            elif [[ "$ip_input" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})/([0-9]{1,2})$ ]]; then
+                local network="${BASH_REMATCH[1]}"
+                local cidr="${BASH_REMATCH[2]}"
+                
+                if command -v ipcalc &> /dev/null; then
+                    print_message "Processing CIDR block: $ip_input"
+                    # Use ipcalc to get all IPs in range
+                    local ip_list=$(ipcalc -nb "$ip_input" | grep -E "^HostMin:|^HostMax:" | awk '{print $2}')
+                    if [ ! -z "$ip_list" ]; then
+                        local min_ip=$(echo "$ip_list" | head -1)
+                        local max_ip=$(echo "$ip_list" | tail -1)
+                        
+                        # Convert IPs to integers for iteration
+                        IFS='.' read -r -a min_parts <<< "$min_ip"
+                        IFS='.' read -r -a max_parts <<< "$max_ip"
+                        
+                        local min_last="${min_parts[3]}"
+                        local max_last="${max_parts[3]}"
+                        local ip_prefix="${min_parts[0]}.${min_parts[1]}.${min_parts[2]}."
+                        
+                        for ((i=min_last; i<=max_last; i++)); do
+                            local full_ip="${ip_prefix}${i}"
+                            if [ "$full_ip" != "$PRIMARY_IP" ]; then
+                                IP_ADDRESSES+=("$full_ip")
+                                IP_COUNT=$((IP_COUNT + 1))
+                                print_message "  Added IP: $full_ip"
+                            fi
+                        done
+                    fi
+                else
+                    print_warning "ipcalc not found. Installing it for CIDR support..."
+                    apt-get install -y ipcalc &>/dev/null
+                    print_message "Please re-enter the CIDR notation."
+                fi
+                
+            # Check if it's a simple range like 246-250 (assume same subnet as primary)
+            elif [[ "$ip_input" =~ ^([0-9]{1,3})-([0-9]{1,3})$ ]]; then
+                local start_octet="${BASH_REMATCH[1]}"
+                local end_octet="${BASH_REMATCH[2]}"
+                
+                # Extract base from primary IP
+                local ip_base=$(echo "$PRIMARY_IP" | cut -d'.' -f1-3)
+                
+                if [ "$start_octet" -le "$end_octet" ] && [ "$end_octet" -le 255 ]; then
+                    print_message "Adding IP range: ${ip_base}.${start_octet} to ${ip_base}.${end_octet}"
+                    for ((i=start_octet; i<=end_octet; i++)); do
+                        local full_ip="${ip_base}.${i}"
+                        if [ "$full_ip" != "$PRIMARY_IP" ]; then
+                            IP_ADDRESSES+=("$full_ip")
+                            IP_COUNT=$((IP_COUNT + 1))
+                            print_message "  Added IP: $full_ip"
+                        else
+                            print_message "  Skipping $full_ip (already added as primary)"
+                        fi
+                    done
+                else
+                    print_error "Invalid range. End must be >= start and <= 255"
+                fi
+                
+            # Single IP address
+            elif [[ "$ip_input" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                # Skip if it's the primary IP (already added)
+                if [ "$ip_input" != "$PRIMARY_IP" ]; then
+                    IP_ADDRESSES+=("$ip_input")
+                    IP_COUNT=$((IP_COUNT + 1))
+                    print_message "Added IP: $ip_input (will be configured during installation)"
+                else
+                    print_message "Skipping $ip_input (already added as primary)"
+                fi
             else
-                print_error "Invalid IP format. Please enter a valid IPv4 address."
+                print_error "Invalid format. Use single IP (208.115.249.246), range (208.115.249.246-250), or simple range (246-250)"
             fi
         done
     else
@@ -48,11 +140,20 @@ get_all_server_ips() {
         IP_COUNT=1
     fi
     
+    # Remove duplicates
+    local unique_ips=($(printf "%s\n" "${IP_ADDRESSES[@]}" | sort -u))
+    IP_ADDRESSES=("${unique_ips[@]}")
+    IP_COUNT=${#IP_ADDRESSES[@]}
+    
     export IP_ADDRESSES
     export IP_COUNT
-    print_message "\nWill configure ${IP_COUNT} IP address(es) for mail server."
+    
+    print_message "\nTotal unique IPs to be configured: ${IP_COUNT}"
+    print_message "IP addresses:"
+    for ip in "${IP_ADDRESSES[@]}"; do
+        echo "  - $ip"
+    done
 }
-
 # Configure network interfaces for multiple IPs
 configure_network_interfaces() {
     print_header "Configuring Network Interfaces for Multiple IPs"
