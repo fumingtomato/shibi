@@ -48,13 +48,6 @@ setup_mysql() {
 -- Create database if it doesn't exist
 CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- Create mail user with restricted permissions
-CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
-GRANT SELECT ON mailserver.* TO 'mailuser'@'localhost';
-GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_domains TO 'mailuser'@'localhost';
-GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_users TO 'mailuser'@'localhost';
-GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_aliases TO 'mailuser'@'localhost';
-
 -- Use mailserver database
 USE mailserver;
 
@@ -85,6 +78,13 @@ CREATE TABLE IF NOT EXISTS virtual_aliases (
   FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE,
   UNIQUE KEY source (source)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Create mail user with restricted permissions
+CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
+GRANT SELECT ON mailserver.* TO 'mailuser'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_domains TO 'mailuser'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_users TO 'mailuser'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_aliases TO 'mailuser'@'localhost';
 
 FLUSH PRIVILEGES;
 EOF
@@ -132,6 +132,11 @@ EOF
     # Set proper permissions
     chmod 640 /etc/postfix/mysql-virtual-*.cf
     chown root:postfix /etc/postfix/mysql-virtual-*.cf
+    
+    # Update Postfix configuration to use MySQL maps
+    postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/mysql-virtual-mailbox-domains.cf"
+    postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/mysql-virtual-mailbox-maps.cf"
+    postconf -e "virtual_alias_maps = mysql:/etc/postfix/mysql-virtual-alias-maps.cf"
     
     # Save the database password for later use
     echo "$DB_PASSWORD" > /root/.mail_db_password
@@ -226,7 +231,7 @@ setup_dovecot() {
     # Create mail directories
     mkdir -p /var/vmail
     chmod 770 /var/vmail
-    chown vmail:dovecot /var/vmail
+    chown -R vmail:vmail /var/vmail
     
     # Backup original configuration
     backup_config "dovecot" "/etc/dovecot/dovecot.conf"
@@ -379,8 +384,9 @@ user_query = SELECT concat('/var/vmail/', substring_index('%u', '@', -1), '/', s
 EOF
     
     # Set proper permissions
-    chown -R vmail:dovecot /etc/dovecot
+    chown -R root:dovecot /etc/dovecot
     chmod -R o-rwx /etc/dovecot
+    chmod 640 /etc/dovecot/dovecot-sql.conf.ext
     
     # Configure SSL
     cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
