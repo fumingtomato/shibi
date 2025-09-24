@@ -52,7 +52,16 @@ FLUSH PRIVILEGES;
 EOF
     
     print_message "MySQL root password saved in /root/.mysql_credentials"
-    
+
+    # Configure dynamic maps for MySQL
+    cat > /etc/postfix/dynamicmaps.cf <<EOF
+    # Postfix dynamic maps configuration
+    mysql   postfix-mysql.so.1.0.1 dict_mysql_open
+EOF
+chmod 644 /etc/postfix/dynamicmaps.cf
+chown root:root /etc/postfix/dynamicmaps.cf
+
+# Ensure the add_domain_to_mysql function adds the postmaster alias
     # Create mail database and user
     print_message "Creating mail database and user..."
     
@@ -368,6 +377,8 @@ EOF
     
     return 0
 }
+# Add postmaster alias for compliance
+mysql -u $DB_USER -p$DB_PASS $DB_NAME -e "INSERT INTO virtual_aliases (source, destination) VALUES ('postmaster@$domain', 'admin@$domain');"
 
 # Create database management script
 create_db_management_script() {
