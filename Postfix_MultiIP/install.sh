@@ -65,6 +65,7 @@ modules=(
     "multiip_config.sh"
     "postfix_setup.sh"
     "mysql_dovecot.sh"
+    "dkim_spf.sh"
     "dns_ssl.sh"
     "monitoring_scripts.sh"
     "security_hardening.sh"
