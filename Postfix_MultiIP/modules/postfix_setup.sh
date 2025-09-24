@@ -201,6 +201,18 @@ EOF
     # Configure main.cf
     configure_postfix_main_cf "$domain" "$hostname"
     
+    # Fix dynamicmaps.cf for MySQL support
+    echo "mysql	/usr/lib/postfix/postfix-mysql.so	dict_mysql_open" > /etc/postfix/dynamicmaps.cf
+    chown root:root /etc/postfix/dynamicmaps.cf
+    chmod 644 /etc/postfix/dynamicmaps.cf
+    
+    # Remove duplicate lines from main.cf
+    awk '!seen[$0]++' /etc/postfix/main.cf > /tmp/main.cf.tmp && mv /tmp/main.cf.tmp /etc/postfix/main.cf
+    
+    # Fix aliases
+    sed -i '/^postmaster:/d' /etc/aliases
+    echo "postmaster: root" >> /etc/aliases
+    newaliases
     # Set permissions
     chown -R postfix:postfix /etc/postfix
     chmod 644 /etc/postfix/main.cf
