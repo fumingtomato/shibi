@@ -1,347 +1,234 @@
 #!/bin/bash
 
 # =================================================================
-# MYSQL AND DOVECOT SETUP MODULE
-# Database setup and mail storage configuration
+# MYSQL AND DOVECOT CONFIGURATION MODULE
+# Database setup, user authentication, and mail storage
 # =================================================================
 
-# Setup MySQL for mail server
+# Setup MySQL server for mail storage
 setup_mysql() {
-    print_header "Setting up MySQL Database"
-
-    # Install MySQL if not present
-    if ! command -v mysql >/dev/null 2>&1; then
-        print_message "Installing MySQL server..."
-        apt-get update
-        apt-get install -y mysql-server mysql-client
-    fi
-
-    # Install postfix-mysql package - CRITICAL for MySQL map support
+    print_header "Setting up MySQL Database Server"
+    
+    # Install MySQL server and client packages first
+    print_message "Installing MySQL server and client packages..."
+    apt-get update
+    apt-get install -y mysql-server mysql-client
+    
+    # Now install postfix-mysql
     print_message "Installing postfix-mysql package..."
     apt-get install -y postfix-mysql
-
-    # Verify postfix-mysql is properly installed
-    if ! dpkg -l | grep -q postfix-mysql; then
-        print_error "Failed to install postfix-mysql package. This is required for MySQL integration."
-        exit 1
-    fi
-
-    # Check if dynamicmaps.cf contains mysql entry
-    if ! grep -q "mysql" /etc/postfix/dynamicmaps.cf; then
-        print_warning "MySQL not found in Postfix dynamic maps config. Adding it..."
-        echo "mysql    mysql:/etc/postfix/postfix-mysql.cf.proto    dict    mysql" >> /etc/postfix/dynamicmaps.cf
-    fi
-
-    # Set MySQL root password securely
-    local mysql_password=$(openssl rand -base64 32)
     
-    # Check if MySQL is running
+    # Make sure the postfix-mysql package is properly registered with Postfix
+    if [ ! -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
+        print_message "Creating MySQL dynamic maps configuration for Postfix..."
+        echo "mysql	postfix-mysql.so.1.0.1	dict_mysql_open" > /etc/postfix/dynamicmaps.cf.d/mysql
+        # Ensure dynamicmaps.cf is owned by root:root to avoid security warnings
+        chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
+        chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+    fi
+    
+    # Create a secure random password for the mail user
+    DB_PASSWORD=$(openssl rand -base64 32)
+    
+    print_message "Setting up MySQL database for mail server..."
+    
+    # Check if MySQL service is running
     if ! systemctl is-active --quiet mysql; then
         print_message "Starting MySQL service..."
         systemctl start mysql
         systemctl enable mysql
     fi
+    
+    # Create a secure temporary SQL file
+    SQL_TMPFILE=$(mktemp)
+    chmod 600 "$SQL_TMPFILE"
+    
+    # Prepare SQL commands to setup the database and permissions
+    cat > "$SQL_TMPFILE" <<EOF
+-- Create database if it doesn't exist
+CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-    # Secure MySQL installation
-    print_message "Securing MySQL installation..."
-    
-    # Create database password for mail user
-    local mail_db_password=$(openssl rand -base64 32)
-    
-    # Store passwords securely for the installation
-    echo "${mysql_password}" > /root/.mysql_root_password
-    chmod 600 /root/.mysql_root_password
-    echo "${mail_db_password}" > /root/.mail_db_password
-    chmod 600 /root/.mail_db_password
-    
-    # Setup mailserver database
-    print_message "Creating mailserver database and tables..."
-    
-    # Check if database exists
-    if mysql -u root -e "use mailserver" 2>/dev/null; then
-        print_message "Mailserver database already exists. Skipping creation."
-    else
-        # Create database and user
-        mysql -u root -e "CREATE DATABASE mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-        mysql -u root -e "CREATE USER 'mailuser'@'127.0.0.1' IDENTIFIED BY '${mail_db_password}';"
-        mysql -u root -e "GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'127.0.0.1';"
-        mysql -u root -e "FLUSH PRIVILEGES;"
-        
-        # Create tables for mailserver
-        mysql -u root mailserver << EOF
+-- Create mail user with restricted permissions
+CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
+GRANT SELECT ON mailserver.* TO 'mailuser'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_domains TO 'mailuser'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_users TO 'mailuser'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mailserver.virtual_aliases TO 'mailuser'@'localhost';
+
+-- Use mailserver database
+USE mailserver;
+
+-- Create tables if they don't exist
 CREATE TABLE IF NOT EXISTS virtual_domains (
-    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY unique_domain (name)
+  id int NOT NULL auto_increment,
+  name varchar(50) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY name (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS virtual_users (
-    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    domain_id INT NOT NULL,
-    email VARCHAR(255) NOT NULL,
-    password VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY unique_email (email),
-    FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
+  id int NOT NULL auto_increment,
+  domain_id int NOT NULL,
+  password varchar(106) NOT NULL,
+  email varchar(100) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY email (email),
+  FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS virtual_aliases (
-    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    domain_id INT NOT NULL,
-    source VARCHAR(255) NOT NULL,
-    destination VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY unique_source (source),
-    FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
+  id int NOT NULL auto_increment,
+  domain_id int NOT NULL,
+  source varchar(100) NOT NULL,
+  destination varchar(100) NOT NULL,
+  PRIMARY KEY (id),
+  FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE,
+  UNIQUE KEY source (source)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS sender_access (
-    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    email_pattern VARCHAR(255) NOT NULL,
-    access VARCHAR(50) NOT NULL,
-    UNIQUE KEY unique_email_pattern (email_pattern)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS ip_rotation (
-    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    sender_pattern VARCHAR(255) NOT NULL,
-    transport VARCHAR(50) NOT NULL,
-    probability INT DEFAULT 100,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY unique_sender_pattern (sender_pattern, transport)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+FLUSH PRIVILEGES;
 EOF
+    
+    # Execute the SQL commands
+    if mysql -u root < "$SQL_TMPFILE"; then
+        print_message "MySQL database 'mailserver' created successfully"
+    else
+        print_error "Failed to create MySQL database"
+        exit 1
     fi
     
-    # Configure Postfix to use MySQL
-    print_message "Configuring Postfix to use MySQL..."
+    # Remove temporary SQL file
+    rm -f "$SQL_TMPFILE"
     
-    # Create virtual domain configuration
-    cat > /etc/postfix/mysql-virtual-mailbox-domains.cf << EOF
+    # Create MySQL configuration files for Postfix
+    
+    # Virtual domains configuration
+    cat > /etc/postfix/mysql-virtual-mailbox-domains.cf <<EOF
 user = mailuser
-password = ${mail_db_password}
+password = $DB_PASSWORD
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT 1 FROM virtual_domains WHERE name='%s'
 EOF
-
-    # Create virtual user configuration
-    cat > /etc/postfix/mysql-virtual-mailbox-maps.cf << EOF
+    
+    # Virtual mailboxes configuration
+    cat > /etc/postfix/mysql-virtual-mailbox-maps.cf <<EOF
 user = mailuser
-password = ${mail_db_password}
+password = $DB_PASSWORD
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT 1 FROM virtual_users WHERE email='%s'
 EOF
-
-    # Create virtual alias configuration
-    cat > /etc/postfix/mysql-virtual-alias-maps.cf << EOF
+    
+    # Virtual aliases configuration
+    cat > /etc/postfix/mysql-virtual-alias-maps.cf <<EOF
 user = mailuser
-password = ${mail_db_password}
+password = $DB_PASSWORD
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT destination FROM virtual_aliases WHERE source='%s'
 EOF
-
-    # Create sender access configuration
-    cat > /etc/postfix/mysql-sender-access.cf << EOF
-user = mailuser
-password = ${mail_db_password}
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT access FROM sender_access WHERE email_pattern='%s'
-EOF
-
-    # Create sender-dependent transport configuration
-    cat > /etc/postfix/mysql-sender-dependent-relayhost-maps.cf << EOF
-user = mailuser
-password = ${mail_db_password}
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT transport FROM ip_rotation WHERE sender_pattern='%s' ORDER BY RAND() LIMIT 1
-EOF
-
-    # Set correct permissions
-    chmod 640 /etc/postfix/mysql-*
-    chown root:postfix /etc/postfix/mysql-*
     
-    # Configure postfix to use these maps
-    postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/mysql-virtual-mailbox-domains.cf"
-    postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/mysql-virtual-mailbox-maps.cf"
-    postconf -e "virtual_alias_maps = mysql:/etc/postfix/mysql-virtual-alias-maps.cf"
-    postconf -e "smtpd_sender_restrictions = check_sender_access mysql:/etc/postfix/mysql-sender-access.cf"
-    postconf -e "sender_dependent_default_transport_maps = mysql:/etc/postfix/mysql-sender-dependent-relayhost-maps.cf"
-
-    # Test the MySQL configuration
-    print_message "Testing Postfix MySQL configuration..."
+    # Set proper permissions
+    chmod 640 /etc/postfix/mysql-virtual-*.cf
+    chown root:postfix /etc/postfix/mysql-virtual-*.cf
     
-    if ! postmap -q "test" mysql:/etc/postfix/mysql-virtual-mailbox-domains.cf >/dev/null 2>&1; then
-        print_warning "Postfix MySQL configuration test failed. Checking postfix-mysql installation..."
-        
-        # Ensure the mysql dynamic map module is loaded
-        ldconfig
-        if [ -f /usr/lib/postfix/dict_mysql.so ] || [ -f /usr/lib/postfix/modules/dict_mysql.so ]; then
-            print_message "MySQL module file exists, ensuring it's properly linked..."
-        else
-            print_error "MySQL module file not found. Reinstalling postfix-mysql..."
-            apt-get install --reinstall -y postfix-mysql
-        fi
-        
-        # Make sure dynamicmaps.cf is properly configured
-        if ! grep -q "mysql\s" /etc/postfix/dynamicmaps.cf; then
-            print_message "Adding MySQL to dynamicmaps.cf..."
-            echo "mysql    mysql:/etc/postfix/postfix-mysql.cf.proto    dict    mysql" >> /etc/postfix/dynamicmaps.cf
-        fi
-        
-        # Restart Postfix to load the module
-        systemctl restart postfix
-    fi
-
-    print_message "MySQL setup for mail server completed successfully"
+    # Save the database password for later use
+    echo "$DB_PASSWORD" > /root/.mail_db_password
+    chmod 600 /root/.mail_db_password
+    
+    print_message "MySQL setup for mail server completed"
+    
+    # Store DB variables for other functions
+    export DB_PASSWORD
 }
 
-# Add a domain to the mail database
+# Add a domain to the MySQL database
 add_domain_to_mysql() {
     local domain=$1
-    local mail_db_password=$(cat /root/.mail_db_password)
+    local SQL_TMPFILE=$(mktemp)
+    chmod 600 "$SQL_TMPFILE"
     
-    print_message "Adding domain ${domain} to MySQL database..."
+    print_message "Adding domain $domain to MySQL database..."
     
-    # Add domain if not exists
-    local domain_exists=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT COUNT(*) FROM virtual_domains WHERE name='${domain}'")
-    
-    if [ "$domain_exists" -eq 0 ]; then
-        mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -e "INSERT INTO virtual_domains (name) VALUES ('${domain}')"
-        print_message "Domain ${domain} added to database"
-    else
-        print_message "Domain ${domain} already exists in database"
-    fi
+    cat > "$SQL_TMPFILE" <<EOF
+USE mailserver;
+INSERT INTO virtual_domains (name) VALUES ('$domain') ON DUPLICATE KEY UPDATE name=name;
 
-    # Create required aliases including postmaster
-    print_message "Creating postmaster alias for ${domain}..."
-    add_email_alias "postmaster@${domain}" "root@${domain}"
+-- Get the domain ID for the added domain
+SET @domain_id = (SELECT id FROM virtual_domains WHERE name='$domain');
 
-    # Test the alias setup
-    print_message "Testing postmaster alias..."
-    if postmap -q "postmaster@${domain}" mysql:/etc/postfix/mysql-virtual-alias-maps.cf > /dev/null 2>&1; then
-        print_message "Postmaster alias for ${domain} successfully configured"
+-- Ensure the postmaster alias exists for this domain
+INSERT INTO virtual_aliases (domain_id, source, destination) 
+VALUES (@domain_id, 'postmaster@$domain', 'root@localhost')
+ON DUPLICATE KEY UPDATE destination='root@localhost';
+EOF
+    
+    if mysql -u root < "$SQL_TMPFILE"; then
+        print_message "Domain $domain added successfully to MySQL database"
     else
-        print_warning "Issue with postmaster alias configuration, attempting fix..."
-        
-        # Get domain ID
-        local domain_id=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT id FROM virtual_domains WHERE name='${domain}'")
-        
-        # Manually add postmaster alias to ensure it exists
-        mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -e "REPLACE INTO virtual_aliases (domain_id, source, destination) VALUES (${domain_id}, 'postmaster@${domain}', 'root@${domain}')"
-        
-        # Test again
-        if postmap -q "postmaster@${domain}" mysql:/etc/postfix/mysql-virtual-alias-maps.cf > /dev/null 2>&1; then
-            print_message "Postmaster alias fixed and configured properly"
-        else
-            print_error "Unable to configure postmaster alias. Check MySQL configuration."
-        fi
+        print_error "Failed to add domain $domain to MySQL database"
     fi
+    
+    rm -f "$SQL_TMPFILE"
 }
 
-# Add email alias
-add_email_alias() {
-    local source=$1
-    local destination=$2
-    local mail_db_password=$(cat /root/.mail_db_password)
-    
-    # Extract domain from source email
-    local domain=$(echo "$source" | cut -d@ -f2)
-    
-    # Get domain_id
-    local domain_id=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT id FROM virtual_domains WHERE name='${domain}'")
-    
-    if [ -z "$domain_id" ]; then
-        print_error "Domain ${domain} not found in database"
-        return 1
-    fi
-    
-    # Check if alias exists
-    local alias_exists=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT COUNT(*) FROM virtual_aliases WHERE source='${source}'")
-    
-    if [ "$alias_exists" -eq 0 ]; then
-        mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -e "INSERT INTO virtual_aliases (domain_id, source, destination) VALUES (${domain_id}, '${source}', '${destination}')"
-        print_message "Email alias ${source} -> ${destination} created"
-    else
-        mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -e "UPDATE virtual_aliases SET destination='${destination}' WHERE source='${source}'"
-        print_message "Email alias ${source} updated to point to ${destination}"
-    fi
-}
-
-# Add email user to mailserver
+# Add an email user to the MySQL database
 add_email_user() {
     local email=$1
     local password=$2
-    local mail_db_password=$(cat /root/.mail_db_password)
+    local domain=$(echo "$email" | cut -d '@' -f 2)
+    local username=$(echo "$email" | cut -d '@' -f 1)
+    local SQL_TMPFILE=$(mktemp)
+    chmod 600 "$SQL_TMPFILE"
     
-    # Extract domain from email
-    local domain=$(echo "$email" | cut -d@ -f2)
+    # Generate salted SHA512 password hash
+    local hashed_password=$(doveadm pw -s SHA512-CRYPT -p "$password")
     
-    print_message "Adding email user ${email}..."
+    print_message "Adding email user $email to MySQL database..."
     
-    # Get domain_id
-    local domain_id=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT id FROM virtual_domains WHERE name='${domain}'")
+    cat > "$SQL_TMPFILE" <<EOF
+USE mailserver;
+SET @domain_id = (SELECT id FROM virtual_domains WHERE name='$domain');
+INSERT INTO virtual_users (domain_id, email, password)
+VALUES (@domain_id, '$email', '$hashed_password')
+ON DUPLICATE KEY UPDATE password='$hashed_password';
+EOF
     
-    if [ -z "$domain_id" ]; then
-        print_error "Domain ${domain} not found in database"
-        return 1
-    fi
-    
-    # Hash the password
-    local hashed_password=$(doveadm pw -s SHA512-CRYPT -p "${password}")
-    
-    # Check if user exists
-    local user_exists=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT COUNT(*) FROM virtual_users WHERE email='${email}'")
-    
-    if [ "$user_exists" -eq 0 ]; then
-        mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -e "INSERT INTO virtual_users (domain_id, email, password) VALUES (${domain_id}, '${email}', '${hashed_password}')"
-        print_message "Email user ${email} created"
+    if mysql -u root < "$SQL_TMPFILE"; then
+        print_message "Email user $email added successfully to MySQL database"
     else
-        mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -e "UPDATE virtual_users SET password='${hashed_password}' WHERE email='${email}'"
-        print_message "Email user ${email} password updated"
-    fi
-}
-
-# Setup mail storage directories
-setup_mail_directories() {
-    print_message "Setting up mail directories..."
-    
-    # Create vmail user for mail storage
-    if ! id -u vmail >/dev/null 2>&1; then
-        useradd -r -u 5000 -g mail -d /var/mail/vmail -s /sbin/nologin -c "Virtual Mail User" vmail
+        print_error "Failed to add email user $email to MySQL database"
     fi
     
-    # Create mail directory
-    mkdir -p /var/mail/vmail
-    chmod -R 770 /var/mail/vmail
-    chown -R vmail:mail /var/mail/vmail
-    
-    print_message "Mail directories configured"
+    rm -f "$SQL_TMPFILE"
 }
 
-# Setup Dovecot
+# Setup Dovecot for IMAP/POP3 with MySQL authentication
 setup_dovecot() {
     local domain=$1
     local hostname=$2
-    local mail_db_password=$(cat /root/.mail_db_password)
     
     print_header "Setting up Dovecot IMAP/POP3 Server"
     
-    # Install Dovecot if not already installed
-    print_message "Installing Dovecot..."
+    print_message "Installing Dovecot packages..."
     apt-get update
-    apt-get install -y dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-mysql
+    apt-get install -y dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-mysql dovecot-sieve dovecot-managesieved
     
-    # Backup original configurations
+    # Stop Dovecot during configuration
+    systemctl stop dovecot
+    
+    # Create mail user and group
+    print_message "Setting up mail user and directory..."
+    groupadd -g 5000 vmail 2>/dev/null || true
+    useradd -g vmail -u 5000 vmail -d /var/vmail -m 2>/dev/null || true
+    
+    # Create mail directories
+    mkdir -p /var/vmail
+    chmod 770 /var/vmail
+    chown vmail:dovecot /var/vmail
+    
+    # Backup original configuration
     backup_config "dovecot" "/etc/dovecot/dovecot.conf"
     backup_config "dovecot" "/etc/dovecot/conf.d/10-mail.conf"
     backup_config "dovecot" "/etc/dovecot/conf.d/10-auth.conf"
@@ -353,41 +240,24 @@ setup_dovecot() {
 # Dovecot configuration
 # Generated by Mail Server Installer
 
-# Protocols to enable
+# Protocols we want to be serving
 protocols = imap pop3 lmtp
 
-# Logging
-log_path = /var/log/dovecot.log
-info_log_path = /var/log/dovecot-info.log
-debug_log_path = /var/log/dovecot-debug.log
+# Listen on all interfaces
+listen = *
 
-# SSL configuration
-ssl = required
-ssl_cert = </etc/letsencrypt/live/${hostname}/fullchain.pem
-ssl_key = </etc/letsencrypt/live/${hostname}/privkey.pem
-ssl_min_protocol = TLSv1.2
-ssl_prefer_server_ciphers = yes
-
-# Authentication
-auth_mechanisms = plain login
+# User/group for running the server
+first_valid_uid = 5000
+first_valid_gid = 5000
 
 # Mail location
-mail_location = maildir:/var/mail/vmail/%d/%n
+mail_location = maildir:/var/vmail/%d/%n
 
-# User/group for mail processes
-mail_uid = 5000
-mail_gid = 8
-
-# Allow plaintext authentication from local networks
-auth_allow_cleartext = yes
-
-# Include other configuration files
+# Include all the other configuration files
 !include conf.d/*.conf
 
-# Mailbox configuration
-namespace inbox {
-  inbox = yes
-}
+# Include mail server specific configuration
+!include_try local.conf
 EOF
     
     # Configure mail settings
@@ -395,26 +265,41 @@ EOF
 # Mail configuration
 # Generated by Mail Server Installer
 
-mail_location = maildir:/var/mail/vmail/%d/%n
+# Mailbox locations and namespaces
+mail_location = maildir:/var/vmail/%d/%n
+mail_privileged_group = vmail
+
+# Mailbox settings
+mailbox_list_index = yes
+mailbox_idle_check_interval = 30 secs
+
+# Maildir settings
+maildir_stat_dirs = yes
+
 namespace inbox {
   inbox = yes
+  separator = /
+  mailbox Drafts {
+    special_use = \Drafts
+    auto = subscribe
+  }
+  mailbox Junk {
+    special_use = \Junk
+    auto = subscribe
+  }
+  mailbox Sent {
+    special_use = \Sent
+    auto = subscribe
+  }
+  mailbox Trash {
+    special_use = \Trash
+    auto = subscribe
+  }
+  mailbox Archive {
+    special_use = \Archive
+    auto = subscribe
+  }
 }
-
-# Mailbox configuration
-mailbox_list_index = yes
-mail_privileged_group = mail
-first_valid_uid = 5000
-first_valid_gid = 8
-
-# Mailbox auto creation
-mailbox_autosubscribe = yes
-mailbox_list_index = yes
-
-# Performance settings
-mail_fsync = optimized
-mail_nfs_index = no
-mail_nfs_storage = no
-mmap_disable = no
 EOF
     
     # Configure authentication
@@ -422,11 +307,43 @@ EOF
 # Authentication configuration
 # Generated by Mail Server Installer
 
+# Authentication mechanisms
 auth_mechanisms = plain login
-!include auth-sql.conf.ext
 
+# Disable plaintext authentication
 disable_plaintext_auth = yes
-auth_username_format = %n
+
+# Password schemes to use
+password_scheme = SHA512-CRYPT
+
+# Auth master process
+service auth {
+  unix_listener auth-userdb {
+    mode = 0600
+    user = vmail
+    group = vmail
+  }
+  
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+
+# User database
+userdb {
+  driver = static
+  args = uid=vmail gid=vmail home=/var/vmail/%d/%n
+}
+
+# Password database
+passdb {
+  driver = sql
+  args = /etc/dovecot/dovecot-sql.conf.ext
+}
+
+!include auth-sql.conf.ext
 EOF
     
     # Configure SQL authentication
@@ -440,8 +357,8 @@ passdb {
 }
 
 userdb {
-  driver = sql
-  args = /etc/dovecot/dovecot-sql.conf.ext
+  driver = static
+  args = uid=vmail gid=vmail home=/var/vmail/%d/%n
 }
 EOF
     
@@ -451,78 +368,139 @@ EOF
 # Generated by Mail Server Installer
 
 driver = mysql
-connect = host=127.0.0.1 dbname=mailserver user=mailuser password=${mail_db_password}
+connect = host=127.0.0.1 dbname=mailserver user=mailuser password=$DB_PASSWORD
 default_pass_scheme = SHA512-CRYPT
 
+# Get user's password
 password_query = SELECT email as user, password FROM virtual_users WHERE email='%u';
 
-user_query = SELECT CONCAT('/var/mail/vmail/', SUBSTRING_INDEX(email, '@', -1), '/', SUBSTRING_INDEX(email, '@', 1)) AS home, 5000 AS uid, 8 AS gid FROM virtual_users WHERE email='%u';
-
-# For using doveadm -A:
-iterate_query = SELECT email AS user FROM virtual_users;
+# Get user's home directory
+user_query = SELECT concat('/var/vmail/', substring_index('%u', '@', -1), '/', substring_index('%u', '@', 1)) as home, 5000 AS uid, 5000 AS gid FROM virtual_users WHERE email='%u';
 EOF
     
-    # Setup permissions
+    # Set proper permissions
     chown -R vmail:dovecot /etc/dovecot
     chmod -R o-rwx /etc/dovecot
     
-    # Restart Dovecot
-    print_message "Restarting Dovecot..."
-    systemctl restart dovecot
+    # Configure SSL
+    cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
+# SSL configuration
+# Generated by Mail Server Installer
+
+ssl = required
+ssl_prefer_server_ciphers = yes
+ssl_min_protocol = TLSv1.2
+ssl_cert = </etc/letsencrypt/live/$hostname/fullchain.pem
+ssl_key = </etc/letsencrypt/live/$hostname/privkey.pem
+ssl_dh = </etc/dovecot/dh.pem
+EOF
+    
+    # Generate DH parameters (this might take some time)
+    print_message "Generating DH parameters for SSL (this may take a few minutes)..."
+    openssl dhparam -out /etc/dovecot/dh.pem 2048
+    
+    # Configure master process
+    cat > /etc/dovecot/conf.d/10-master.conf <<EOF
+# Master process configuration
+# Generated by Mail Server Installer
+
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+  inet_listener imaps {
+    port = 993
+    ssl = yes
+  }
+}
+
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+  inet_listener pop3s {
+    port = 995
+    ssl = yes
+  }
+}
+
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+
+service auth {
+  unix_listener auth-userdb {
+    mode = 0600
+    user = vmail
+    group = vmail
+  }
+  
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+EOF
+    
+    # Start and enable Dovecot
+    systemctl start dovecot
     systemctl enable dovecot
     
-    print_message "Dovecot configuration completed successfully"
+    print_message "Dovecot setup completed"
     
-    # Add Postfix to deliver to Dovecot
-    print_message "Configuring Postfix to deliver mail to Dovecot LMTP..."
+    # Configure Postfix to work with Dovecot
+    print_message "Configuring Postfix to work with Dovecot..."
+    
     postconf -e "virtual_transport = lmtp:unix:private/dovecot-lmtp"
     postconf -e "mailbox_transport = lmtp:unix:private/dovecot-lmtp"
+    postconf -e "smtpd_sasl_type = dovecot"
+    postconf -e "smtpd_sasl_path = private/auth"
+    postconf -e "smtpd_sasl_auth_enable = yes"
+    postconf -e "smtpd_sasl_security_options = noanonymous"
+    postconf -e "smtpd_sasl_local_domain = $domain"
     
-    # Restart Postfix
+    # Restart Postfix to apply changes
     systemctl restart postfix
-}
-
-# Create email forwarding
-create_email_forward() {
-    local source=$1
-    local destination=$2
     
-    print_message "Creating email forward from ${source} to ${destination}..."
-    add_email_alias "${source}" "${destination}"
+    print_message "Dovecot integration with Postfix completed"
 }
 
-# Setup common email aliases
+# Setup email aliases
 setup_email_aliases() {
-    local mail_db_password=$(cat /root/.mail_db_password)
+    print_message "Setting up system-wide email aliases..."
     
-    print_header "Setting Up Common Email Aliases"
+    # Backup existing aliases file
+    if [ -f /etc/aliases ]; then
+        cp /etc/aliases /etc/aliases.bak
+    fi
     
-    # Get all domains in the database
-    local domains=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT name FROM virtual_domains")
+    # Create basic aliases
+    cat > /etc/aliases <<EOF
+# Basic system aliases
+mailer-daemon: postmaster
+postmaster: root
+nobody: root
+hostmaster: root
+usenet: root
+news: root
+webmaster: root
+www: root
+ftp: root
+abuse: root
+noc: root
+security: root
+root: $ADMIN_EMAIL
+EOF
     
-    for domain in ${domains}; do
-        print_message "Setting up aliases for domain: ${domain}"
-        
-        # Get domain ID
-        local domain_id=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT id FROM virtual_domains WHERE name='${domain}'")
-        
-        # Common aliases all point to postmaster initially
-        local common_aliases=("abuse" "webmaster" "hostmaster" "info" "support" "admin")
-        
-        for alias in "${common_aliases[@]}"; do
-            # Check if alias already exists
-            local alias_exists=$(mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -sN -e "SELECT COUNT(*) FROM virtual_aliases WHERE source='${alias}@${domain}'")
-            
-            if [ "$alias_exists" -eq 0 ]; then
-                # Forward to postmaster alias
-                mysql -u mailuser -p"${mail_db_password}" -h 127.0.0.1 mailserver -e "INSERT INTO virtual_aliases (domain_id, source, destination) VALUES (${domain_id}, '${alias}@${domain}', 'postmaster@${domain}')"
-                print_message "Created alias ${alias}@${domain} -> postmaster@${domain}"
-            fi
-        done
-    done
+    # Update the aliases database
+    newaliases
     
-    print_message "Common email aliases setup completed"
+    print_message "Email aliases setup completed"
 }
 
-export -f setup_mysql add_domain_to_mysql add_email_user add_email_alias
-export -f setup_mail_directories setup_dovecot create_email_forward setup_email_aliases
+export -f setup_mysql add_domain_to_mysql add_email_user setup_dovecot setup_email_aliases
