@@ -107,6 +107,13 @@ CREATE TABLE IF NOT EXISTS sender_stats (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 EOF
     
+    # Create vmail user and group for mail storage
+    print_message "Creating vmail user for mail storage..."
+    groupadd -g 5000 vmail 2>/dev/null || true
+    useradd -g vmail -u 5000 vmail -d /var/mail/vhosts -m -s /sbin/nologin 2>/dev/null || true
+    mkdir -p /var/mail/vhosts
+    chown -R vmail:vmail /var/mail/vhosts
+    
     print_message "MySQL database setup completed with secure password configuration."
     
     # Export password for use in other modules
@@ -298,15 +305,7 @@ ssl_cipher_list = ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDH
 ssl_prefer_server_ciphers = yes
 EOF
     
-    # Create vmail user and directories
-    print_message "Creating vmail user and directories..."
-    groupadd -g 5000 vmail 2>/dev/null || true
-    useradd -g vmail -u 5000 vmail -d /var/mail/vhosts -m -s /sbin/nologin 2>/dev/null || true
-    
-    mkdir -p /var/mail/vhosts
-    chown -R vmail:vmail /var/mail/vhosts
-    
-    # Generate DH parameters
+    # Generate DH parameters if not exists
     if [ ! -f /usr/share/dovecot/dh.pem ]; then
         print_message "Generating DH parameters (this may take a while)..."
         openssl dhparam -out /usr/share/dovecot/dh.pem 2048
@@ -346,6 +345,9 @@ add_email_user() {
     local domain=$(echo $email | cut -d'@' -f2)
     
     print_message "Adding email user $email to database..."
+    
+    # Install doveadm if not available
+    which doveadm >/dev/null 2>&1 || apt-get install -y dovecot-core
     
     # Hash the password
     local hashed_password=$(doveadm pw -s SHA512-CRYPT -p "$password")
