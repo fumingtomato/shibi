@@ -1,5 +1,14 @@
 #!/bin/bash
-# VM Host Hardening - Kernel Hardening Module
+# Module: 11-kernel-hardening.sh - Kernel and System Security Hardening
+# Part of VM Host Hardening Script
+
+# Source common functions
+if [ -f "$(dirname "$0")/00-common.sh" ]; then
+    source "$(dirname "$0")/00-common.sh"
+else
+    echo "Error: Could not find common functions file"
+    exit 1
+fi
 
 harden_kernel() {
     print_header "Kernel Hardening"
@@ -63,17 +72,20 @@ fs.suid_dumpable = 0
 fs.protected_fifos = 2
 fs.protected_regular = 2
 EOF
+        print_message "Created kernel hardening configuration"
     else
-        print_message "Kernel hardening configuration already exists."
+        print_message "Kernel hardening configuration already exists"
     fi
     
     # Apply the settings
     print_message "Applying kernel parameters..."
-    sysctl -p /etc/sysctl.d/80-vm-host-hardening.conf
+    if ! sysctl -p /etc/sysctl.d/80-vm-host-hardening.conf; then
+        print_warning "Some kernel parameters could not be applied. This is normal if the kernel doesn't support all features."
+    fi
     
     # Enable AppArmor if available
     if command -v aa-status &> /dev/null; then
-        print_message "Configuring AppArmor..."
+        print_message "Enabling AppArmor..."
         
         # Ensure AppArmor is enabled and started
         systemctl enable apparmor
@@ -91,43 +103,36 @@ EOF
             
             # Restart AppArmor to load new profile
             systemctl restart apparmor
+            print_message "AppArmor profile for libvirt created"
+        else
+            print_message "AppArmor profile for libvirt already exists"
         fi
     else
-        print_warning "AppArmor not found. Installing..."
-        apt-get install -y apparmor apparmor-utils
-        systemctl enable apparmor
-        systemctl start apparmor
-        # Recursive call to continue configuration
-        harden_kernel
-        return
+        print_warning "AppArmor is not installed. Consider installing it for enhanced security."
     fi
     
-    # Set up kernel module blacklisting for unused/dangerous modules
-    if [ ! -f /etc/modprobe.d/vm-host-blacklist.conf ]; then
-        print_message "Setting up kernel module blacklisting..."
-        
-        cat > /etc/modprobe.d/vm-host-blacklist.conf <<EOF
-# Blacklist potentially dangerous or unnecessary modules
-# Unused network protocols
-blacklist dccp
-blacklist sctp
-blacklist rds
-blacklist tipc
-# Uncommon filesystem types - enable if needed
-blacklist cramfs
-blacklist freevxfs
-blacklist jffs2
-blacklist hfs
-blacklist hfsplus
-blacklist squashfs
-# Disable firewire to prevent DMA attacks
-blacklist firewire-core
-blacklist firewire-ohci
+    # Set secure limits for system resources
+    if [ ! -f /etc/security/limits.d/10-kernel-hardening.conf ]; then
+        print_message "Setting secure resource limits..."
+        cat > /etc/security/limits.d/10-kernel-hardening.conf <<EOF
+# Limits for VM host security
+* hard core 0
+* soft nproc 1000
+* hard nproc 2000
+* soft nofile 4096
+* hard nofile 65536
+root soft nofile 16384
+root hard nofile 65536
 EOF
+        print_message "System resource limits configured"
+    else
+        print_message "System resource limits already configured"
     fi
     
-    # Apply module blacklisting
-    rmmod -f dccp sctp rds tipc cramfs freevxfs jffs2 hfs hfsplus squashfs firewire-core firewire-ohci 2>/dev/null || true
-    
-    print_message "Kernel hardening complete."
+    print_message "Kernel hardening complete"
 }
+
+# Execute function if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    harden_kernel
+fi
