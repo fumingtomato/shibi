@@ -92,7 +92,8 @@ backup_config() {
 # Validate domain name
 validate_domain() {
     local domain=$1
-    if [[ ! "$domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$ ]]; then
+    # Updated regex to properly handle subdomains like mta1.fuelmonkies.com
+    if [[ ! "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
         print_error "Invalid domain format: $domain"
         return 1
     fi
