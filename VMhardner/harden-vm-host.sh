@@ -11,14 +11,16 @@ set -e
 # Script version
 VERSION="1.0.0"
 
-# Resolve the actual script location (following symlinks)
-SOURCE="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE" ]; do
-    DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-    SOURCE="$(readlink "$SOURCE")"
-    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+# Get the real path of the script (resolving symlinks)
+if [ -L "${BASH_SOURCE[0]}" ]; then
+    # Script is a symlink, resolve it
+    SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+else
+    SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+
+# Get the directory where the actual script is located
+SCRIPT_DIR="$( cd "$( dirname "$SCRIPT_PATH" )" && pwd )"
 
 # Local paths
 CONFIG_DIR="${SCRIPT_DIR}/config"
@@ -70,6 +72,9 @@ fi
 # Function to check if all required files exist
 check_files() {
     local missing_files=0
+    
+    # Debug: Show where we're looking for files
+    print_message "Looking for files in: $SCRIPT_DIR"
     
     # Check for config file
     if [ ! -f "${CONFIG_DIR}/settings.conf" ]; then
