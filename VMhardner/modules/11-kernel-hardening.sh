@@ -2,12 +2,16 @@
 # Module: 11-kernel-hardening.sh - Kernel and System Security Hardening
 # Part of VM Host Hardening Script
 
-# Source common functions
-if [ -f "$(dirname "$0")/00-common.sh" ]; then
-    source "$(dirname "$0")/00-common.sh"
-else
-    echo "Error: Could not find common functions file"
-    exit 1
+# Check if we're being run standalone or as part of the main script
+if [ -z "$LOG_FILE" ]; then
+    # Running standalone, need to source common
+    SCRIPT_DIR="$(dirname "$0")"
+    if [ -f "${SCRIPT_DIR}/00-common.sh" ]; then
+        source "${SCRIPT_DIR}/00-common.sh"
+    else
+        echo "Error: Could not find common functions file"
+        exit 1
+    fi
 fi
 
 harden_kernel() {
