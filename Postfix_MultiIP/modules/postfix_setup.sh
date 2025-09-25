@@ -201,11 +201,6 @@ EOF
     # Configure main.cf
     configure_postfix_main_cf "$domain" "$hostname"
     
-    # Fix dynamicmaps.cf for MySQL support
-    echo "mysql	/usr/lib/postfix/postfix-mysql.so	dict_mysql_open" > /etc/postfix/dynamicmaps.cf
-    chown root:root /etc/postfix/dynamicmaps.cf
-    chmod 644 /etc/postfix/dynamicmaps.cf
-    
     # Remove duplicate lines from main.cf
     awk '!seen[$0]++' /etc/postfix/main.cf > /tmp/main.cf.tmp && mv /tmp/main.cf.tmp /etc/postfix/main.cf
     
@@ -395,7 +390,7 @@ create_mysql_config_files() {
     # Virtual mailbox domains
     cat > /etc/postfix/mysql-virtual-mailbox-domains.cf <<EOF
 user = mailuser
-password = ${MYSQL_MAIL_PASSWORD}
+password = ${DB_PASSWORD}
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT 1 FROM virtual_domains WHERE name='%s'
@@ -404,7 +399,7 @@ EOF
     # Virtual mailbox maps
     cat > /etc/postfix/mysql-virtual-mailbox-maps.cf <<EOF
 user = mailuser
-password = ${MYSQL_MAIL_PASSWORD}
+password = ${DB_PASSWORD}
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT 1 FROM virtual_users WHERE email='%s'
@@ -413,7 +408,7 @@ EOF
     # Virtual alias maps
     cat > /etc/postfix/mysql-virtual-alias-maps.cf <<EOF
 user = mailuser
-password = ${MYSQL_MAIL_PASSWORD}
+password = ${DB_PASSWORD}
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT destination FROM virtual_aliases WHERE source='%s'
