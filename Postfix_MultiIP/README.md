@@ -1,4 +1,4 @@
-# Multi-IP Bulk Mail Server Installer
+# Multi-IP Bulk Mail Server Installer - NOT WORKING YET
 
 A comprehensive mail server installer optimized for commercial bulk mailing with multiple IP address support, designed for integration with MailWizz.
 
