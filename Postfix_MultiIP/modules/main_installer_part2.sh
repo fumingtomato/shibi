@@ -35,13 +35,26 @@ configure_hostname() {
 # Setup email aliases
 setup_email_aliases() {
     print_message "Setting up email aliases for postmaster..."
+    
+    # First, remove any existing postmaster entries to avoid duplicates
+    if [ -f /etc/aliases ]; then
+        sed -i '/^postmaster:/d' /etc/aliases
+    fi
+    
+    # Ensure root alias exists
+    if ! grep -q "^root:" /etc/aliases; then
+        echo "root: $ADMIN_EMAIL" >> /etc/aliases
+    fi
+    
+    # Add required aliases
     cat >> /etc/aliases <<EOF
-postmaster: $ADMIN_EMAIL
-abuse: $ADMIN_EMAIL
-webmaster: $ADMIN_EMAIL
-hostmaster: $ADMIN_EMAIL
-mailer-daemon: $ADMIN_EMAIL
+postmaster: root
+abuse: root
+webmaster: root
+hostmaster: root
+mailer-daemon: root
 EOF
+    
     newaliases
     print_message "Email aliases configured"
 }
