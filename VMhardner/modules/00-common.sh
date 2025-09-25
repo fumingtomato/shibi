@@ -49,7 +49,43 @@ package_installed() {
     dpkg -l "$1" &> /dev/null
 }
 
-# Function to modify a config setting if it doesn't match
+# Function to modify a config setting for libvirt (uses = syntax)
+configure_libvirt_setting() {
+    local file="$1"
+    local parameter="$2"
+    local value="$3"
+    local comment="${4:-}"
+    
+    # Make a backup if it doesn't exist
+    if [ ! -f "${file}.bak" ] && [ -f "$file" ]; then
+        cp "$file" "${file}.bak"
+        log "Created backup of $file"
+    fi
+    
+    # Create file if it doesn't exist
+    if [ ! -f "$file" ]; then
+        touch "$file"
+    fi
+    
+    # For libvirt configs, format the line properly with equals sign
+    local formatted_line="${parameter} = ${value}"
+    
+    # Check if parameter exists (commented or not)
+    if grep -q "^${parameter}\|^#.*${parameter}" "$file" 2>/dev/null; then
+        # Parameter exists, update it
+        sed -i "s/^#*${parameter}.*/${formatted_line}/" "$file"
+        log "Updated ${parameter} in $file"
+    else
+        # Parameter doesn't exist, add it
+        if [ -n "$comment" ]; then
+            echo -e "\n# $comment" >> "$file"
+        fi
+        echo "${formatted_line}" >> "$file"
+        log "Added ${parameter} to $file"
+    fi
+}
+
+# Original function for other config files (SSH, etc)
 configure_setting() {
     local file="$1"
     local parameter="$2"
