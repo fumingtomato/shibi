@@ -18,14 +18,14 @@ setup_mysql() {
     print_message "Installing postfix-mysql package..."
     apt-get install -y postfix-mysql
     
-    # Make sure the postfix-mysql package is properly registered with Postfix
-    if [ ! -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
-        print_message "Creating MySQL dynamic maps configuration for Postfix..."
-        echo "mysql	postfix-mysql.so.1.0.1	dict_mysql_open" > /etc/postfix/dynamicmaps.cf.d/mysql
-        # Ensure dynamicmaps.cf is owned by root:root to avoid security warnings
-        chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
-        chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
-    fi
+    # Always create MySQL dynamic maps configuration for Postfix - FIX 1
+    print_message "Creating MySQL dynamic maps configuration for Postfix..."
+    mkdir -p /etc/postfix/dynamicmaps.cf.d/
+    echo "mysql	postfix-mysql.so.1.0.1	dict_mysql_open" > /etc/postfix/dynamicmaps.cf.d/mysql
+    
+    # Ensure dynamicmaps.cf is owned by root:root to avoid security warnings
+    chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
+    chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
     
     # Create a secure random password for the mail user
     DB_PASSWORD=$(openssl rand -base64 32)
@@ -99,7 +99,8 @@ EOF
     # Remove temporary SQL file
     rm -f "$SQL_TMPFILE"
     
-    # Create MySQL configuration files for Postfix
+    # Create MySQL configuration files for Postfix - FIX 2: More explicit error checking
+    print_message "Creating MySQL configuration files for Postfix..."
     
     # Virtual domains configuration
     cat > /etc/postfix/mysql-virtual-mailbox-domains.cf <<EOF
@@ -119,7 +120,7 @@ dbname = mailserver
 query = SELECT 1 FROM virtual_users WHERE email='%s'
 EOF
     
-    # Virtual aliases configuration
+    # Virtual aliases configuration - FIX 3: Ensure this file is created properly
     cat > /etc/postfix/mysql-virtual-alias-maps.cf <<EOF
 user = mailuser
 password = $DB_PASSWORD
@@ -127,6 +128,21 @@ hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT destination FROM virtual_aliases WHERE source='%s'
 EOF
+    
+    # Verify the files were created correctly
+    for file in mysql-virtual-mailbox-domains.cf mysql-virtual-mailbox-maps.cf mysql-virtual-alias-maps.cf; do
+        if [ ! -s "/etc/postfix/$file" ]; then
+            print_error "Failed to create /etc/postfix/$file - file is empty or does not exist"
+            cat > "/etc/postfix/$file" <<EOF
+user = mailuser
+password = $DB_PASSWORD
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT destination FROM virtual_aliases WHERE source='%s'
+EOF
+            print_message "Re-created /etc/postfix/$file"
+        fi
+    done
     
     # Set proper permissions
     chmod 640 /etc/postfix/mysql-virtual-*.cf
