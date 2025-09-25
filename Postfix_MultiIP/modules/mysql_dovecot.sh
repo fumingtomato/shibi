@@ -124,7 +124,7 @@ EOF
     # Remove temporary SQL file
     rm -f "$SQL_TMPFILE"
     
-    # Create MySQL configuration files for Postfix
+    # Create MySQL configuration files for Postfix with proper permissions
     
     # Virtual domains configuration
     cat > /etc/postfix/mysql-virtual-mailbox-domains.cf <<EOF
@@ -170,17 +170,6 @@ EOF
     if ! grep -q "^root:" /etc/aliases; then
         echo "root: $ADMIN_EMAIL" >> /etc/aliases
         newaliases
-    fi
-    
-    # Fix permissions for Postfix files to prevent security warnings
-    if [ -f /etc/postfix/dynamicmaps.cf ]; then
-        chown root:root /etc/postfix/dynamicmaps.cf
-        chmod 644 /etc/postfix/dynamicmaps.cf
-    fi
-    
-    if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
-        chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
-        chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
     fi
     
     # Restart Postfix to recognize MySQL maps
@@ -536,48 +525,5 @@ EOF
     print_message "Dovecot integration with Postfix completed"
 }
 
-# Setup email aliases
-setup_email_aliases() {
-    print_message "Setting up email aliases..."
-    
-    # Backup existing aliases file
-    if [ -f /etc/aliases ]; then
-        cp /etc/aliases /etc/aliases.bak
-    fi
-    
-    # Create basic aliases
-    cat > /etc/aliases <<EOF
-# Basic system aliases
-mailer-daemon: postmaster
-postmaster: root
-nobody: root
-hostmaster: root
-usenet: root
-news: root
-webmaster: root
-www: root
-ftp: root
-abuse: root
-noc: root
-security: root
-root: $ADMIN_EMAIL
-EOF
-    
-    # Ensure correct permissions before running newaliases
-    if [ -f /etc/postfix/dynamicmaps.cf ]; then
-        chown root:root /etc/postfix/dynamicmaps.cf
-        chmod 644 /etc/postfix/dynamicmaps.cf
-    fi
-    
-    if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
-        chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
-        chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
-    fi
-    
-    # Update the aliases database
-    newaliases
-    
-    print_message "Email aliases setup completed"
-}
-
-export -f setup_mysql add_domain_to_mysql add_email_user setup_dovecot setup_email_aliases
+# Export functions to make them available to other scripts
+export -f setup_mysql add_domain_to_mysql add_email_user setup_dovecot
