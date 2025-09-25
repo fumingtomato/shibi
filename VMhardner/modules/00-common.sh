@@ -62,11 +62,16 @@ configure_setting() {
         log "Created backup of $file"
     fi
     
+    # Create file if it doesn't exist
+    if [ ! -f "$file" ]; then
+        touch "$file"
+    fi
+    
     # If the parameter doesn't exist or is commented, add/uncomment it
     if ! grep -q "^${parameter}" "$file" 2>/dev/null; then
         if grep -q "^#[[:space:]]*${parameter}" "$file" 2>/dev/null; then
-            # Uncomment the parameter
-            sed -i "s/^#[[:space:]]*${parameter}.*/${parameter} ${value}/" "$file"
+            # Uncomment the parameter - use | as delimiter to avoid conflicts with quotes
+            sed -i "\|^#[[:space:]]*${parameter}|s|.*|${parameter} ${value}|" "$file"
             log "Uncommented and set $parameter to $value in $file"
         else
             # Add the parameter
@@ -78,9 +83,10 @@ configure_setting() {
         fi
     else
         # If the parameter exists but has a different value, update it
-        current_value=$(grep "^${parameter}" "$file" | sed "s/^${parameter}[[:space:]]*//")
+        current_value=$(grep "^${parameter}" "$file" | sed "s|^${parameter}[[:space:]]*||")
         if [ "$current_value" != "$value" ]; then
-            sed -i "s/^${parameter}.*/${parameter} ${value}/" "$file"
+            # Use | as delimiter to avoid conflicts with quotes in values
+            sed -i "\|^${parameter}|s|.*|${parameter} ${value}|" "$file"
             log "Updated $parameter to $value in $file (was $current_value)"
         else
             log "Parameter $parameter already set to $value in $file"
