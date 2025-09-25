@@ -31,9 +31,9 @@ setup_monitoring() {
         sed_if_not_exists "max_log_file" "max_log_file = 50" /etc/audit/auditd.conf
         sed_if_not_exists "max_log_file_action" "max_log_file_action = rotate" /etc/audit/auditd.conf
         sed_if_not_exists "space_left" "space_left = 75" /etc/audit/auditd.conf
-        sed_if_not_exists "space_left_action" "space_left_action = email" /etc/audit/auditd.conf
+        sed_if_not_exists "space_left_action" "space_left_action = syslog" /etc/audit/auditd.conf
         sed_if_not_exists "admin_space_left" "admin_space_left = 50" /etc/audit/auditd.conf
-        sed_if_not_exists "admin_space_left_action" "admin_space_left_action = halt" /etc/audit/auditd.conf
+        sed_if_not_exists "admin_space_left_action" "admin_space_left_action = syslog" /etc/audit/auditd.conf
         
         # Add VM-specific audit rules
         if [ ! -f /etc/audit/rules.d/90-vm-monitoring.rules ]; then
@@ -61,33 +61,9 @@ EOF
         print_warning "auditd is not installed. Skipping audit configuration."
     fi
     
-    # Install and configure logwatch for daily reports if not already done
-    if ! command -v logwatch &> /dev/null; then
-        print_message "Installing logwatch for daily security reports..."
-        apt-get install -y logwatch
-        
-        # Configure logwatch
-        mkdir -p /etc/logwatch/conf/
-        cat > /etc/logwatch/conf/logwatch.conf <<EOF
-# Logwatch configuration
-Output = mail
-Format = html
-MailTo = root
-Detail = High
-Service = All
-# Add additional services
-Service = libvirt
-Service = sshd
-Service = pam
-EOF
-        
-        print_message "Logwatch configured successfully"
-    else
-        print_message "Logwatch is already installed"
-    fi
-    
-    # Setup VM monitoring script
-    print_message "Creating VM monitoring script..."
+    # Instead of installing logwatch (which pulls in postfix),
+    # set up a simple monitoring script to write to local log files only
+    print_message "Creating VM monitoring script without email dependencies..."
     
     cat > /usr/local/bin/vm-monitor.sh <<'EOFSCRIPT'
 #!/bin/bash
@@ -129,12 +105,12 @@ grep -i error /var/log/libvirt/libvirtd.log 2>/dev/null | tail -20 >> $REPORT_FI
 echo "======== End of Report ========" >> $REPORT_FILE
 echo "" >> $REPORT_FILE
 
-# Email the report if over threshold
+# Alert to syslog if over threshold
 CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}' | cut -d. -f1)
 MEMORY_USAGE=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
 
 if [ "$CPU_USAGE" -gt 80 ] || [ "$MEMORY_USAGE" -gt 80 ]; then
-    cat $REPORT_FILE | mail -s "WARNING: High resource usage on VM host" root
+    logger -p local0.warning "VM Host Warning: High resource usage - CPU: ${CPU_USAGE}%, Memory: ${MEMORY_USAGE}%"
 fi
 EOFSCRIPT
     
