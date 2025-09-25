@@ -24,14 +24,33 @@ setup_mysql() {
     # Create the directory if it doesn't exist
     mkdir -p /etc/postfix/dynamicmaps.cf.d
     
+    # Check if mysql entry already exists in dynamicmaps.cf
+    if grep -q "mysql.*dict_mysql_open" /etc/postfix/dynamicmaps.cf 2>/dev/null; then
+        print_message "MySQL dynamic map already configured in main dynamicmaps.cf"
+    else
+        print_message "Adding MySQL to main dynamicmaps.cf"
+        echo "mysql   postfix-mysql.so.1.0.1   dict_mysql_open" >> /etc/postfix/dynamicmaps.cf
+    fi
+    
+    # Check if the mysql file already exists
+    if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
+        print_message "Replacing existing MySQL dynamic maps configuration file"
+    fi
+    
     # Create the MySQL dynamic maps configuration file with correct content
     cat > /etc/postfix/dynamicmaps.cf.d/mysql <<EOF
 mysql   postfix-mysql.so.1.0.1   dict_mysql_open
 EOF
     
-    # Ensure dynamicmaps.cf is owned by root:root to avoid security warnings
+    # Ensure proper ownership and permissions
     chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
     chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+    
+    # Also fix permissions on the main dynamicmaps.cf file if it exists
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        chown root:root /etc/postfix/dynamicmaps.cf
+        chmod 644 /etc/postfix/dynamicmaps.cf
+    fi
     
     # Create a secure random password for the mail user
     DB_PASSWORD=$(openssl rand -base64 32)
@@ -149,7 +168,7 @@ EOF
     
     # Restart Postfix to recognize MySQL maps
     print_message "Restarting Postfix to apply MySQL configuration..."
-    systemctl restart postfix
+    postfix reload
 }
 
 # Add a domain to the MySQL database
@@ -487,8 +506,12 @@ setup_email_aliases() {
         cp /etc/aliases /etc/aliases.bak
     fi
     
-    # Create basic aliases
-    cat > /etc/aliases <<EOF
+    # Check if root alias exists
+    if grep -q "^root:" /etc/aliases; then
+        print_message "Root alias already exists in /etc/aliases"
+    else
+        # Create basic aliases with root alias
+        cat > /etc/aliases <<EOF
 # Basic system aliases
 mailer-daemon: postmaster
 postmaster: root
@@ -504,6 +527,7 @@ noc: root
 security: root
 root: $ADMIN_EMAIL
 EOF
+    fi
     
     # Update the aliases database
     newaliases
