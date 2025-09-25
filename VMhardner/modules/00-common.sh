@@ -67,30 +67,55 @@ configure_setting() {
         touch "$file"
     fi
     
-    # If the parameter doesn't exist or is commented, add/uncomment it
-    if ! grep -q "^${parameter}" "$file" 2>/dev/null; then
-        if grep -q "^#[[:space:]]*${parameter}" "$file" 2>/dev/null; then
-            # Uncomment the parameter - use | as delimiter to avoid conflicts with quotes
-            sed -i "\|^#[[:space:]]*${parameter}|s|.*|${parameter} ${value}|" "$file"
-            log "Uncommented and set $parameter to $value in $file"
-        else
-            # Add the parameter
-            if [ -n "$comment" ]; then
-                echo -e "\n# $comment" >> "$file"
+    # Escape special characters in the value for sed
+    local escaped_value=$(printf '%s\n' "$value" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    
+    # Check if parameter exists (commented or not)
+    if grep -q "^${parameter}\|^#.*${parameter}" "$file" 2>/dev/null; then
+        # Parameter exists (maybe commented), update or uncomment it
+        if grep -q "^${parameter}" "$file" 2>/dev/null; then
+            # Parameter is active, check if value needs updating
+            current_line=$(grep "^${parameter}" "$file" | head -1)
+            if [ "$current_line" != "${parameter} ${value}" ]; then
+                # Use a temporary file for safer editing
+                grep -v "^${parameter}" "$file" > "${file}.tmp"
+                echo "${parameter} ${value}" >> "${file}.tmp"
+                mv "${file}.tmp" "$file"
+                log "Updated $parameter to $value in $file"
+            else
+                log "Parameter $parameter already set to $value in $file"
             fi
-            echo "${parameter} ${value}" >> "$file"
-            log "Added $parameter with value $value to $file"
+        else
+            # Parameter is commented, uncomment and set it
+            grep -v "^#.*${parameter}" "$file" > "${file}.tmp"
+            echo "${parameter} ${value}" >> "${file}.tmp"
+            mv "${file}.tmp" "$file"
+            log "Uncommented and set $parameter to $value in $file"
         fi
     else
-        # If the parameter exists but has a different value, update it
-        current_value=$(grep "^${parameter}" "$file" | sed "s|^${parameter}[[:space:]]*||")
-        if [ "$current_value" != "$value" ]; then
-            # Use | as delimiter to avoid conflicts with quotes in values
-            sed -i "\|^${parameter}|s|.*|${parameter} ${value}|" "$file"
-            log "Updated $parameter to $value in $file (was $current_value)"
-        else
-            log "Parameter $parameter already set to $value in $file"
+        # Parameter doesn't exist, add it
+        if [ -n "$comment" ]; then
+            echo -e "\n# $comment" >> "$file"
         fi
+        echo "${parameter} ${value}" >> "$file"
+        log "Added $parameter with value $value to $file"
+    fi
+}
+
+# Alternative function for auditd settings
+sed_if_not_exists() {
+    local param="$1"
+    local value="$2"
+    local file="$3"
+    
+    if grep -q "^${param}" "$file" 2>/dev/null; then
+        # Parameter exists, update it
+        grep -v "^${param}" "$file" > "${file}.tmp"
+        echo "$value" >> "${file}.tmp"
+        mv "${file}.tmp" "$file"
+    else
+        # Parameter doesn't exist, add it
+        echo "$value" >> "$file"
     fi
 }
 
