@@ -31,7 +31,7 @@ setup_mysql() {
     # Create the directory if it doesn't exist
     mkdir -p /etc/postfix/dynamicmaps.cf.d
     
-    # Check for duplicate mysql entries and remove them if found
+    # Remove any existing mysql file to prevent duplicates
     if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
         print_message "Removing existing mysql dynamicmaps file to prevent duplicates..."
         rm -f /etc/postfix/dynamicmaps.cf.d/mysql
@@ -42,7 +42,7 @@ setup_mysql() {
 mysql   postfix-mysql.so.1.0.1   dict_mysql_open
 EOF
     
-    # Ensure dynamicmaps.cf is owned by root:root to avoid security warnings
+    # Ensure proper ownership and permissions
     chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
     chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
     
@@ -171,6 +171,20 @@ EOF
         echo "root: $ADMIN_EMAIL" >> /etc/aliases
         newaliases
     fi
+    
+    # Fix permissions for Postfix files to prevent security warnings
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        chown root:root /etc/postfix/dynamicmaps.cf
+        chmod 644 /etc/postfix/dynamicmaps.cf
+    fi
+    
+    if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
+        chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
+        chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+    fi
+    
+    # Restart Postfix to recognize MySQL maps
+    print_message "Restarting Postfix to apply MySQL configuration..."
     
     # Verify mysql module is loaded
     if ! postconf -m | grep -q mysql; then
