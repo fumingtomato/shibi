@@ -71,7 +71,7 @@ modules=(
     "security_hardening.sh"
     "mailwizz_integration.sh"
     "utility_scripts.sh"
-    "sticky_ip.sh"  # Added the missing sticky_ip.sh module
+    "sticky_ip.sh"  # Important: Make sure sticky_ip.sh is included
     "main_installer.sh"
     "main_installer_part2.sh"
 )
