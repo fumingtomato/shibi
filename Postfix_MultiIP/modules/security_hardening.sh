@@ -91,6 +91,18 @@ EOF
     systemctl enable fail2ban
     systemctl restart fail2ban
     
+    # Fix permissions for critical Postfix files
+    print_message "Fixing permissions for Postfix configuration files..."
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        chown root:root /etc/postfix/dynamicmaps.cf
+        chmod 644 /etc/postfix/dynamicmaps.cf
+    fi
+    
+    if [ -d /etc/postfix/dynamicmaps.cf.d/ ]; then
+        chown -R root:root /etc/postfix/dynamicmaps.cf.d/
+        chmod -R 644 /etc/postfix/dynamicmaps.cf.d/*
+    fi
+    
     # Check if rate limiting is already configured
     print_message "Configuring Postfix rate limits for bulk mail..."
     
