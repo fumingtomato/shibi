@@ -73,9 +73,6 @@ fi
 check_files() {
     local missing_files=0
     
-    # Debug: Show where we're looking for files
-    print_message "Looking for files in: $SCRIPT_DIR"
-    
     # Check for config file
     if [ ! -f "${CONFIG_DIR}/settings.conf" ]; then
         print_error "Missing configuration file: ${CONFIG_DIR}/settings.conf"
