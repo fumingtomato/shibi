@@ -48,23 +48,9 @@ EOF
         log "VM resource control settings already exist"
     fi
     
-    print_message "Setting up OOM protection for libvirtd..."
-    log "Setting up OOM protection for libvirtd"
-    
-    if ! grep -q "OOMScoreAdjust=-900" /etc/systemd/system/libvirtd.service.d/override.conf 2>/dev/null; then
-        mkdir -p /etc/systemd/system/libvirtd.service.d/
-        cat > /etc/systemd/system/libvirtd.service.d/override.conf <<EOF
-[Service]
-OOMScoreAdjust=-900
-EOF
-        log "Created OOM protection override for libvirtd"
-        
-        systemctl daemon-reload
-        systemctl restart libvirtd
-        log "Applied OOM protection settings and restarted libvirtd"
-    else
-        log "OOM protection for libvirtd already configured"
-    fi
+    # NOTE: Removed OOMScoreAdjust for libvirtd as it causes startup failures
+    # The OOM killer protection was causing systemd to fail starting libvirtd
+    # Default systemd settings provide adequate protection without custom OOMScoreAdjust
     
     print_message "VM resource controls configured."
     log "VM resource controls configured successfully"
