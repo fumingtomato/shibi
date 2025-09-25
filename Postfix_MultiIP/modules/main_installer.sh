@@ -45,6 +45,14 @@ first_time_installation_multi_ip() {
     # Setup timezone
     setup_timezone
     
+    # Ask about Sticky IP feature
+    print_header "Sticky IP Configuration"
+    print_message "The Sticky IP feature ensures that contacts who engage with your emails"
+    print_message "always receive future emails from the same IP address, improving deliverability."
+    
+    read -p "Enable Sticky IP feature? (y/n) [y]: " enable_sticky_ip
+    enable_sticky_ip=${enable_sticky_ip:-y}
+    
     # Cloudflare integration
     print_header "Cloudflare Integration (Optional)"
     print_message "To automatically configure DNS records, please provide your Cloudflare credentials."
@@ -67,6 +75,8 @@ first_time_installation_multi_ip() {
     for ip in "${IP_ADDRESSES[@]}"; do
         echo "  - $ip"
     done
+    echo "IP Distribution: Round-robin (default)"
+    echo "Sticky IP Feature: $([[ "$enable_sticky_ip" == "y" ]] && echo "Enabled" || echo "Disabled")"
     echo "Timezone: $timezone"
     
     read -p "Is this information correct? (y/n): " confirm
@@ -79,6 +89,7 @@ first_time_installation_multi_ip() {
     export DOMAIN_NAME HOSTNAME ADMIN_EMAIL BRAND_NAME
     export MAIL_USERNAME MAIL_PASSWORD
     export CF_API_TOKEN CF_ZONE_ID
+    export ENABLE_STICKY_IP=$enable_sticky_ip
     
     # Start installation
     print_message "Starting multi-IP mail server installation..."
@@ -94,20 +105,32 @@ first_time_installation_multi_ip() {
         configure_network_interfaces
     fi
     
-setup_mysql                 # 1. First - Install MySQL & postfix-mysql
-add_domain_to_mysql "$DOMAIN_NAME"
-add_email_user "${MAIL_USERNAME}@${DOMAIN_NAME}" "${MAIL_PASSWORD}"
-setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"  # 3. Setup Dovecot (uses MySQL)
-setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"  # 4. NOW setup Postfix (MySQL is ready)
-create_ip_rotation_config               # 5. Configure IP rotation for Postfix
-setup_opendkim "$DOMAIN_NAME"          # 6. Setup DKIM
+    setup_mysql                 # 1. First - Install MySQL & postfix-mysql
+    add_domain_to_mysql "$DOMAIN_NAME"
+    add_email_user "${MAIL_USERNAME}@${DOMAIN_NAME}" "${MAIL_PASSWORD}"
+    
+    # Setup Sticky IP if enabled
+    if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
+        setup_sticky_ip_db
+    fi
+    
+    setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"  # 3. Setup Dovecot (uses MySQL)
+    setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"  # 4. NOW setup Postfix (MySQL is ready)
+    create_ip_rotation_config               # 5. Configure IP rotation for Postfix
+    
+    # Configure Sticky IP Postfix settings if enabled
+    if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
+        configure_sticky_ip_postfix
+    fi
+    
+    setup_opendkim "$DOMAIN_NAME"          # 6. Setup DKIM
     
     # Setup web and SSL
     setup_nginx "$DOMAIN_NAME" "$HOSTNAME"
     
     # Now setup DNS (which will add DKIM to Cloudflare)
     if [ ! -z "$CLOUDFLARE_API_KEY" ]; then
-    setup_cloudflare_dns "$DOMAIN_NAME"  # This will now have DKIM ready
+        setup_cloudflare_dns "$DOMAIN_NAME"  # This will now have DKIM ready
     fi
 
     if [ ! -z "$CF_API_TOKEN" ]; then
@@ -122,6 +145,13 @@ setup_opendkim "$DOMAIN_NAME"          # 6. Setup DKIM
     create_ip_warmup_scripts
     create_monitoring_scripts
     create_mailwizz_multi_ip_guide "$DOMAIN_NAME"
+    
+    # Create Sticky IP utilities if enabled
+    if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
+        create_sticky_ip_utility
+        create_mailwizz_sticky_ip_integration
+    fi
+    
     create_ptr_instructions
     
     # Apply hardening
@@ -143,6 +173,16 @@ setup_opendkim "$DOMAIN_NAME"          # 6. Setup DKIM
     print_message "Your Multi-IP Bulk Mail Server has been successfully installed!"
     print_message ""
     print_message "Configured with ${#IP_ADDRESSES[@]} IP address(es) for load balancing and rotation."
+    print_message "Default IP distribution: Round-robin"
+    
+    if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
+        print_message "Sticky IP feature is ENABLED: Contacts who open/click emails will receive"
+        print_message "future emails from the same IP address."
+        print_message ""
+        print_message "Sticky IP management: /usr/local/bin/sticky-ip-manager"
+        print_message "See the guide at: /root/mailwizz-sticky-ip-guide.txt"
+    fi
+    
     print_message ""
     print_message "NEXT STEPS:"
     print_message "1. Configure reverse DNS for all IPs with your hosting provider"
