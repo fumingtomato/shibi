@@ -107,7 +107,7 @@ restart_all_services() {
         print_message "Restarting $service..."
         systemctl restart $service || print_error "Failed to restart $service"
         systemctl enable $service
-    fi
+    done
 }
 
 # Save configuration for future reference
