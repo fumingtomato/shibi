@@ -12,7 +12,7 @@ set -e
 VERSION="1.0.0"
 
 # Base URL for downloading script modules
-REPO_URL="https://raw.githubusercontent.com/fumingtomato/vm-host-hardener/main"
+REPO_URL="https://raw.githubusercontent.com/fumingtomato/shibi/main/VMhardner"
 
 # Local paths
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
