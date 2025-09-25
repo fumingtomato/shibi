@@ -172,9 +172,6 @@ EOF
         newaliases
     fi
     
-    # Restart Postfix to recognize MySQL maps
-    print_message "Restarting Postfix to apply MySQL configuration..."
-    
     # Verify mysql module is loaded
     if ! postconf -m | grep -q mysql; then
         print_error "MySQL module still not detected in Postfix after configuration"
@@ -527,7 +524,7 @@ EOF
 
 # Setup email aliases
 setup_email_aliases() {
-    print_message "Setting up system-wide email aliases..."
+    print_message "Setting up email aliases..."
     
     # Backup existing aliases file
     if [ -f /etc/aliases ]; then
@@ -551,6 +548,17 @@ noc: root
 security: root
 root: $ADMIN_EMAIL
 EOF
+    
+    # Ensure correct permissions before running newaliases
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        chown root:root /etc/postfix/dynamicmaps.cf
+        chmod 644 /etc/postfix/dynamicmaps.cf
+    fi
+    
+    if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
+        chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
+        chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+    fi
     
     # Update the aliases database
     newaliases
