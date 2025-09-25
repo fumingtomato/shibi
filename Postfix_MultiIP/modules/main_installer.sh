@@ -111,7 +111,12 @@ first_time_installation_multi_ip() {
     
     # Setup Sticky IP if enabled
     if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
-        setup_sticky_ip_db
+        # Make sure sticky_ip.sh is sourced before using its functions
+        if type setup_sticky_ip_db &>/dev/null; then
+            setup_sticky_ip_db
+        else
+            print_error "Sticky IP module not loaded properly. Skipping sticky IP setup."
+        fi
     fi
     
     setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"  # 3. Setup Dovecot (uses MySQL)
@@ -120,7 +125,11 @@ first_time_installation_multi_ip() {
     
     # Configure Sticky IP Postfix settings if enabled
     if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
-        configure_sticky_ip_postfix
+        if type configure_sticky_ip_postfix &>/dev/null; then
+            configure_sticky_ip_postfix
+        else
+            print_error "Sticky IP module not loaded properly. Skipping sticky IP postfix config."
+        fi
     fi
     
     setup_opendkim "$DOMAIN_NAME"          # 6. Setup DKIM
@@ -148,8 +157,12 @@ first_time_installation_multi_ip() {
     
     # Create Sticky IP utilities if enabled
     if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
-        create_sticky_ip_utility
-        create_mailwizz_sticky_ip_integration
+        if type create_sticky_ip_utility &>/dev/null; then
+            create_sticky_ip_utility
+            create_mailwizz_sticky_ip_integration
+        else
+            print_error "Sticky IP module not loaded properly. Skipping sticky IP utilities."
+        fi
     fi
     
     create_ptr_instructions
