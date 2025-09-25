@@ -583,5 +583,5 @@ EOF
     print_message "MailWizz sticky IP integration guide created at /root/mailwizz-sticky-ip-guide.txt"
 }
 
-# Export functions
+# Explicitly export all functions to make them available to the main script
 export -f setup_sticky_ip_db configure_sticky_ip_postfix create_sticky_ip_utility create_mailwizz_sticky_ip_integration
