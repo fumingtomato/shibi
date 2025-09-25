@@ -60,6 +60,7 @@ cd "$INSTALLER_DIR"
 # Download all modules
 print_message "Downloading installer modules..."
 
+# Important: ensure sticky_ip.sh comes BEFORE main_installer.sh to make functions available
 modules=(
     "core_functions.sh"
     "multiip_config.sh"
@@ -71,7 +72,7 @@ modules=(
     "security_hardening.sh"
     "mailwizz_integration.sh"
     "utility_scripts.sh"
-    "sticky_ip.sh"  # Important: Make sure sticky_ip.sh is included
+    "sticky_ip.sh"
     "main_installer.sh"
     "main_installer_part2.sh"
 )
@@ -96,7 +97,17 @@ print_message "All modules downloaded successfully"
 # Source all modules
 print_message "Loading modules..."
 for module in "${modules[@]}"; do
+    print_message "Loading module: $module"
     source "./$module"
+    # Verify key functions from sticky_ip.sh are loaded
+    if [[ "$module" == "sticky_ip.sh" ]]; then
+        if ! type setup_sticky_ip_db &>/dev/null; then
+            print_error "Failed to load setup_sticky_ip_db function from sticky_ip.sh"
+            exit 1
+        else
+            print_message "Successfully loaded sticky IP functions"
+        fi
+    fi
 done
 
 print_message "All modules loaded successfully"
