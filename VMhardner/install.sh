@@ -1,8 +1,8 @@
 #!/bin/bash
 # =================================================================
-# VM Host Hardener - Installation Script
-# Downloads and installs the complete VM Host Hardener from GitHub
-# For Ubuntu 24.04 LTS
+# VM Host Hardener - Installation and Execution Script
+# Downloads and immediately runs the VM Host Hardener
+# For Ubuntu 24.04 LTS hosting mail, web, and NextCloud VMs
 # =================================================================
 
 set -e
@@ -45,7 +45,10 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
-print_header "VM Host Hardener - Installation"
+print_header "VM Host Hardener - Installation & Execution"
+print_message "This script will install and immediately run the VM host hardening process"
+print_message "Optimized for hosts running mail, web, and NextCloud VMs"
+echo ""
 
 # Create installation directory
 INSTALL_DIR="/opt/vm-host-hardener"
@@ -152,27 +155,33 @@ fi
 if [ "$all_files_present" = true ]; then
     print_message "✓ All files downloaded successfully"
     
-    print_header "Installation Complete!"
+    print_header "Starting VM Host Hardening Process"
     print_message ""
-    print_message "VM Host Hardener has been installed to: $INSTALL_DIR"
+    print_message "The hardening process will now begin automatically."
+    print_message "This script is optimized for hosts running:"
+    print_message "  • Mail server VMs (SMTP/IMAP)"
+    print_message "  • Web server VMs (HTTP/HTTPS)"
+    print_message "  • NextCloud VMs"
     print_message ""
-    print_message "You can now run the hardening script using any of these commands:"
-    print_message "  sudo vm-hardener"
-    print_message "  sudo $INSTALL_DIR/harden-vm-host.sh"
+    print_warning "The following ports will be automatically configured:"
+    print_message "  • SSH (22 or custom if configured)"
+    print_message "  • HTTP (80) - For web and NextCloud VMs"
+    print_message "  • HTTPS (443) - For web and NextCloud VMs"
+    print_message "  • SMTP (25) - For mail server VMs"
+    print_message "  • SMTPS/Submission (465/587) - For mail server VMs"
+    print_message "  • IMAP (143) - For mail server VMs"
+    print_message "  • IMAPS (993) - For mail server VMs"
     print_message ""
-    print_message "To check the installation:"
-    print_message "  sudo vm-hardener --check"
-    print_message ""
-    print_message "To start the hardening process:"
-    print_message "  sudo vm-hardener"
-    print_message ""
-    print_message "For help:"
-    print_message "  sudo vm-hardener --help"
+    
+    read -p "Press Enter to continue with the hardening process..."
+    
+    # Run the hardening script directly
+    print_header "Executing VM Host Hardening"
+    exec "$INSTALL_DIR/harden-vm-host.sh"
+    
 else
     print_error ""
     print_error "Installation verification failed!"
     print_error "Some files are missing. Please run the installer again."
     exit 1
 fi
-
-exit 0
