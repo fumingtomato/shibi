@@ -122,11 +122,11 @@ configure_firewall() {
             log "No additional ports requested"
         fi
         
-        # Enable the firewall
+        # Enable the firewall - use --force to skip the prompt
         print_message ""
         print_message "Enabling UFW firewall..."
         log "Enabling UFW firewall"
-        echo "y" | ufw enable
+        ufw --force enable
         print_message "✓ Firewall enabled successfully"
         log "UFW enabled"
         
