@@ -371,7 +371,6 @@ body_checks = regexp:/etc/postfix/body_checks
 # Logging
 maillog_file = /var/log/mail.log
 debug_peer_level = 2
-
 EOF
     
     # Create MySQL configuration files
