@@ -11,13 +11,15 @@ set -e
 # Script version
 VERSION="1.0.0"
 
-# Base URL for downloading script modules
-REPO_URL="https://raw.githubusercontent.com/fumingtomato/shibi/main/VMhardner"
-
 # Local paths
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONFIG_DIR="${SCRIPT_DIR}/config"
 MODULES_DIR="${SCRIPT_DIR}/modules"
+
+# Export these for use in modules
+export CONFIG_DIR
+export MODULES_DIR
+export VERSION
 
 # Color codes for output
 GREEN='\033[0;32m'
@@ -51,38 +53,17 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
-# Function to download a file if it doesn't exist or force download is specified
-download_file() {
-    local file_path="$1"
-    local file_url="$2"
-    local force="$3"
-    local dir=$(dirname "$file_path")
+# Function to check if all required files exist
+check_files() {
+    local missing_files=0
     
-    # Create directory if it doesn't exist
-    mkdir -p "$dir"
-    
-    if [ ! -f "$file_path" ] || [ "$force" == "force" ]; then
-        print_message "Downloading $file_path..."
-        curl -s -o "$file_path" "$file_url" || {
-            print_error "Failed to download $file_url"
-            exit 1
-        }
-        chmod +x "$file_path" 2>/dev/null || true
+    # Check for config file
+    if [ ! -f "${CONFIG_DIR}/settings.conf" ]; then
+        print_error "Missing configuration file: ${CONFIG_DIR}/settings.conf"
+        missing_files=1
     fi
-}
-
-# Download and setup the required files
-setup_files() {
-    print_header "Setting up VM Host Hardening Script"
     
-    # Create necessary directories
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$MODULES_DIR"
-    
-    # Download configuration files
-    download_file "${CONFIG_DIR}/settings.conf" "${REPO_URL}/config/settings.conf" "$1"
-    
-    # Download module files
+    # Check for module files
     MODULE_FILES=(
         "00-common.sh"
         "01-system-checks.sh"
@@ -100,8 +81,18 @@ setup_files() {
     )
     
     for module in "${MODULE_FILES[@]}"; do
-        download_file "${MODULES_DIR}/${module}" "${REPO_URL}/modules/${module}" "$1"
+        if [ ! -f "${MODULES_DIR}/${module}" ]; then
+            print_error "Missing module file: ${MODULES_DIR}/${module}"
+            missing_files=1
+        fi
     done
+    
+    if [ $missing_files -eq 1 ]; then
+        print_error ""
+        print_error "Required files are missing. Please ensure all files are present."
+        print_error "Run the install.sh script first if you haven't already."
+        exit 1
+    fi
 }
 
 # Function to source a module file and handle errors
@@ -110,7 +101,7 @@ source_module() {
     if [ -f "$module" ]; then
         source "$module"
     else
-        print_error "Module $module not found. Please run the script with --update to download all modules."
+        print_error "Module $module not found."
         exit 1
     fi
 }
@@ -118,6 +109,9 @@ source_module() {
 # Main function to run the hardening process
 run_hardening() {
     print_header "VM Host Hardening Process v$VERSION"
+    
+    # Check that all required files exist
+    check_files
     
     # Source common functions and variables
     source_module "${MODULES_DIR}/00-common.sh"
@@ -148,13 +142,13 @@ run_hardening() {
     run_storage_security
     
     source_module "${MODULES_DIR}/09-monitoring.sh"
-    run_monitoring
+    setup_monitoring
     
     source_module "${MODULES_DIR}/10-backups.sh"
-    run_backups
+    configure_backups
     
     source_module "${MODULES_DIR}/11-kernel-hardening.sh"
-    run_kernel_hardening
+    harden_kernel
     
     source_module "${MODULES_DIR}/12-security-report.sh"
     run_security_report
@@ -167,24 +161,22 @@ run_hardening() {
 
 # Parse command line arguments
 case "$1" in
-    --update)
-        setup_files "force"
-        ;;
     --help|-h)
         echo "Usage: $0 [OPTION]"
         echo "Options:"
         echo "  --help, -h    Display this help message"
-        echo "  --update      Force update all script files"
         echo "  --version     Display version information"
-        echo "  No option will run the hardening process"
+        echo "  --check       Check if all required files are present"
+        echo "  No option     Run the hardening process"
         ;;
     --version|-v)
         echo "VM Host Hardening Script v$VERSION"
         ;;
+    --check)
+        check_files
+        print_message "All required files are present."
+        ;;
     *)
-        # Setup files if they don't exist
-        setup_files
-        
         # Run the hardening process
         run_hardening
         ;;
