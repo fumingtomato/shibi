@@ -132,104 +132,21 @@ EOF
         done
     fi
     
-    # Set up traffic filtering between VMs if needed
+    # SIMPLIFIED: Skip VM isolation since it's too complex for multiple VMs
+    # Users can configure their own iptables rules if needed
     if [ "$ENABLE_VM_ISOLATION" == "true" ]; then
-        print_message "Configuring VM traffic isolation..."
-        log "Configuring VM traffic isolation"
-        
-        # Check if we have multiple VMs that should be isolated
-        if [ "$(echo "$VM_LIST" | wc -l)" -gt 1 ]; then
-            read -p "Do you want to isolate traffic between the mail server and web server VMs? (y/n): " isolate_vms
-            
-            if [[ "$isolate_vms" == "y" || "$isolate_vms" == "Y" ]]; then
-                # List available VMs
-                print_message "Available VMs:"
-                echo "$VM_LIST"
-                
-                read -p "Enter the name of your mail server VM: " MAIL_VM
-                read -p "Enter the name of your web server VM: " WEB_VM
-                
-                if virsh dominfo "$MAIL_VM" &>/dev/null && virsh dominfo "$WEB_VM" &>/dev/null; then
-                    print_message "Creating VM isolation rules..."
-                    log "Creating VM isolation rules for $MAIL_VM and $WEB_VM"
-                    
-                    # Get MAC addresses of the VMs
-                    MAIL_MAC=$(virsh domiflist "$MAIL_VM" | grep -o -E "([0-9a-f]{2}:){5}([0-9a-f]{2})" | head -1)
-                    WEB_MAC=$(virsh domiflist "$WEB_VM" | grep -o -E "([0-9a-f]{2}:){5}([0-9a-f]{2})" | head -1)
-                    
-                    if [ -z "$MAIL_MAC" ] || [ -z "$WEB_MAC" ]; then
-                        print_error "Could not determine MAC addresses of VMs. Skipping VM isolation."
-                        log "ERROR: Could not determine MAC addresses of VMs"
-                        return
-                    fi
-                    
-                    # Create custom chain for VM filtering
-                    iptables -N VM_ISOLATION 2>/dev/null || true
-                    
-                    # Clear the chain
-                    iptables -F VM_ISOLATION
-                    
-                    # Allow established connections
-                    iptables -A VM_ISOLATION -m state --state ESTABLISHED,RELATED -j ACCEPT
-                    
-                    # Allow mail server ports to web server (for email sending)
-                    iptables -A VM_ISOLATION -p tcp -m mac --mac-source $MAIL_MAC -m multiport --dports 80,443 -j ACCEPT
-                    
-                    # Allow web server to mail server only on mail ports
-                    iptables -A VM_ISOLATION -p tcp -m mac --mac-source $WEB_MAC -m multiport --dports 25,587,465 -j ACCEPT
-                    
-                    # Block other traffic between VMs
-                    iptables -A VM_ISOLATION -j DROP
-                    
-                    # Apply the chain to the forward table
-                    iptables -C FORWARD -j VM_ISOLATION 2>/dev/null || iptables -A FORWARD -j VM_ISOLATION
-                    
-                    # Save iptables rules for persistence
-                    if command_exists iptables-save; then
-                        print_message "Saving iptables rules..."
-                        log "Saving iptables rules"
-                        mkdir -p /etc/iptables/
-                        iptables-save > /etc/iptables/rules.v4
-                        
-                        # Ensure rules are loaded at boot
-                        if [ ! -f /etc/systemd/system/iptables-restore.service ]; then
-                            cat > /etc/systemd/system/iptables-restore.service <<EOF
-[Unit]
-Description=Restore iptables firewall rules
-Before=network-pre.target
-Wants=network-pre.target
-
-[Service]
-Type=oneshot
-ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
-ExecStartPost=/sbin/ip6tables-restore /etc/iptables/rules.v6 || true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-                            systemctl daemon-reload
-                            systemctl enable iptables-restore
-                            log "Created and enabled iptables-restore service"
-                        fi
-                    else
-                        print_warning "iptables-save not found. Rules will not persist across reboots."
-                        log "WARNING: iptables-save not found. Rules will not persist across reboots"
-                    fi
-                    
-                    print_message "VM traffic isolation rules created."
-                    log "VM traffic isolation rules created"
-                else
-                    print_error "One or both of the specified VMs do not exist."
-                    log "ERROR: One or both of the specified VMs do not exist"
-                fi
-            else
-                log "Skipped VM traffic isolation"
-            fi
-        else
-            print_message "Not enough VMs detected for isolation rules."
-            log "Not enough VMs detected for isolation rules"
-        fi
+        print_message "VM isolation is enabled in settings."
+        print_message "Note: Automatic VM-to-VM isolation has been skipped."
+        print_message "With multiple mail and web servers, isolation rules should be"
+        print_message "configured manually based on your specific requirements."
+        print_message ""
+        print_message "For manual configuration, you can use iptables rules like:"
+        print_message "  iptables -I FORWARD -s VM1_IP -d VM2_IP -j DROP"
+        print_message "  iptables -I FORWARD -s VM2_IP -d VM1_IP -j DROP"
+        log "Skipped automatic VM isolation - manual configuration recommended for complex setups"
     else
         log "VM isolation is disabled in settings"
     fi
+    
+    print_message "Network security configuration completed."
 }
