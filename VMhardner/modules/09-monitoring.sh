@@ -2,12 +2,16 @@
 # Module: 09-monitoring.sh - System Auditing and Monitoring Configuration
 # Part of VM Host Hardening Script
 
-# Source common functions
-if [ -f "$(dirname "$0")/00-common.sh" ]; then
-    source "$(dirname "$0")/00-common.sh"
-else
-    echo "Error: Could not find common functions file"
-    exit 1
+# Check if we're being run standalone or as part of the main script
+if [ -z "$LOG_FILE" ]; then
+    # Running standalone, need to source common
+    SCRIPT_DIR="$(dirname "$0")"
+    if [ -f "${SCRIPT_DIR}/00-common.sh" ]; then
+        source "${SCRIPT_DIR}/00-common.sh"
+    else
+        echo "Error: Could not find common functions file"
+        exit 1
+    fi
 fi
 
 setup_monitoring() {
@@ -85,54 +89,54 @@ EOF
     # Setup VM monitoring script
     print_message "Creating VM monitoring script..."
     
-    cat > /usr/local/bin/vm-monitor.sh <<EOF
+    cat > /usr/local/bin/vm-monitor.sh <<'EOFSCRIPT'
 #!/bin/bash
 # VM Resource Monitoring Script
 
-DATE=\$(date +"%Y-%m-%d %H:%M:%S")
-REPORT_FILE="/var/log/vm-monitor-\$(date +%Y%m%d).log"
+DATE=$(date +"%Y-%m-%d %H:%M:%S")
+REPORT_FILE="/var/log/vm-monitor-$(date +%Y%m%d).log"
 
-echo "======== VM Monitor Report: \$DATE ========" >> \$REPORT_FILE
+echo "======== VM Monitor Report: $DATE ========" >> $REPORT_FILE
 
 # Check libvirt status
-echo "== Libvirt Service Status ==" >> \$REPORT_FILE
-systemctl status libvirtd --no-pager | grep "Active:" >> \$REPORT_FILE
+echo "== Libvirt Service Status ==" >> $REPORT_FILE
+systemctl status libvirtd --no-pager | grep "Active:" >> $REPORT_FILE
 
 # List running VMs
-echo -e "\n== Running VMs ==" >> \$REPORT_FILE
-virsh list --all >> \$REPORT_FILE
+echo -e "\n== Running VMs ==" >> $REPORT_FILE
+virsh list --all >> $REPORT_FILE
 
 # Check VM resource usage
-echo -e "\n== VM Resource Usage ==" >> \$REPORT_FILE
-for vm in \$(virsh list --name); do
-    echo "\$vm:" >> \$REPORT_FILE
-    virsh domstats \$vm --balloon --vcpu --interface --block >> \$REPORT_FILE
+echo -e "\n== VM Resource Usage ==" >> $REPORT_FILE
+for vm in $(virsh list --name); do
+    echo "$vm:" >> $REPORT_FILE
+    virsh domstats $vm --balloon --vcpu --interface --block >> $REPORT_FILE
 done
 
 # Check host resource usage
-echo -e "\n== Host Resource Usage ==" >> \$REPORT_FILE
-echo "CPU usage:" >> \$REPORT_FILE
-top -bn1 | grep "Cpu(s)" >> \$REPORT_FILE
-echo "Memory usage:" >> \$REPORT_FILE
-free -h >> \$REPORT_FILE
-echo "Disk usage:" >> \$REPORT_FILE
-df -h >> \$REPORT_FILE
+echo -e "\n== Host Resource Usage ==" >> $REPORT_FILE
+echo "CPU usage:" >> $REPORT_FILE
+top -bn1 | grep "Cpu(s)" >> $REPORT_FILE
+echo "Memory usage:" >> $REPORT_FILE
+free -h >> $REPORT_FILE
+echo "Disk usage:" >> $REPORT_FILE
+df -h >> $REPORT_FILE
 
 # Check for any issues in logs
-echo -e "\n== Recent Libvirt Errors ==" >> \$REPORT_FILE
-grep -i error /var/log/libvirt/libvirtd.log 2>/dev/null | tail -20 >> \$REPORT_FILE
+echo -e "\n== Recent Libvirt Errors ==" >> $REPORT_FILE
+grep -i error /var/log/libvirt/libvirtd.log 2>/dev/null | tail -20 >> $REPORT_FILE
 
-echo "======== End of Report ========" >> \$REPORT_FILE
-echo "" >> \$REPORT_FILE
+echo "======== End of Report ========" >> $REPORT_FILE
+echo "" >> $REPORT_FILE
 
 # Email the report if over threshold
-CPU_USAGE=\$(top -bn1 | grep "Cpu(s)" | awk '{print \$2 + \$4}' | cut -d. -f1)
-MEMORY_USAGE=\$(free | grep Mem | awk '{print int(\$3/\$2 * 100)}')
+CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}' | cut -d. -f1)
+MEMORY_USAGE=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
 
-if [ "\$CPU_USAGE" -gt 80 ] || [ "\$MEMORY_USAGE" -gt 80 ]; then
-    cat \$REPORT_FILE | mail -s "WARNING: High resource usage on VM host" root
+if [ "$CPU_USAGE" -gt 80 ] || [ "$MEMORY_USAGE" -gt 80 ]; then
+    cat $REPORT_FILE | mail -s "WARNING: High resource usage on VM host" root
 fi
-EOF
+EOFSCRIPT
     
     chmod +x /usr/local/bin/vm-monitor.sh
     
