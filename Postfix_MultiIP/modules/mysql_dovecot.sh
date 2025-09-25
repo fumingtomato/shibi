@@ -21,20 +21,20 @@ setup_mysql() {
     # Make sure the postfix-mysql package is properly registered with Postfix
     print_message "Creating MySQL dynamic maps configuration for Postfix..."
     
+    # First check if postfix-mysql is properly loaded
+    postconf -m | grep -q mysql
+    if [ $? -ne 0 ]; then
+        print_warning "MySQL support not detected in Postfix, ensuring package is properly installed..."
+        apt-get install --reinstall postfix-mysql
+    fi
+    
     # Create the directory if it doesn't exist
     mkdir -p /etc/postfix/dynamicmaps.cf.d
     
-    # Check if mysql entry already exists in dynamicmaps.cf
-    if grep -q "mysql.*dict_mysql_open" /etc/postfix/dynamicmaps.cf 2>/dev/null; then
-        print_message "MySQL dynamic map already configured in main dynamicmaps.cf"
-    else
-        print_message "Adding MySQL to main dynamicmaps.cf"
-        echo "mysql   postfix-mysql.so.1.0.1   dict_mysql_open" >> /etc/postfix/dynamicmaps.cf
-    fi
-    
-    # Check if the mysql file already exists
+    # Check for duplicate mysql entries and remove them if found
     if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
-        print_message "Replacing existing MySQL dynamic maps configuration file"
+        print_message "Removing existing mysql dynamicmaps file to prevent duplicates..."
+        rm -f /etc/postfix/dynamicmaps.cf.d/mysql
     fi
     
     # Create the MySQL dynamic maps configuration file with correct content
@@ -42,11 +42,11 @@ setup_mysql() {
 mysql   postfix-mysql.so.1.0.1   dict_mysql_open
 EOF
     
-    # Ensure proper ownership and permissions
+    # Ensure dynamicmaps.cf is owned by root:root to avoid security warnings
     chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
     chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
     
-    # Also fix permissions on the main dynamicmaps.cf file if it exists
+    # Also fix main dynamicmaps.cf file permissions
     if [ -f /etc/postfix/dynamicmaps.cf ]; then
         chown root:root /etc/postfix/dynamicmaps.cf
         chmod 644 /etc/postfix/dynamicmaps.cf
@@ -68,7 +68,7 @@ EOF
     SQL_TMPFILE=$(mktemp)
     chmod 600 "$SQL_TMPFILE"
     
-    # Prepare SQL commands to setup the database and permissions - FIX: Create tables first
+    # Prepare SQL commands to setup the database and permissions - Create tables first
     cat > "$SQL_TMPFILE" <<EOF
 -- Create database if it doesn't exist
 CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -166,9 +166,37 @@ EOF
     # Store DB variables for other functions
     export DB_PASSWORD
     
+    # Fix root alias in /etc/aliases if needed
+    if ! grep -q "^root:" /etc/aliases; then
+        echo "root: $ADMIN_EMAIL" >> /etc/aliases
+        newaliases
+    fi
+    
     # Restart Postfix to recognize MySQL maps
     print_message "Restarting Postfix to apply MySQL configuration..."
-    postfix reload
+    
+    # Verify mysql module is loaded
+    if ! postconf -m | grep -q mysql; then
+        print_error "MySQL module still not detected in Postfix after configuration"
+        print_message "Attempting to fix by linking libraries..."
+        
+        # Check if the library exists
+        POSTFIX_MYSQL_LIB=$(find /usr/lib -name "dict_mysql.so*" | head -1)
+        if [ -n "$POSTFIX_MYSQL_LIB" ]; then
+            print_message "Found MySQL library at $POSTFIX_MYSQL_LIB"
+            # Update dynamicmaps.cf with correct path
+            echo "mysql   $POSTFIX_MYSQL_LIB   dict_mysql_open" > /etc/postfix/dynamicmaps.cf.d/mysql
+            chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+            chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
+        else
+            print_error "Could not find MySQL library for Postfix"
+            print_message "Installing dependencies and trying again..."
+            apt-get install -y libsasl2-modules postfix-mysql
+        fi
+    fi
+    
+    # Restart Postfix
+    systemctl restart postfix
 }
 
 # Add a domain to the MySQL database
@@ -506,12 +534,8 @@ setup_email_aliases() {
         cp /etc/aliases /etc/aliases.bak
     fi
     
-    # Check if root alias exists
-    if grep -q "^root:" /etc/aliases; then
-        print_message "Root alias already exists in /etc/aliases"
-    else
-        # Create basic aliases with root alias
-        cat > /etc/aliases <<EOF
+    # Create basic aliases
+    cat > /etc/aliases <<EOF
 # Basic system aliases
 mailer-daemon: postmaster
 postmaster: root
@@ -527,7 +551,6 @@ noc: root
 security: root
 root: $ADMIN_EMAIL
 EOF
-    fi
     
     # Update the aliases database
     newaliases
