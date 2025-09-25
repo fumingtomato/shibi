@@ -11,8 +11,16 @@ set -e
 # Script version
 VERSION="1.0.0"
 
+# Resolve the actual script location (following symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
 # Local paths
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONFIG_DIR="${SCRIPT_DIR}/config"
 MODULES_DIR="${SCRIPT_DIR}/modules"
 
@@ -46,6 +54,12 @@ print_header() {
     echo -e "${BLUE}$1${NC}"
     echo -e "${BLUE}==================================================${NC}"
 }
+
+# Export print functions for use in modules
+export -f print_message
+export -f print_warning
+export -f print_error
+export -f print_header
 
 # Check if script is run as root
 if [ "$(id -u)" != "0" ]; then
