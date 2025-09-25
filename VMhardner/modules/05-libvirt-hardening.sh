@@ -24,16 +24,29 @@ harden_libvirt() {
     print_message "Hardening libvirt configuration..."
     log "Hardening libvirt configuration"
     
-    # Secure libvirt daemon - note: no quotes in the actual values
-    configure_setting "/etc/libvirt/libvirtd.conf" "auth_unix_ro" "none" "Read-only socket authentication"
-    configure_setting "/etc/libvirt/libvirtd.conf" "auth_unix_rw" "polkit" "Read-write socket authentication"
-    configure_setting "/etc/libvirt/libvirtd.conf" "unix_sock_group" "libvirt" "Socket group ownership"
-    configure_setting "/etc/libvirt/libvirtd.conf" "unix_sock_ro_perms" "0770" "Read-only socket permissions"
-    configure_setting "/etc/libvirt/libvirtd.conf" "unix_sock_rw_perms" "0770" "Read-write socket permissions"
-    configure_setting "/etc/libvirt/libvirtd.conf" "unix_sock_admin_perms" "0700" "Admin socket permissions"
-    # Remove log settings that might cause issues
-    # configure_setting "/etc/libvirt/libvirtd.conf" "log_filters" "3:remote 4:event 3:json 3:rpc" "Log filters"
-    # configure_setting "/etc/libvirt/libvirtd.conf" "log_outputs" "1:file:/var/log/libvirt/libvirtd.log" "Log outputs"
+    # Function to set libvirt config with proper syntax
+    set_libvirt_config() {
+        local file="$1"
+        local param="$2"
+        local value="$3"
+        
+        # Check if parameter exists (commented or not)
+        if grep -q "^#*${param} =" "$file" 2>/dev/null; then
+            # Parameter exists, update it
+            sed -i "s|^#*${param} =.*|${param} = ${value}|" "$file"
+        else
+            # Add parameter if it doesn't exist
+            echo "${param} = ${value}" >> "$file"
+        fi
+    }
+    
+    # Secure libvirt daemon settings
+    set_libvirt_config "/etc/libvirt/libvirtd.conf" "auth_unix_ro" '"none"'
+    set_libvirt_config "/etc/libvirt/libvirtd.conf" "auth_unix_rw" '"polkit"'
+    set_libvirt_config "/etc/libvirt/libvirtd.conf" "unix_sock_group" '"libvirt"'
+    set_libvirt_config "/etc/libvirt/libvirtd.conf" "unix_sock_ro_perms" '"0770"'
+    set_libvirt_config "/etc/libvirt/libvirtd.conf" "unix_sock_rw_perms" '"0770"'
+    set_libvirt_config "/etc/libvirt/libvirtd.conf" "unix_sock_admin_perms" '"0700"'
     
     # Configure QEMU settings for security
     if [ ! -f /etc/libvirt/qemu.conf.bak ] && [ -f /etc/libvirt/qemu.conf ]; then
@@ -41,14 +54,12 @@ harden_libvirt() {
         log "Hardening QEMU configuration"
         cp /etc/libvirt/qemu.conf /etc/libvirt/qemu.conf.bak
         
-        configure_setting "/etc/libvirt/qemu.conf" "security_driver" "apparmor" "Security driver"
-        # Don't set user and group to root - let libvirt use its defaults
-        # configure_setting "/etc/libvirt/qemu.conf" "user" "root" "User for QEMU processes"
-        # configure_setting "/etc/libvirt/qemu.conf" "group" "root" "Group for QEMU processes"
-        configure_setting "/etc/libvirt/qemu.conf" "dynamic_ownership" "1" "Dynamic ownership of VM resources"
-        configure_setting "/etc/libvirt/qemu.conf" "remember_owner" "1" "Remember owner of VM resources"
-        configure_setting "/etc/libvirt/qemu.conf" "clear_emulator_capabilities" "1" "Clear emulator capabilities"
-        configure_setting "/etc/libvirt/qemu.conf" "seccomp_sandbox" "1" "Enable seccomp sandbox"
+        # QEMU security settings
+        set_libvirt_config "/etc/libvirt/qemu.conf" "security_driver" '"apparmor"'
+        set_libvirt_config "/etc/libvirt/qemu.conf" "dynamic_ownership" "1"
+        set_libvirt_config "/etc/libvirt/qemu.conf" "remember_owner" "1"
+        set_libvirt_config "/etc/libvirt/qemu.conf" "clear_emulator_capabilities" "1"
+        set_libvirt_config "/etc/libvirt/qemu.conf" "seccomp_sandbox" "1"
     fi
     
     # Create directory for libvirt logs if it doesn't exist
@@ -70,7 +81,9 @@ harden_libvirt() {
                 print_error "Failed to restart libvirtd! Restoring original configuration..."
                 log "ERROR: Failed to restart libvirtd, restoring backup"
                 cp /etc/libvirt/libvirtd.conf.bak /etc/libvirt/libvirtd.conf
-                cp /etc/libvirt/qemu.conf.bak /etc/libvirt/qemu.conf
+                if [ -f /etc/libvirt/qemu.conf.bak ]; then
+                    cp /etc/libvirt/qemu.conf.bak /etc/libvirt/qemu.conf
+                fi
                 systemctl restart libvirtd
                 print_error "Configuration has been restored. Please check libvirt logs for details."
                 return 1
