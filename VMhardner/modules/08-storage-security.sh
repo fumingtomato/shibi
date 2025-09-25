@@ -47,27 +47,74 @@ secure_vm_storage() {
     print_message "Securing VM storage permissions..."
     log "Securing VM storage permissions"
     
-    # Check if directory is owned by proper user
-    if [ "$(stat -c '%U' "$VM_STORAGE_DIR")" != "root" ] || [ "$(stat -c '%G' "$VM_STORAGE_DIR")" != "root" ]; then
+    # Get the libvirt user and group
+    LIBVIRT_USER=$(ps -ef | grep libvirtd | grep -v grep | head -n 1 | awk '{print $1}')
+    LIBVIRT_GROUP="libvirt"
+    QEMU_GROUP="libvirt-qemu"
+    
+    print_message "Detected libvirt user: $LIBVIRT_USER"
+    log "Detected libvirt user: $LIBVIRT_USER"
+    
+    # Make sure the VM storage directory has appropriate permissions
+    if [ -d "$VM_STORAGE_DIR" ]; then
+        # Set base directory ownership to root:root but allow libvirt group read access
         chown root:root "$VM_STORAGE_DIR"
-        print_message "Changed ownership of $VM_STORAGE_DIR to root:root"
-        log "Changed ownership of $VM_STORAGE_DIR to root:root"
+        chmod 755 "$VM_STORAGE_DIR"
+        print_message "Set base directory permissions: $VM_STORAGE_DIR (755 root:root)"
+        log "Set permissions 755 on $VM_STORAGE_DIR"
+        
+        # Process subdirectories
+        find "$VM_STORAGE_DIR" -type d | while read dir; do
+            # Skip the top-level directory as we already set it
+            if [ "$dir" != "$VM_STORAGE_DIR" ]; then
+                # For subdirectories, ensure libvirt has access
+                chown root:$QEMU_GROUP "$dir"
+                chmod 750 "$dir"
+                print_message "Secured directory: $dir (750 root:$QEMU_GROUP)"
+                log "Set permissions 750 on $dir (root:$QEMU_GROUP)"
+            fi
+        done
+        
+        # Check for individual VM disk files and secure them recursively
+        print_message "Securing VM disk files..."
+        log "Securing VM disk files"
+        
+        # Find all VM disk files (including in subdirectories)
+        find "$VM_STORAGE_DIR" -type f \( -name "*.qcow2" -o -name "*.img" -o -name "*.raw" \) | while read disk_file; do
+            # Ensure libvirt-qemu can read/write disk files
+            chown root:$QEMU_GROUP "$disk_file"
+            chmod 660 "$disk_file"
+            print_message "Secured VM disk: $(basename "$disk_file") (660 root:$QEMU_GROUP)"
+            log "Set permissions 660 on $disk_file (root:$QEMU_GROUP)"
+        done
+        
+        # Fix specific problem cases - look for files with no access
+        find "$VM_STORAGE_DIR" -type f -not -perm /004 | while read no_access_file; do
+            if [[ "$no_access_file" == *".qcow2" || "$no_access_file" == *".img" || "$no_access_file" == *".raw" ]]; then
+                print_warning "Found VM disk with restricted permissions: $no_access_file"
+                chown root:$QEMU_GROUP "$no_access_file"
+                chmod 660 "$no_access_file"
+                print_message "Fixed permissions: $(basename "$no_access_file") (660 root:$QEMU_GROUP)"
+                log "Fixed permissions on $no_access_file (660 root:$QEMU_GROUP)"
+            fi
+        done
+        
+        # Add specific fix for nextclouD directory if it exists (case from error message)
+        if [ -d "$VM_STORAGE_DIR/nextclouD" ]; then
+            print_message "Found nextclouD directory - applying special permission fixes"
+            chown -R root:$QEMU_GROUP "$VM_STORAGE_DIR/nextclouD"
+            chmod -R 750 "$VM_STORAGE_DIR/nextclouD"
+            find "$VM_STORAGE_DIR/nextclouD" -type f \( -name "*.qcow2" -o -name "*.img" -o -name "*.raw" \) -exec chmod 660 {} \;
+            print_message "Fixed permissions on nextclouD directory and contents"
+            log "Fixed permissions on $VM_STORAGE_DIR/nextclouD directory and contents"
+        fi
+    else
+        print_error "VM storage directory $VM_STORAGE_DIR no longer exists!"
+        log "ERROR: VM storage directory $VM_STORAGE_DIR does not exist"
+        return 1
     fi
     
-    # Ensure proper permissions
-    chmod 750 "$VM_STORAGE_DIR"
-    log "Set permissions 750 on $VM_STORAGE_DIR"
-    
-    # Check for individual VM disk files and secure them
-    print_message "Securing VM disk files..."
-    log "Securing VM disk files"
-    find "$VM_STORAGE_DIR" -type f \( -name "*.qcow2" -o -name "*.img" \) | while read disk_file; do
-        chmod 640 "$disk_file"
-        print_message "Secured permissions for $(basename "$disk_file")"
-        log "Set permissions 640 on $disk_file"
-    done
-    
-    # Skip encryption setup - removed the prompt and encryption template creation
+    # Skip encryption setup
     print_message "VM storage permissions secured."
     print_message "Note: Disk encryption setup has been skipped for performance reasons."
     log "VM storage security configuration completed (encryption skipped)"
