@@ -2,12 +2,16 @@
 # Module: 10-backups.sh - VM Backup Configuration
 # Part of VM Host Hardening Script
 
-# Source common functions
-if [ -f "$(dirname "$0")/00-common.sh" ]; then
-    source "$(dirname "$0")/00-common.sh"
-else
-    echo "Error: Could not find common functions file"
-    exit 1
+# Check if we're being run standalone or as part of the main script
+if [ -z "$LOG_FILE" ]; then
+    # Running standalone, need to source common
+    SCRIPT_DIR="$(dirname "$0")"
+    if [ -f "${SCRIPT_DIR}/00-common.sh" ]; then
+        source "${SCRIPT_DIR}/00-common.sh"
+    else
+        echo "Error: Could not find common functions file"
+        exit 1
+    fi
 fi
 
 configure_backups() {
@@ -24,30 +28,30 @@ configure_backups() {
     
     print_message "Setting up automated VM backups..."
     
-    # Ask for backup directory or use default from config
-    if [ -z "$BACKUP_DIR" ]; then
-        read -p "Enter path for VM backups [/var/backup/vms]: " BACKUP_DIR
-        BACKUP_DIR=${BACKUP_DIR:-/var/backup/vms}
+    # Use BACKUP_DIRECTORY from settings or ask for it
+    if [ -z "$BACKUP_DIRECTORY" ]; then
+        read -p "Enter path for VM backups [/var/backup/vms]: " BACKUP_DIRECTORY
+        BACKUP_DIRECTORY=${BACKUP_DIRECTORY:-/var/backup/vms}
     fi
     
     # Create backup directory if it doesn't exist
-    if [ ! -d "$BACKUP_DIR" ]; then
-        mkdir -p "$BACKUP_DIR"
-        chmod 750 "$BACKUP_DIR"
-        print_message "Created backup directory: $BACKUP_DIR"
+    if [ ! -d "$BACKUP_DIRECTORY" ]; then
+        mkdir -p "$BACKUP_DIRECTORY"
+        chmod 750 "$BACKUP_DIRECTORY"
+        print_message "Created backup directory: $BACKUP_DIRECTORY"
     else
-        print_message "Using existing backup directory: $BACKUP_DIR"
+        print_message "Using existing backup directory: $BACKUP_DIRECTORY"
     fi
     
     # Create backup script if it doesn't exist
     if [ ! -f /usr/local/bin/backup-vms.sh ]; then
         print_message "Creating VM backup script..."
         
-        cat > /usr/local/bin/backup-vms.sh <<EOF
+        cat > /usr/local/bin/backup-vms.sh <<EOFSCRIPT
 #!/bin/bash
 # Automated VM Backup Script
 
-BACKUP_DIR="$BACKUP_DIR"
+BACKUP_DIR="$BACKUP_DIRECTORY"
 DATE=\$(date +"%Y%m%d-%H%M%S")
 LOG_FILE="/var/log/vm-backup.log"
 
@@ -130,7 +134,7 @@ for VM in \$(virsh list --all --name); do
 done
 
 echo "======== VM Backup Completed: \$(date) ========" >> \$LOG_FILE
-EOF
+EOFSCRIPT
         
         chmod +x /usr/local/bin/backup-vms.sh
         print_message "VM backup script created"
@@ -163,7 +167,7 @@ EOF
     fi
     
     print_message "VM backup configuration complete. Backups will run weekly."
-    print_message "Backup location: $BACKUP_DIR"
+    print_message "Backup location: $BACKUP_DIRECTORY"
 }
 
 # Execute function if script is run directly
