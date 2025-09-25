@@ -55,6 +55,17 @@ hostmaster: root
 mailer-daemon: root
 EOF
     
+    # Ensure proper permissions on critical files
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        chown root:root /etc/postfix/dynamicmaps.cf
+        chmod 644 /etc/postfix/dynamicmaps.cf
+    fi
+    
+    if [ -d /etc/postfix/dynamicmaps.cf.d/ ]; then
+        find /etc/postfix/dynamicmaps.cf.d/ -type f -exec chown root:root {} \;
+        find /etc/postfix/dynamicmaps.cf.d/ -type f -exec chmod 644 {} \;
+    fi
+    
     newaliases
     print_message "Email aliases configured"
 }
@@ -69,7 +80,7 @@ restart_all_services() {
         print_message "Restarting $service..."
         systemctl restart $service || print_error "Failed to restart $service"
         systemctl enable $service
-    done
+    fi
 }
 
 # Save configuration for future reference
@@ -279,6 +290,15 @@ run_diagnostics() {
             print_error "✗ $service is not running"
         fi
     done
+    
+    # Check permissions of critical files
+    print_message "\nChecking critical file permissions..."
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        ls -la /etc/postfix/dynamicmaps.cf
+    fi
+    if [ -d /etc/postfix/dynamicmaps.cf.d/ ]; then
+        ls -la /etc/postfix/dynamicmaps.cf.d/
+    fi
     
     print_message "\nChecking mail queue..."
     mailq | tail -5
