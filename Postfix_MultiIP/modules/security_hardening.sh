@@ -91,11 +91,15 @@ EOF
     systemctl enable fail2ban
     systemctl restart fail2ban
     
-    # Postfix Rate Limiting for Bulk Mail
+    # Check if rate limiting is already configured
     print_message "Configuring Postfix rate limits for bulk mail..."
     
-    # Update main.cf with rate limiting
-    cat >> /etc/postfix/main.cf <<EOF
+    # Check if rate limiting is already configured in main.cf
+    if grep -q "smtpd_client_message_rate_limit" /etc/postfix/main.cf; then
+        print_message "Rate limiting is already configured in main.cf"
+    else
+        # Update main.cf with rate limiting
+        cat >> /etc/postfix/main.cf <<EOF
 
 # Rate limiting configuration
 smtpd_client_message_rate_limit = 1000
@@ -103,6 +107,7 @@ smtpd_client_event_limit_exceptions = \$mynetworks
 smtpd_client_connection_count_limit = 50
 anvil_rate_time_unit = 60s
 EOF
+    fi
     
     # Secure Postfix configurations
     postconf -e "smtpd_helo_required = yes"
