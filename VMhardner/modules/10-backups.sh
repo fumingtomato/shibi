@@ -118,7 +118,7 @@ for VM in \$(virsh list --all --name); do
     echo "Backup of \$VM completed" >> \$LOG_FILE
 done
 
-# Cleanup old backups (keep last 3)
+# Cleanup old backups
 for VM in \$(virsh list --all --name); do
     if [ -d "\$BACKUP_DIR/\$VM" ]; then
         VM_BACKUP_COUNT=\$(ls -1 "\$BACKUP_DIR/\$VM/" 2>/dev/null | wc -l)
@@ -133,6 +133,8 @@ for VM in \$(virsh list --all --name); do
     fi
 done
 
+# Log completion to syslog instead of using email
+logger -p local0.notice "VM Backup completed: \$(date)"
 echo "======== VM Backup Completed: \$(date) ========" >> \$LOG_FILE
 EOFSCRIPT
         
