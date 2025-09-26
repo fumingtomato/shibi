@@ -5,7 +5,520 @@
 # Package installation and system setup functions
 # =================================================================
 
-# [Previous functions remain the same until setup_website function]
+# Install all required packages for the mail server
+install_required_packages() {
+    print_header "Installing Required Packages"
+    
+    print_message "Updating package lists..."
+    apt-get update
+    
+    # CRITICAL: Pre-configure Postfix to avoid interactive prompts
+    print_message "Pre-configuring Postfix for non-interactive installation..."
+    
+    # Set Postfix configuration type to "Internet Site"
+    echo "postfix postfix/mailname string ${HOSTNAME:-$(hostname -f)}" | debconf-set-selections
+    echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
+    
+    # Set non-interactive frontend for apt
+    export DEBIAN_FRONTEND=noninteractive
+    
+    print_message "Installing essential packages..."
+    
+    # Core packages - Install in groups to better handle any issues
+    
+    # First, install basic tools
+    local basic_packages=(
+        "build-essential"
+        "software-properties-common"
+        "apt-transport-https"
+        "ca-certificates"
+        "gnupg"
+        "lsb-release"
+        "net-tools"
+        "curl"
+        "wget"
+        "telnet"
+        "dnsutils"
+        "ipcalc"
+    )
+    
+    for package in "${basic_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            if ! apt-get install -y -q "$package" >/dev/null 2>&1; then
+                print_warning "Failed to install $package, continuing..."
+            fi
+        fi
+    done
+    
+    # Install Postfix with non-interactive settings
+    print_message "Installing Postfix (non-interactively)..."
+    if ! dpkg -l | grep -q "^ii  postfix "; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            postfix postfix-mysql postfix-pcre >/dev/null 2>&1; then
+            print_error "Failed to install Postfix"
+            # Try alternative method
+            print_message "Trying alternative Postfix installation method..."
+            apt-get install -y --force-yes postfix postfix-mysql postfix-pcre 2>/dev/null || true
+        else
+            print_message "✓ Postfix installed successfully"
+        fi
+    else
+        print_message "✓ Postfix already installed"
+    fi
+    
+    # Install MySQL/MariaDB
+    print_message "Installing MySQL/MariaDB..."
+    local mysql_packages=(
+        "mysql-server"
+        "mysql-client"
+    )
+    
+    for package in "${mysql_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1; then
+                print_warning "Failed to install $package, trying mariadb..."
+                # Try MariaDB as alternative
+                if [ "$package" = "mysql-server" ]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y -q mariadb-server >/dev/null 2>&1 || true
+                elif [ "$package" = "mysql-client" ]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y -q mariadb-client >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+    done
+    
+    # Install Dovecot packages
+    print_message "Installing Dovecot packages..."
+    local dovecot_packages=(
+        "dovecot-core"
+        "dovecot-imapd"
+        "dovecot-pop3d"
+        "dovecot-lmtpd"
+        "dovecot-mysql"
+        "dovecot-sieve"
+        "dovecot-managesieved"
+    )
+    
+    for package in "${dovecot_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
+                print_warning "Failed to install $package, continuing..."
+        fi
+    done
+    
+    # Install web server and SSL
+    print_message "Installing web server and SSL tools..."
+    local web_packages=(
+        "nginx"
+        "certbot"
+        "python3-certbot-nginx"
+    )
+    
+    for package in "${web_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
+                print_warning "Failed to install $package, continuing..."
+        fi
+    done
+    
+    # Install email authentication
+    print_message "Installing email authentication packages..."
+    if ! dpkg -l | grep -q "^ii  opendkim "; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q opendkim opendkim-tools >/dev/null 2>&1 || \
+            print_warning "Failed to install OpenDKIM"
+    else
+        print_message "✓ OpenDKIM already installed"
+    fi
+    
+    # Install security tools
+    print_message "Installing security tools..."
+    local security_packages=(
+        "ufw"
+        "fail2ban"
+        "rkhunter"
+        "logwatch"
+    )
+    
+    for package in "${security_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
+                print_warning "Failed to install $package, continuing..."
+        fi
+    done
+    
+    # Install utilities
+    print_message "Installing utility packages..."
+    local utility_packages=(
+        "mailutils"
+        "zip"
+        "unzip"
+        "git"
+        "htop"
+        "ncdu"
+        "bc"
+        "jq"
+        "python3"
+        "python3-pip"
+    )
+    
+    for package in "${utility_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
+                print_warning "Failed to install $package, continuing..."
+        fi
+    done
+    
+    # Reset the frontend variable
+    unset DEBIAN_FRONTEND
+    
+    # Ensure critical services are not running yet (will be configured later)
+    print_message "Stopping services for configuration..."
+    systemctl stop postfix 2>/dev/null || true
+    systemctl stop dovecot 2>/dev/null || true
+    systemctl stop mysql 2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
+    
+    print_message "Package installation completed"
+    
+    # Verify critical packages
+    print_message "Verifying critical packages..."
+    local critical_packages=("postfix" "mysql-server" "dovecot-core" "nginx")
+    local all_installed=true
+    
+    for package in "${critical_packages[@]}"; do
+        # Check for package or alternatives
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package verified"
+        elif [ "$package" = "mysql-server" ] && dpkg -l | grep -q "^ii  mariadb-server "; then
+            print_message "✓ mariadb-server verified (alternative to mysql-server)"
+        else
+            print_error "✗ $package is not installed properly"
+            all_installed=false
+        fi
+    done
+    
+    if [ "$all_installed" = false ]; then
+        print_error "Some critical packages failed to install."
+        print_message "Attempting to fix broken packages..."
+        apt-get install -f -y
+        dpkg --configure -a
+    fi
+}
+
+# Configure system hostname
+configure_hostname() {
+    local hostname=$1
+    
+    print_header "Configuring System Hostname"
+    
+    if [ -z "$hostname" ]; then
+        print_error "Hostname not provided"
+        return 1
+    fi
+    
+    # Extract the short hostname (first part before first dot)
+    local short_hostname=$(echo "$hostname" | cut -d'.' -f1)
+    
+    print_message "Setting hostname to: $hostname"
+    print_message "Short hostname: $short_hostname"
+    
+    # Set the hostname
+    hostnamectl set-hostname "$short_hostname"
+    
+    # Update /etc/hostname
+    echo "$short_hostname" > /etc/hostname
+    
+    # Update /etc/hosts
+    if ! grep -q "127.0.1.1" /etc/hosts; then
+        echo "127.0.1.1 $hostname $short_hostname" >> /etc/hosts
+    else
+        sed -i "s/127.0.1.1.*/127.0.1.1 $hostname $short_hostname/" /etc/hosts
+    fi
+    
+    # Add server IPs to hosts file if available
+    if [ ! -z "${IP_ADDRESSES}" ]; then
+        for ip in "${IP_ADDRESSES[@]}"; do
+            if ! grep -q "$ip" /etc/hosts; then
+                echo "$ip $hostname $short_hostname" >> /etc/hosts
+            fi
+        done
+    fi
+    
+    # Apply hostname changes
+    hostname "$short_hostname"
+    
+    # Verify
+    print_message "Hostname configured:"
+    print_message "  Full: $(hostname -f)"
+    print_message "  Short: $(hostname -s)"
+    
+    # Configure /etc/mailname for Postfix
+    echo "$hostname" > /etc/mailname
+    
+    print_message "Hostname configuration completed"
+}
+
+# Save installation configuration for future reference
+save_configuration() {
+    print_header "Saving Installation Configuration"
+    
+    local config_file="/root/mail-server-config.json"
+    local backup_dir="/root/mail-server-backups"
+    
+    # Create backup directory
+    mkdir -p "$backup_dir"
+    
+    print_message "Creating configuration backup..."
+    
+    # Create JSON configuration file
+    cat > "$config_file" <<EOF
+{
+  "installation_date": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
+  "installer_version": "$INSTALLER_VERSION",
+  "server_configuration": {
+    "domain": "${DOMAIN_NAME:-}",
+    "hostname": "${HOSTNAME:-}",
+    "admin_email": "${ADMIN_EMAIL:-}",
+    "brand_name": "${BRAND_NAME:-}",
+    "timezone": "$(timedatectl | grep 'Time zone' | awk '{print $3}')"
+  },
+  "network_configuration": {
+    "primary_ip": "${PRIMARY_IP:-}",
+    "total_ips": ${IP_COUNT:-1},
+    "ip_addresses": [
+EOF
+    
+    # Add IP addresses to JSON
+    if [ ! -z "${IP_ADDRESSES}" ]; then
+        local first=true
+        for ip in "${IP_ADDRESSES[@]}"; do
+            if [ "$first" = true ]; then
+                echo -n "      \"$ip\"" >> "$config_file"
+                first=false
+            else
+                echo -n ",
+      \"$ip\"" >> "$config_file"
+            fi
+        done
+    fi
+    
+    cat >> "$config_file" <<EOF
+
+    ]
+  },
+  "features": {
+    "sticky_ip_enabled": ${ENABLE_STICKY_IP:-false},
+    "cloudflare_dns": $([ ! -z "$CF_API_TOKEN" ] && echo "true" || echo "false"),
+    "ssl_enabled": true,
+    "dkim_enabled": true,
+    "spf_enabled": true,
+    "dmarc_enabled": true
+  },
+  "services": {
+    "postfix": "$(postconf mail_version 2>/dev/null | cut -d' ' -f3 || echo 'unknown')",
+    "dovecot": "$(dovecot --version 2>/dev/null | cut -d' ' -f1 || echo 'unknown')",
+    "mysql": "$(mysql --version 2>/dev/null | awk '{print $5}' | cut -d',' -f1 || echo 'unknown')",
+    "nginx": "$(nginx -v 2>&1 | cut -d'/' -f2 || echo 'unknown')"
+  },
+  "database": {
+    "name": "mailserver",
+    "user": "mailuser",
+    "password_file": "/root/.mail_db_password"
+  },
+  "paths": {
+    "mail_storage": "/var/vmail",
+    "postfix_config": "/etc/postfix",
+    "dovecot_config": "/etc/dovecot",
+    "dkim_keys": "/etc/opendkim/keys",
+    "ssl_certificates": "/etc/letsencrypt/live",
+    "logs": "/var/log"
+  }
+}
+EOF
+    
+    # Set proper permissions
+    chmod 600 "$config_file"
+    
+    # Backup critical configuration files
+    print_message "Backing up configuration files..."
+    
+    local backup_file="$backup_dir/config-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    
+    # Only backup directories that exist
+    local dirs_to_backup=""
+    [ -d "/etc/postfix" ] && dirs_to_backup="$dirs_to_backup /etc/postfix"
+    [ -d "/etc/dovecot" ] && dirs_to_backup="$dirs_to_backup /etc/dovecot"
+    [ -d "/etc/nginx/sites-available" ] && dirs_to_backup="$dirs_to_backup /etc/nginx/sites-available"
+    [ -d "/etc/opendkim" ] && dirs_to_backup="$dirs_to_backup /etc/opendkim"
+    [ -f "$config_file" ] && dirs_to_backup="$dirs_to_backup $config_file"
+    
+    if [ ! -z "$dirs_to_backup" ]; then
+        tar -czf "$backup_file" $dirs_to_backup 2>/dev/null || true
+        print_message "Backup created at: $backup_file"
+    fi
+    
+    print_message "Configuration saved to: $config_file"
+    
+    # Create quick reference file
+    cat > /root/mail-server-quick-ref.txt <<EOF
+==============================================
+Mail Server Quick Reference
+==============================================
+Installation Date: $(date)
+Domain: ${DOMAIN_NAME:-}
+Hostname: ${HOSTNAME:-}
+Admin Email: ${ADMIN_EMAIL:-}
+
+MANAGEMENT COMMANDS:
+--------------------
+Send test email: send-test-email recipient@example.com
+Send mail: send-mail recipient@example.com "Subject"
+Queue management: manage-mail-queue {status|flush|clear}
+Mail statistics: mail-stats {overall|ip <IP>|report}
+IP warmup: ip-warmup-manager {status|init|check}
+Sticky IP: sticky-ip-manager {list|assign|remove|stats}
+Monitor Postfix: monitor-postfix
+Security check: check-mail-security
+
+SERVICE COMMANDS:
+-----------------
+Restart all: systemctl restart postfix dovecot nginx mysql opendkim
+Check status: systemctl status postfix dovecot nginx mysql opendkim
+View mail log: tail -f /var/log/mail.log
+Check queue: mailq
+
+DATABASE ACCESS:
+----------------
+MySQL database: mailserver
+MySQL user: mailuser
+Password location: /root/.mail_db_password
+
+Connect to database:
+mysql -u mailuser -p\$(cat /root/.mail_db_password) mailserver
+
+IMPORTANT FILES:
+----------------
+Configuration backup: $config_file
+Postfix config: /etc/postfix/main.cf
+Dovecot config: /etc/dovecot/dovecot.conf
+DNS records: /root/*-record-*.txt
+MailWizz guide: /root/mailwizz-multi-ip-guide.txt
+==============================================
+EOF
+    
+    chmod 644 /root/mail-server-quick-ref.txt
+    
+    print_message "Quick reference guide saved to: /root/mail-server-quick-ref.txt"
+}
+
+# Create final documentation with all important information
+create_final_documentation() {
+    print_header "Creating Final Documentation"
+    
+    local doc_file="/root/mail-server-multiip-info.txt"
+    
+    print_message "Generating comprehensive documentation..."
+    
+    cat > "$doc_file" <<'EOF'
+==========================================================
+   MULTI-IP BULK MAIL SERVER DOCUMENTATION
+==========================================================
+
+INSTALLATION SUMMARY
+--------------------
+EOF
+    
+    cat >> "$doc_file" <<EOF
+Date: $(date)
+Version: $INSTALLER_VERSION
+Domain: ${DOMAIN_NAME:-}
+Hostname: ${HOSTNAME:-}
+Admin Email: ${ADMIN_EMAIL:-}
+Total IPs Configured: ${IP_COUNT:-1}
+
+IP ADDRESSES:
+-------------
+EOF
+    
+    if [ ! -z "${IP_ADDRESSES}" ]; then
+        local idx=1
+        for ip in "${IP_ADDRESSES[@]}"; do
+            echo "$idx. $ip (Transport: smtp-ip${idx})" >> "$doc_file"
+            idx=$((idx + 1))
+        done
+    fi
+    
+    cat >> "$doc_file" <<'EOF'
+
+SERVICES STATUS:
+----------------
+EOF
+    
+    # Check service status
+    for service in postfix dovecot mysql nginx opendkim; do
+        if systemctl is-active --quiet $service 2>/dev/null; then
+            echo "✓ $service: Running" >> "$doc_file"
+        elif systemctl is-active --quiet mariadb 2>/dev/null && [ "$service" = "mysql" ]; then
+            echo "✓ mariadb: Running (MySQL alternative)" >> "$doc_file"
+        else
+            echo "✗ $service: Not running" >> "$doc_file"
+        fi
+    done
+    
+    cat >> "$doc_file" <<'EOF'
+
+TESTING YOUR SETUP:
+-------------------
+1. Send test email:
+   send-test-email recipient@external-domain.com
+
+2. Check mail queue:
+   mailq
+
+3. Monitor mail log:
+   tail -f /var/log/mail.log
+
+4. Test authentication:
+   telnet localhost 25
+   EHLO test
+
+==========================================================
+Installation completed!
+Your multi-IP bulk mail server is ready for use.
+==========================================================
+EOF
+    
+    chmod 644 "$doc_file"
+    
+    print_message "Complete documentation saved to: $doc_file"
+    
+    # Create a simple IP list file for easy reference
+    if [ ! -z "${IP_ADDRESSES}" ]; then
+        printf "%s\n" "${IP_ADDRESSES[@]}" > /root/ip-list.txt
+        chmod 644 /root/ip-list.txt
+        print_message "IP list saved to: /root/ip-list.txt"
+    fi
+}
 
 # Setup basic website for the mail server domain with privacy and unsubscribe
 setup_website() {
@@ -452,8 +965,6 @@ EOF
     
     print_message "Web interface with unsubscribe and privacy policy pages created"
 }
-
-# [Rest of the functions remain the same]
 
 # Export all functions
 export -f install_required_packages
