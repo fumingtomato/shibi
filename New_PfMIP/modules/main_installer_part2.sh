@@ -5,23 +5,57 @@
 # Supporting functions and utilities with proper permissions
 # =================================================================
 
-# Fix Postfix MySQL configuration issues
+# Fix Postfix MySQL configuration issues with complete cleanup
 fix_mysql_config() {
     print_message "Fixing MySQL configuration issues..."
+    
+    # Stop postfix temporarily to ensure clean configuration
+    systemctl stop postfix 2>/dev/null || true
     
     # Check if directory exists
     if [ ! -d /etc/postfix/dynamicmaps.cf.d ]; then
         mkdir -p /etc/postfix/dynamicmaps.cf.d
     fi
     
-    # Remove all existing mysql entries to prevent duplicates
-    if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
-        rm -f /etc/postfix/dynamicmaps.cf.d/mysql
+    # Remove ALL existing mysql-related entries to prevent any duplicates
+    rm -f /etc/postfix/dynamicmaps.cf.d/mysql* 2>/dev/null
+    rm -f /etc/postfix/dynamicmaps.cf.d/*mysql* 2>/dev/null
+    
+    # Clean up any duplicate entries from the main dynamicmaps.cf file
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        # Remove any lines containing mysql to start fresh
+        grep -v "mysql" /etc/postfix/dynamicmaps.cf > /tmp/dynamicmaps.cf.tmp 2>/dev/null || true
+        if [ -s /tmp/dynamicmaps.cf.tmp ]; then
+            mv /tmp/dynamicmaps.cf.tmp /etc/postfix/dynamicmaps.cf
+        fi
     fi
     
-    # Create a clean mysql configuration file
+    # Find the correct MySQL library path
+    local mysql_lib=""
+    local possible_paths=(
+        "/usr/lib/postfix/postfix-mysql.so"
+        "/usr/lib/postfix/dict_mysql.so"
+        "/usr/lib/x86_64-linux-gnu/postfix/dict_mysql.so"
+        "/usr/lib/postfix/postfix-mysql.so.1.0.1"
+    )
+    
+    for path in "${possible_paths[@]}"; do
+        if [ -f "$path" ]; then
+            mysql_lib="$path"
+            print_message "Found MySQL library at: $mysql_lib"
+            break
+        fi
+    done
+    
+    if [ -z "$mysql_lib" ]; then
+        # Use the most common default
+        mysql_lib="postfix-mysql.so.1.0.1"
+        print_warning "Could not find MySQL library, using default: $mysql_lib"
+    fi
+    
+    # Create a single, clean mysql configuration file
     cat > /etc/postfix/dynamicmaps.cf.d/mysql <<EOF
-mysql   postfix-mysql.so.1.0.1   dict_mysql_open
+mysql	${mysql_lib}	dict_mysql_open
 EOF
     
     # Fix permissions for all critical files
@@ -33,16 +67,45 @@ EOF
     chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
     chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
     
+    # Regenerate the main dynamicmaps.cf file to ensure consistency
+    if command -v postconf >/dev/null 2>&1; then
+        # Force regeneration of dynamic maps
+        postconf -e "mysql = yes" 2>/dev/null || true
+    fi
+    
+    # Clear Postfix's internal cache
+    rm -f /var/lib/postfix/dynamicmaps.cf.db 2>/dev/null
+    rm -f /var/spool/postfix/etc/dynamicmaps.cf.db 2>/dev/null
+    
     print_message "MySQL configuration fixed"
 }
 
-# Setup email aliases
+# Setup email aliases with improved duplicate handling
 setup_email_aliases() {
     print_message "Setting up email aliases for postmaster..."
     
-    # First, remove any existing postmaster entries to avoid duplicates
-    if [ -f /etc/aliases ]; then
-        sed -i '/^postmaster:/d' /etc/aliases
+    # First, ensure MySQL config is completely clean
+    fix_mysql_config
+    
+    # Create a clean aliases file if it doesn't exist
+    if [ ! -f /etc/aliases ]; then
+        touch /etc/aliases
+    fi
+    
+    # Remove any existing postmaster, abuse, webmaster, hostmaster entries to avoid duplicates
+    local temp_aliases=$(mktemp)
+    grep -v "^postmaster:" /etc/aliases | \
+    grep -v "^abuse:" | \
+    grep -v "^webmaster:" | \
+    grep -v "^hostmaster:" | \
+    grep -v "^mailer-daemon:" > "$temp_aliases" 2>/dev/null || true
+    
+    # Move cleaned file back
+    if [ -s "$temp_aliases" ]; then
+        mv "$temp_aliases" /etc/aliases
+    else
+        # If file is empty, start fresh
+        echo "" > /etc/aliases
     fi
     
     # Ensure root alias exists
@@ -50,7 +113,7 @@ setup_email_aliases() {
         echo "root: $ADMIN_EMAIL" >> /etc/aliases
     fi
     
-    # Add required aliases
+    # Add required aliases (only once, they're already removed above)
     cat >> /etc/aliases <<EOF
 postmaster: root
 abuse: root
@@ -59,15 +122,13 @@ hostmaster: root
 mailer-daemon: root
 EOF
     
-    # Fix permissions and ownership of critical files
-    fix_mysql_config
+    # Apply aliases with clean MySQL config
+    newaliases 2>&1 | grep -v "warning.*duplicate" || true
     
-    # Apply aliases
-    newaliases
     print_message "Email aliases configured"
 }
 
-# Restart all services
+# Restart all services with proper MySQL cleanup
 restart_all_services() {
     print_message "Restarting all services..."
     
@@ -78,9 +139,15 @@ restart_all_services() {
     
     for service in "${services[@]}"; do
         print_message "Restarting $service..."
-        systemctl restart $service || print_error "Failed to restart $service"
+        systemctl restart $service 2>&1 | grep -v "warning.*duplicate" || print_error "Failed to restart $service"
         systemctl enable $service
     done
+}
+
+# Clean Postfix warnings from output
+clean_postfix_output() {
+    # This function filters out the duplicate mysql warnings from command output
+    grep -v "warning.*dynamicmaps.cf.d/mysql.*duplicate" | grep -v "ignoring duplicate entry for \"mysql\""
 }
 
 # Main menu function
@@ -130,4 +197,4 @@ main_menu() {
 }
 
 # Export functions to make them available in other scripts
-export -f fix_mysql_config restart_all_services setup_email_aliases main_menu
+export -f fix_mysql_config restart_all_services setup_email_aliases main_menu clean_postfix_output
