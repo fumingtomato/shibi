@@ -57,15 +57,15 @@ print_message "Creating temporary installation directory..."
 mkdir -p "$INSTALLER_DIR"
 cd "$INSTALLER_DIR"
 
-# Download all modules - ensure correct loading order
+# Download all modules
 print_message "Downloading installer modules..."
 
-# IMPORTANT: Changed the order to load modules in correct dependency order
+# Important: main_installer_part2.sh must be loaded before main_installer.sh
 modules=(
     "core_functions.sh"
     "multiip_config.sh"
     "mysql_dovecot.sh"
-    "postfix_setup.sh"
+    "postfix_setup.sh" 
     "dkim_spf.sh"
     "dns_ssl.sh"
     "monitoring_scripts.sh"
@@ -73,37 +73,34 @@ modules=(
     "mailwizz_integration.sh"
     "utility_scripts.sh"
     "sticky_ip.sh"
-    "main_installer_part2.sh"  # Load this before main_installer.sh
+    "main_installer_part2.sh"
     "main_installer.sh"
 )
 
 for module in "${modules[@]}"; do
     print_message "Downloading $module..."
     if ! wget -q -O "$module" "$BASE_URL/modules/$module"; then
-        print_error "Failed to download $module"
         print_warning "Trying alternative download method..."
         if ! curl -s -o "$module" "$BASE_URL/modules/$module"; then
-            print_error "Failed to download $module with curl"
+            print_error "Failed to download $module"
             exit 1
         fi
     fi
-    
-    # Make module executable
     chmod +x "$module"
 done
 
 print_message "All modules downloaded successfully"
 
-# Source all modules in the correct order
+# Source all modules
 print_message "Loading modules..."
 for module in "${modules[@]}"; do
     print_message "Loading module: $module"
     source "./$module"
-}
+done
 
 print_message "All modules loaded successfully"
 
-# Run the main menu - ensure it's defined now
+# Run the main menu
 main_menu
 
 # Cleanup
