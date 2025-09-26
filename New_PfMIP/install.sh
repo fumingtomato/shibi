@@ -2,18 +2,18 @@
 
 # =================================================================
 # Multi-IP Bulk Mail Server Master Installer
-# Version: 16.0.1
+# Version: 16.0.2
 # Repository: https://github.com/fumingtomato/shibi
 # =================================================================
 
 set -e
 
 INSTALLER_NAME="Multi-IP Bulk Mail Server Installer"
-INSTALLER_VERSION="16.0.1"
+INSTALLER_VERSION="16.0.2"
 GITHUB_USER="fumingtomato"
 GITHUB_REPO="shibi"
 GITHUB_BRANCH="main"
-BASE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/New_PfMIP/"
+BASE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/New_PfMIP"
 INSTALLER_DIR="/tmp/multiip-installer-$$"
 
 # Colors
@@ -45,8 +45,23 @@ print_header() {
 # Function to handle errors
 handle_error() {
     local line_no=$1
-    print_error "An error occurred at line $line_no"
+    local bash_lineno=$2
+    local last_command=$3
+    
+    print_error "An error occurred:"
+    print_error "  Line: $line_no"
+    print_error "  Command: $last_command"
     print_error "Installation failed. Cleaning up..."
+    
+    # Show what was downloaded for debugging
+    print_error "Downloaded files:"
+    ls -la "$INSTALLER_DIR" 2>/dev/null || true
+    
+    # Show first few lines of problematic file if it exists
+    if [ -f "$INSTALLER_DIR/core-functions.sh" ]; then
+        print_error "First lines of core-functions.sh:"
+        head -n 5 "$INSTALLER_DIR/core-functions.sh"
+    fi
     
     # Cleanup
     cd /
@@ -56,8 +71,8 @@ handle_error() {
     exit 1
 }
 
-# Set error trap
-trap 'handle_error $LINENO' ERR
+# Set error trap with more detail
+trap 'handle_error $LINENO $BASH_LINENO "$BASH_COMMAND"' ERR
 
 # Check if running as root
 if [ "$(id -u)" != "0" ]; then
@@ -81,7 +96,7 @@ print_message "Creating temporary installation directory..."
 mkdir -p "$INSTALLER_DIR"
 cd "$INSTALLER_DIR"
 
-# Function to download a module with retry
+# Function to download a module with retry and validation
 download_module() {
     local module=$1
     local max_attempts=3
@@ -90,25 +105,46 @@ download_module() {
     while [ $attempt -le $max_attempts ]; do
         print_message "Downloading $module (attempt $attempt/$max_attempts)..."
         
-        if wget -q -O "$module" "$BASE_URL/modules/$module" 2>/dev/null; then
+        # Try wget first with proper user agent
+        if wget --user-agent="Mozilla/5.0" -q -O "$module" "$BASE_URL/modules/$module" 2>/dev/null; then
+            # Validate that we got a shell script, not HTML
             if [ -s "$module" ]; then
-                chmod +x "$module"
-                return 0
-            else
-                print_warning "Downloaded file is empty, retrying..."
-            fi
-        else
-            print_warning "wget failed, trying curl..."
-            if curl -s -o "$module" "$BASE_URL/modules/$module" 2>/dev/null; then
-                if [ -s "$module" ]; then
+                if head -n 1 "$module" | grep -q "^#!/bin/bash\|^#!.*sh"; then
                     chmod +x "$module"
+                    print_message "✓ Successfully downloaded $module"
                     return 0
+                else
+                    print_warning "Downloaded file doesn't appear to be a shell script. First line:"
+                    head -n 1 "$module"
+                    rm -f "$module"
                 fi
+            else
+                print_warning "Downloaded file is empty"
+                rm -f "$module"
+            fi
+        fi
+        
+        # Try curl as fallback
+        print_warning "wget failed or invalid content, trying curl..."
+        if curl -L -s -o "$module" "$BASE_URL/modules/$module" 2>/dev/null; then
+            if [ -s "$module" ]; then
+                if head -n 1 "$module" | grep -q "^#!/bin/bash\|^#!.*sh"; then
+                    chmod +x "$module"
+                    print_message "✓ Successfully downloaded $module with curl"
+                    return 0
+                else
+                    print_warning "Downloaded file doesn't appear to be a shell script"
+                    rm -f "$module"
+                fi
+            else
+                print_warning "Downloaded file is empty"
+                rm -f "$module"
             fi
         fi
         
         attempt=$((attempt + 1))
         if [ $attempt -le $max_attempts ]; then
+            print_warning "Retrying in 2 seconds..."
             sleep 2
         fi
     done
@@ -120,10 +156,10 @@ download_module() {
 # Download all modules in the correct order
 print_message "Downloading installer modules..."
 
-# CRITICAL: Module loading order is important for dependencies
+# CRITICAL: Use correct filenames with hyphens, not underscores!
 modules=(
-    "core_functions.sh"          # Basic functions needed by all
-    "packages_system.sh"         # NEW - System packages and missing functions
+    "core-functions.sh"          # Note: hyphen not underscore
+    "packages_system.sh"         # System packages and functions
     "multiip_config.sh"          # IP configuration
     "mysql_dovecot.sh"           # MySQL and Dovecot setup
     "postfix_setup.sh"           # Postfix configuration
@@ -137,6 +173,18 @@ modules=(
     "main_installer_part2.sh"    # Additional installer functions
     "main_installer.sh"          # Main installation logic
 )
+
+# Check if modules are accessible
+print_message "Checking module availability..."
+test_url="${BASE_URL}/modules/core-functions.sh"
+if ! curl -L -s --head "$test_url" | head -n 1 | grep "200\|301\|302" > /dev/null; then
+    print_error "Cannot access modules at $BASE_URL/modules/"
+    print_error "Please check that the repository and path are correct."
+    print_error "Test URL: $test_url"
+    cd /
+    rm -rf "$INSTALLER_DIR"
+    exit 1
+fi
 
 # Download each module
 failed_modules=()
@@ -176,19 +224,34 @@ for module in "${modules[@]}"; do
     fi
 done
 
+# Rename downloaded files to match what the scripts expect internally
+# This fixes the hyphen vs underscore issue
+print_message "Preparing modules..."
+if [ -f "core-functions.sh" ]; then
+    cp "core-functions.sh" "core_functions.sh"
+fi
+
 # Source all modules with error handling
 print_message "Loading modules..."
 for module in "${modules[@]}"; do
-    print_message "Loading module: $module"
+    # Convert hyphen to underscore for sourcing
+    source_name=$(echo "$module" | sed 's/-/_/g')
+    
+    # If file with underscore doesn't exist, use original
+    if [ ! -f "$source_name" ]; then
+        source_name="$module"
+    fi
+    
+    print_message "Loading module: $source_name"
     
     # Use a subshell to test if the module sources correctly
-    if ! (source "./$module" 2>/dev/null); then
-        print_warning "Warning: Issues detected while loading $module"
+    if ! (source "./$source_name" 2>/dev/null); then
+        print_warning "Warning: Issues detected while loading $source_name"
         print_message "Attempting to continue..."
     fi
     
     # Source the module in the main shell
-    source "./$module"
+    source "./$source_name"
 done
 
 print_message "All modules loaded successfully"
