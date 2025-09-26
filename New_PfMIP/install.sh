@@ -13,7 +13,7 @@ INSTALLER_VERSION="16.0.1"
 GITHUB_USER="fumingtomato"
 GITHUB_REPO="shibi"
 GITHUB_BRANCH="main"
-BASE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/Postfix_MultiIP/"
+BASE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/New_PfMIP/"
 INSTALLER_DIR="/tmp/multiip-installer-$$"
 
 # Colors
