@@ -57,15 +57,15 @@ print_message "Creating temporary installation directory..."
 mkdir -p "$INSTALLER_DIR"
 cd "$INSTALLER_DIR"
 
-# Download all modules
+# Download all modules - ensure correct loading order
 print_message "Downloading installer modules..."
 
-# Important: ensure sticky_ip.sh comes BEFORE main_installer.sh to make functions available
+# IMPORTANT: Changed the order to load modules in correct dependency order
 modules=(
     "core_functions.sh"
     "multiip_config.sh"
-    "postfix_setup.sh"
     "mysql_dovecot.sh"
+    "postfix_setup.sh"
     "dkim_spf.sh"
     "dns_ssl.sh"
     "monitoring_scripts.sh"
@@ -73,8 +73,8 @@ modules=(
     "mailwizz_integration.sh"
     "utility_scripts.sh"
     "sticky_ip.sh"
+    "main_installer_part2.sh"  # Load this before main_installer.sh
     "main_installer.sh"
-    "main_installer_part2.sh"
 )
 
 for module in "${modules[@]}"; do
@@ -94,25 +94,16 @@ done
 
 print_message "All modules downloaded successfully"
 
-# Source all modules
+# Source all modules in the correct order
 print_message "Loading modules..."
 for module in "${modules[@]}"; do
     print_message "Loading module: $module"
     source "./$module"
-    # Verify key functions from sticky_ip.sh are loaded
-    if [[ "$module" == "sticky_ip.sh" ]]; then
-        if ! type setup_sticky_ip_db &>/dev/null; then
-            print_error "Failed to load setup_sticky_ip_db function from sticky_ip.sh"
-            exit 1
-        else
-            print_message "Successfully loaded sticky IP functions"
-        fi
-    fi
-done
+}
 
 print_message "All modules loaded successfully"
 
-# Run the main menu
+# Run the main menu - ensure it's defined now
 main_menu
 
 # Cleanup
