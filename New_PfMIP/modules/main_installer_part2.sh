@@ -12,25 +12,41 @@ fix_mysql_config() {
     # Stop postfix temporarily to ensure clean configuration
     systemctl stop postfix 2>/dev/null || true
     
-    # Check if directory exists
-    if [ ! -d /etc/postfix/dynamicmaps.cf.d ]; then
+    # Complete cleanup of all MySQL-related configurations
+    print_message "Performing complete MySQL configuration cleanup..."
+    
+    # 1. Remove ALL mysql entries from dynamicmaps files
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        # Create a clean version without any mysql entries
+        grep -v "mysql" /etc/postfix/dynamicmaps.cf > /tmp/dynamicmaps.cf.clean 2>/dev/null || true
+        mv /tmp/dynamicmaps.cf.clean /etc/postfix/dynamicmaps.cf
+    fi
+    
+    # 2. Remove ALL files from dynamicmaps.cf.d that contain mysql
+    if [ -d /etc/postfix/dynamicmaps.cf.d ]; then
+        find /etc/postfix/dynamicmaps.cf.d -type f -name "*mysql*" -delete 2>/dev/null || true
+        # Also check file contents for mysql references
+        for file in /etc/postfix/dynamicmaps.cf.d/*; do
+            if [ -f "$file" ] && grep -q "mysql" "$file" 2>/dev/null; then
+                rm -f "$file"
+            fi
+        done
+    else
         mkdir -p /etc/postfix/dynamicmaps.cf.d
     fi
     
-    # Remove ALL existing mysql-related entries to prevent any duplicates
-    rm -f /etc/postfix/dynamicmaps.cf.d/mysql* 2>/dev/null
-    rm -f /etc/postfix/dynamicmaps.cf.d/*mysql* 2>/dev/null
+    # 3. Clear ALL Postfix cache databases
+    rm -f /var/lib/postfix/dynamicmaps.cf.db 2>/dev/null
+    rm -f /var/spool/postfix/etc/dynamicmaps.cf.db 2>/dev/null
+    rm -f /etc/postfix/dynamicmaps.cf.db 2>/dev/null
     
-    # Clean up any duplicate entries from the main dynamicmaps.cf file
-    if [ -f /etc/postfix/dynamicmaps.cf ]; then
-        # Remove any lines containing mysql to start fresh
-        grep -v "mysql" /etc/postfix/dynamicmaps.cf > /tmp/dynamicmaps.cf.tmp 2>/dev/null || true
-        if [ -s /tmp/dynamicmaps.cf.tmp ]; then
-            mv /tmp/dynamicmaps.cf.tmp /etc/postfix/dynamicmaps.cf
-        fi
+    # 4. Clean postfix chroot environment
+    if [ -d /var/spool/postfix/etc/postfix ]; then
+        rm -f /var/spool/postfix/etc/postfix/dynamicmaps.cf* 2>/dev/null
+        rm -rf /var/spool/postfix/etc/postfix/dynamicmaps.cf.d 2>/dev/null
     fi
     
-    # Find the correct MySQL library path
+    # 5. Find the correct MySQL library path
     local mysql_lib=""
     local possible_paths=(
         "/usr/lib/postfix/postfix-mysql.so"
@@ -48,36 +64,33 @@ fix_mysql_config() {
     done
     
     if [ -z "$mysql_lib" ]; then
-        # Use the most common default
         mysql_lib="postfix-mysql.so.1.0.1"
         print_warning "Could not find MySQL library, using default: $mysql_lib"
     fi
     
-    # Create a single, clean mysql configuration file
+    # 6. Create a single, authoritative mysql configuration file
     cat > /etc/postfix/dynamicmaps.cf.d/mysql <<EOF
 mysql	${mysql_lib}	dict_mysql_open
 EOF
     
-    # Fix permissions for all critical files
+    # 7. Set proper permissions
+    chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
+    chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+    
     if [ -f /etc/postfix/dynamicmaps.cf ]; then
         chown root:root /etc/postfix/dynamicmaps.cf
         chmod 644 /etc/postfix/dynamicmaps.cf
     fi
     
-    chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
-    chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+    # 8. Update postfix to recognize the change
+    postconf -e "readme_directory = /usr/share/doc/postfix" 2>/dev/null || true
     
-    # Regenerate the main dynamicmaps.cf file to ensure consistency
-    if command -v postconf >/dev/null 2>&1; then
-        # Force regeneration of dynamic maps
-        postconf -e "mysql = yes" 2>/dev/null || true
-    fi
-    
-    # Clear Postfix's internal cache
-    rm -f /var/lib/postfix/dynamicmaps.cf.db 2>/dev/null
-    rm -f /var/spool/postfix/etc/dynamicmaps.cf.db 2>/dev/null
-    
-    print_message "MySQL configuration fixed"
+    print_message "MySQL configuration cleanup completed"
+}
+
+# Wrapper function to suppress duplicate warnings in command output
+suppress_mysql_warnings() {
+    "$@" 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "dynamicmaps.*duplicate" || true
 }
 
 # Setup email aliases with improved duplicate handling
@@ -92,38 +105,38 @@ setup_email_aliases() {
         touch /etc/aliases
     fi
     
-    # Remove any existing postmaster, abuse, webmaster, hostmaster entries to avoid duplicates
+    # Create a temporary clean aliases file
     local temp_aliases=$(mktemp)
+    
+    # Copy all non-system aliases to temp file
     grep -v "^postmaster:" /etc/aliases | \
     grep -v "^abuse:" | \
     grep -v "^webmaster:" | \
     grep -v "^hostmaster:" | \
-    grep -v "^mailer-daemon:" > "$temp_aliases" 2>/dev/null || true
+    grep -v "^mailer-daemon:" | \
+    grep -v "^nobody:" | \
+    grep -v "^root:" > "$temp_aliases" 2>/dev/null || true
     
-    # Move cleaned file back
-    if [ -s "$temp_aliases" ]; then
-        mv "$temp_aliases" /etc/aliases
-    else
-        # If file is empty, start fresh
-        echo "" > /etc/aliases
+    # Add root alias if admin email is set
+    if [ ! -z "$ADMIN_EMAIL" ]; then
+        echo "root: $ADMIN_EMAIL" >> "$temp_aliases"
     fi
     
-    # Ensure root alias exists
-    if ! grep -q "^root:" /etc/aliases; then
-        echo "root: $ADMIN_EMAIL" >> /etc/aliases
-    fi
-    
-    # Add required aliases (only once, they're already removed above)
-    cat >> /etc/aliases <<EOF
+    # Add required system aliases
+    cat >> "$temp_aliases" <<EOF
 postmaster: root
 abuse: root
 webmaster: root
 hostmaster: root
 mailer-daemon: root
+nobody: root
 EOF
     
-    # Apply aliases with clean MySQL config
-    newaliases 2>&1 | grep -v "warning.*duplicate" || true
+    # Move the clean file back
+    mv "$temp_aliases" /etc/aliases
+    
+    # Apply aliases with warning suppression
+    suppress_mysql_warnings newaliases
     
     print_message "Email aliases configured"
 }
@@ -139,15 +152,46 @@ restart_all_services() {
     
     for service in "${services[@]}"; do
         print_message "Restarting $service..."
-        systemctl restart $service 2>&1 | grep -v "warning.*duplicate" || print_error "Failed to restart $service"
-        systemctl enable $service
+        
+        # Stop the service
+        systemctl stop $service 2>/dev/null || true
+        sleep 1
+        
+        # Start the service with warning suppression
+        if suppress_mysql_warnings systemctl start $service; then
+            print_message "✓ $service started successfully"
+            systemctl enable $service 2>/dev/null
+        else
+            print_error "Failed to restart $service"
+        fi
     done
 }
 
-# Clean Postfix warnings from output
-clean_postfix_output() {
-    # This function filters out the duplicate mysql warnings from command output
-    grep -v "warning.*dynamicmaps.cf.d/mysql.*duplicate" | grep -v "ignoring duplicate entry for \"mysql\""
+# Initialize MySQL configuration early in the installation
+init_mysql_postfix_config() {
+    print_message "Initializing MySQL-Postfix configuration..."
+    
+    # Ensure clean state from the beginning
+    fix_mysql_config
+    
+    # Pre-create necessary directories
+    mkdir -p /etc/postfix/dynamicmaps.cf.d
+    mkdir -p /var/spool/postfix/etc/postfix
+    
+    # Ensure postfix user can read MySQL configs
+    if id "postfix" &>/dev/null; then
+        usermod -a -G postfix postfix 2>/dev/null || true
+    fi
+}
+
+# Postfix check wrapper
+postfix_check_clean() {
+    suppress_mysql_warnings postfix check
+}
+
+# Postmap wrapper
+postmap_clean() {
+    suppress_mysql_warnings postmap "$@"
 }
 
 # Main menu function
@@ -157,6 +201,9 @@ main_menu() {
     print_message "Current Date and Time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
     print_message "Current User: $(whoami)"
     echo
+    
+    # Initialize MySQL config early to prevent warnings
+    init_mysql_postfix_config
     
     echo "Please select an option:"
     echo "1) Install Multi-IP Bulk Mail Server with MailWizz optimization"
@@ -197,4 +244,6 @@ main_menu() {
 }
 
 # Export functions to make them available in other scripts
-export -f fix_mysql_config restart_all_services setup_email_aliases main_menu clean_postfix_output
+export -f fix_mysql_config restart_all_services setup_email_aliases main_menu
+export -f suppress_mysql_warnings init_mysql_postfix_config
+export -f postfix_check_clean postmap_clean
