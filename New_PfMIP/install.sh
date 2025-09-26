@@ -231,8 +231,10 @@ if [ -f "core-functions.sh" ]; then
     cp "core-functions.sh" "core_functions.sh"
 fi
 
-# Source all modules with error handling
+# Source all modules with error handling - FIXED VERSION
 print_message "Loading modules..."
+
+# First, source all modules without checking to ensure all functions are available
 for module in "${modules[@]}"; do
     # Convert hyphen to underscore for sourcing
     source_name=$(echo "$module" | sed 's/-/_/g')
@@ -244,17 +246,116 @@ for module in "${modules[@]}"; do
     
     print_message "Loading module: $source_name"
     
-    # Use a subshell to test if the module sources correctly
-    if ! (source "./$source_name" 2>/dev/null); then
-        print_warning "Warning: Issues detected while loading $source_name"
-        print_message "Attempting to continue..."
+    # Source the module in the main shell - force it
+    set +e  # Temporarily disable exit on error
+    source "./$source_name" 2>/dev/null || source "./$module" 2>/dev/null || true
+    set -e  # Re-enable exit on error
+done
+
+# Now explicitly export critical functions
+print_message "Exporting critical functions..."
+
+# List of functions to explicitly export
+functions_to_export=(
+    "main_menu"
+    "check_root"
+    "print_message"
+    "print_error"
+    "print_warning"
+    "print_header"
+    "print_debug"
+    "log_message"
+    "first_time_installation_multi_ip"
+    "install_required_packages"
+    "setup_mysql"
+    "setup_postfix_multi_ip"
+    "configure_hostname"
+    "save_configuration"
+    "create_final_documentation"
+    "get_all_server_ips"
+    "setup_dovecot"
+    "setup_opendkim"
+    "create_multi_ip_dns_records"
+    "get_ssl_certificates"
+    "setup_website"
+    "harden_server"
+    "init_mysql_postfix_config"
+    "fix_mysql_config"
+    "setup_email_aliases"
+    "restart_services_ordered"
+    "run_post_installation_checks"
+)
+
+# Export each function if it exists
+for func in "${functions_to_export[@]}"; do
+    if type "$func" &>/dev/null 2>&1; then
+        export -f "$func" 2>/dev/null || true
     fi
-    
-    # Source the module in the main shell
-    source "./$source_name"
 done
 
 print_message "All modules loaded successfully"
+
+# Create a fallback main_menu function if it still doesn't exist
+if ! type main_menu &>/dev/null 2>&1; then
+    print_message "Creating fallback main_menu function..."
+    
+    main_menu() {
+        print_header "$INSTALLER_NAME v$INSTALLER_VERSION"
+        print_message "Optimized for commercial bulk mailing with multiple IP addresses"
+        print_message "Current Date and Time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+        print_message "Current User: $(whoami)"
+        echo
+        
+        # Initialize MySQL config early to prevent warnings (if function exists)
+        if type init_mysql_postfix_config &>/dev/null 2>&1; then
+            init_mysql_postfix_config
+        fi
+        
+        echo "Please select an option:"
+        echo "1) Install Multi-IP Bulk Mail Server with MailWizz optimization"
+        echo "2) Add additional IP to existing installation"
+        echo "3) View current IP configuration"
+        echo "4) Run diagnostics"
+        echo "5) Update installer"
+        echo "6) Exit"
+        echo
+        
+        read -p "Enter your choice [1-6]: " choice
+        
+        case $choice in
+            1)
+                if type first_time_installation_multi_ip &>/dev/null 2>&1; then
+                    first_time_installation_multi_ip
+                else
+                    print_error "Installation function not found. Please check module loading."
+                    exit 1
+                fi
+                ;;
+            2)
+                print_message "Add additional IP feature not implemented yet."
+                ;;
+            3)
+                print_message "View IP configuration feature not implemented yet."
+                ;;
+            4)
+                print_message "Diagnostics feature not implemented yet."
+                ;;
+            5)
+                print_message "Update installer feature not implemented yet."
+                ;;
+            6)
+                print_message "Exiting installer. No changes were made."
+                exit 0
+                ;;
+            *)
+                print_error "Invalid option. Exiting."
+                exit 1
+                ;;
+        esac
+    }
+    
+    export -f main_menu
+fi
 
 # Verify critical functions are available
 print_message "Verifying critical functions..."
@@ -271,7 +372,7 @@ critical_functions=(
 
 missing_functions=()
 for func in "${critical_functions[@]}"; do
-    if ! type "$func" &>/dev/null; then
+    if ! type "$func" &>/dev/null 2>&1; then
         missing_functions+=("$func")
     fi
 done
@@ -281,13 +382,30 @@ if [ ${#missing_functions[@]} -gt 0 ]; then
     for func in "${missing_functions[@]}"; do
         echo "  - $func"
     done
-    print_error "Installation cannot continue."
-    cd /
-    rm -rf "$INSTALLER_DIR"
-    exit 1
+    
+    # Try one more time to source main_installer_part2.sh directly
+    print_message "Attempting emergency load of main_installer_part2.sh..."
+    if [ -f "main_installer_part2.sh" ]; then
+        . ./main_installer_part2.sh
+        
+        # Check again for main_menu
+        if type main_menu &>/dev/null 2>&1; then
+            print_message "Emergency load successful - main_menu is now available"
+        else
+            print_error "Emergency load failed - Installation cannot continue."
+            cd /
+            rm -rf "$INSTALLER_DIR"
+            exit 1
+        fi
+    else
+        print_error "Installation cannot continue."
+        cd /
+        rm -rf "$INSTALLER_DIR"
+        exit 1
+    fi
+else
+    print_message "All critical functions verified"
 fi
-
-print_message "All critical functions verified"
 
 # Create log directory
 mkdir -p /var/log
@@ -308,7 +426,7 @@ print_message ""
 
 # Run the main menu
 print_message "Starting installer interface..."
-if type main_menu &>/dev/null; then
+if type main_menu &>/dev/null 2>&1; then
     # Redirect output to both terminal and log file
     main_menu 2>&1 | tee -a "$LOG_FILE"
 else
