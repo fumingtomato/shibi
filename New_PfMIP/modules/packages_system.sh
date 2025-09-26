@@ -12,30 +12,92 @@ install_required_packages() {
     print_message "Updating package lists..."
     apt-get update
     
+    # CRITICAL: Pre-configure Postfix to avoid interactive prompts
+    print_message "Pre-configuring Postfix for non-interactive installation..."
+    
+    # Set Postfix configuration type to "Internet Site"
+    echo "postfix postfix/mailname string ${HOSTNAME:-$(hostname -f)}" | debconf-set-selections
+    echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
+    
+    # Set non-interactive frontend for apt
+    export DEBIAN_FRONTEND=noninteractive
+    
     print_message "Installing essential packages..."
     
-    # Core packages
-    local packages=(
-        # Build tools
+    # Core packages - Install in groups to better handle any issues
+    
+    # First, install basic tools
+    local basic_packages=(
         "build-essential"
         "software-properties-common"
         "apt-transport-https"
         "ca-certificates"
         "gnupg"
         "lsb-release"
-        
-        # Network tools
         "net-tools"
         "curl"
         "wget"
         "telnet"
         "dnsutils"
         "ipcalc"
-        
-        # Mail server packages
-        "postfix"
-        "postfix-mysql"
-        "postfix-pcre"
+    )
+    
+    for package in "${basic_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            if ! apt-get install -y -q "$package" >/dev/null 2>&1; then
+                print_warning "Failed to install $package, continuing..."
+            fi
+        fi
+    done
+    
+    # Install Postfix with non-interactive settings
+    print_message "Installing Postfix (non-interactively)..."
+    if ! dpkg -l | grep -q "^ii  postfix "; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            postfix postfix-mysql postfix-pcre >/dev/null 2>&1; then
+            print_error "Failed to install Postfix"
+            # Try alternative method
+            print_message "Trying alternative Postfix installation method..."
+            apt-get install -y --force-yes postfix postfix-mysql postfix-pcre 2>/dev/null || true
+        else
+            print_message "✓ Postfix installed successfully"
+        fi
+    else
+        print_message "✓ Postfix already installed"
+    fi
+    
+    # Install MySQL/MariaDB
+    print_message "Installing MySQL/MariaDB..."
+    local mysql_packages=(
+        "mysql-server"
+        "mysql-client"
+    )
+    
+    for package in "${mysql_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1; then
+                print_warning "Failed to install $package, trying mariadb..."
+                # Try MariaDB as alternative
+                if [ "$package" = "mysql-server" ]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y -q mariadb-server >/dev/null 2>&1 || true
+                elif [ "$package" = "mysql-client" ]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y -q mariadb-client >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+    done
+    
+    # Install Dovecot packages
+    print_message "Installing Dovecot packages..."
+    local dovecot_packages=(
         "dovecot-core"
         "dovecot-imapd"
         "dovecot-pop3d"
@@ -43,27 +105,67 @@ install_required_packages() {
         "dovecot-mysql"
         "dovecot-sieve"
         "dovecot-managesieved"
-        
-        # Database
-        "mysql-server"
-        "mysql-client"
-        
-        # Web server
+    )
+    
+    for package in "${dovecot_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
+                print_warning "Failed to install $package, continuing..."
+        fi
+    done
+    
+    # Install web server and SSL
+    print_message "Installing web server and SSL tools..."
+    local web_packages=(
         "nginx"
         "certbot"
         "python3-certbot-nginx"
-        
-        # Email authentication
-        "opendkim"
-        "opendkim-tools"
-        
-        # Security tools
+    )
+    
+    for package in "${web_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
+                print_warning "Failed to install $package, continuing..."
+        fi
+    done
+    
+    # Install email authentication
+    print_message "Installing email authentication packages..."
+    if ! dpkg -l | grep -q "^ii  opendkim "; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q opendkim opendkim-tools >/dev/null 2>&1 || \
+            print_warning "Failed to install OpenDKIM"
+    else
+        print_message "✓ OpenDKIM already installed"
+    fi
+    
+    # Install security tools
+    print_message "Installing security tools..."
+    local security_packages=(
         "ufw"
         "fail2ban"
         "rkhunter"
         "logwatch"
-        
-        # Utilities
+    )
+    
+    for package in "${security_packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package already installed"
+        else
+            print_message "Installing $package..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
+                print_warning "Failed to install $package, continuing..."
+        fi
+    done
+    
+    # Install utilities
+    print_message "Installing utility packages..."
+    local utility_packages=(
         "mailutils"
         "zip"
         "unzip"
@@ -76,19 +178,51 @@ install_required_packages() {
         "python3-pip"
     )
     
-    # Install packages with error handling
-    for package in "${packages[@]}"; do
+    for package in "${utility_packages[@]}"; do
         if dpkg -l | grep -q "^ii  $package "; then
             print_message "✓ $package already installed"
         else
             print_message "Installing $package..."
-            if ! apt-get install -y "$package" >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
                 print_warning "Failed to install $package, continuing..."
-            fi
         fi
     done
     
+    # Reset the frontend variable
+    unset DEBIAN_FRONTEND
+    
+    # Ensure critical services are not running yet (will be configured later)
+    print_message "Stopping services for configuration..."
+    systemctl stop postfix 2>/dev/null || true
+    systemctl stop dovecot 2>/dev/null || true
+    systemctl stop mysql 2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
+    
     print_message "Package installation completed"
+    
+    # Verify critical packages
+    print_message "Verifying critical packages..."
+    local critical_packages=("postfix" "mysql-server" "dovecot-core" "nginx")
+    local all_installed=true
+    
+    for package in "${critical_packages[@]}"; do
+        # Check for package or alternatives
+        if dpkg -l | grep -q "^ii  $package "; then
+            print_message "✓ $package verified"
+        elif [ "$package" = "mysql-server" ] && dpkg -l | grep -q "^ii  mariadb-server "; then
+            print_message "✓ mariadb-server verified (alternative to mysql-server)"
+        else
+            print_error "✗ $package is not installed properly"
+            all_installed=false
+        fi
+    done
+    
+    if [ "$all_installed" = false ]; then
+        print_error "Some critical packages failed to install."
+        print_message "Attempting to fix broken packages..."
+        apt-get install -f -y
+        dpkg --configure -a
+    fi
 }
 
 # Configure system hostname
@@ -230,16 +364,20 @@ EOF
     
     local backup_file="$backup_dir/config-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
     
-    tar -czf "$backup_file" \
-        /etc/postfix/ \
-        /etc/dovecot/ \
-        /etc/nginx/sites-available/ \
-        /etc/opendkim/ \
-        "$config_file" \
-        2>/dev/null || true
+    # Only backup directories that exist
+    local dirs_to_backup=""
+    [ -d "/etc/postfix" ] && dirs_to_backup="$dirs_to_backup /etc/postfix"
+    [ -d "/etc/dovecot" ] && dirs_to_backup="$dirs_to_backup /etc/dovecot"
+    [ -d "/etc/nginx/sites-available" ] && dirs_to_backup="$dirs_to_backup /etc/nginx/sites-available"
+    [ -d "/etc/opendkim" ] && dirs_to_backup="$dirs_to_backup /etc/opendkim"
+    [ -f "$config_file" ] && dirs_to_backup="$dirs_to_backup $config_file"
+    
+    if [ ! -z "$dirs_to_backup" ]; then
+        tar -czf "$backup_file" $dirs_to_backup 2>/dev/null || true
+        print_message "Backup created at: $backup_file"
+    fi
     
     print_message "Configuration saved to: $config_file"
-    print_message "Backup created at: $backup_file"
     
     # Create quick reference file
     cat > /root/mail-server-quick-ref.txt <<EOF
@@ -338,61 +476,16 @@ EOF
     
     # Check service status
     for service in postfix dovecot mysql nginx opendkim; do
-        if systemctl is-active --quiet $service; then
+        if systemctl is-active --quiet $service 2>/dev/null; then
             echo "✓ $service: Running" >> "$doc_file"
+        elif systemctl is-active --quiet mariadb 2>/dev/null && [ "$service" = "mysql" ]; then
+            echo "✓ mariadb: Running (MySQL alternative)" >> "$doc_file"
         else
             echo "✗ $service: Not running" >> "$doc_file"
         fi
     done
     
     cat >> "$doc_file" <<'EOF'
-
-PORTS AND FIREWALL:
--------------------
-Port 22   (SSH)        - Administrative access
-Port 25   (SMTP)       - Incoming mail
-Port 80   (HTTP)       - Web redirect
-Port 143  (IMAP)       - Mail retrieval
-Port 443  (HTTPS)      - Secure web
-Port 465  (SMTPS)      - Secure SMTP
-Port 587  (Submission) - Mail submission
-Port 993  (IMAPS)      - Secure IMAP
-
-DNS RECORDS REQUIRED:
----------------------
-1. A Records:
-   - Set A record for hostname pointing to each IP
-   
-2. MX Record:
-   - Set MX record for domain pointing to mail hostname
-   
-3. PTR Records (Reverse DNS):
-   - Must be set with hosting provider for each IP
-   
-4. SPF Record:
-   - Check /root/spf-record-*.txt for exact record
-   
-5. DKIM Record:
-   - Check /root/dkim-record-*.txt for exact record
-   
-6. DMARC Record:
-   - Check /root/dmarc-record-*.txt for exact record
-
-MAIL ACCOUNTS:
---------------
-EOF
-    
-    echo "Primary account: ${MAIL_USERNAME}@${DOMAIN_NAME}" >> "$doc_file"
-    
-    cat >> "$doc_file" <<'EOF'
-
-To add more email accounts:
-1. MySQL method:
-   mysql -u mailuser -p$(cat /root/.mail_db_password) mailserver
-   Then use add_email_user function
-
-2. Command line:
-   echo "INSERT INTO virtual_users (domain_id, email, password) VALUES (1, 'user@domain', ENCRYPT('password', CONCAT('$6$', SUBSTRING(SHA(RAND()), -16))));" | mysql mailserver
 
 TESTING YOUR SETUP:
 -------------------
@@ -405,115 +498,12 @@ TESTING YOUR SETUP:
 3. Monitor mail log:
    tail -f /var/log/mail.log
 
-4. Check specific IP sending:
-   grep "smtp-ip1" /var/log/mail.log | tail
-
-5. Test authentication:
+4. Test authentication:
    telnet localhost 25
    EHLO test
-   AUTH LOGIN
-   (provide base64 encoded credentials)
-
-TROUBLESHOOTING:
-----------------
-1. Mail not sending:
-   - Check: systemctl status postfix
-   - Check: tail -f /var/log/mail.log
-   - Verify: postfix check
-
-2. Authentication failing:
-   - Check: systemctl status dovecot
-   - Test: doveadm auth test user@domain
-   - Verify MySQL: mysql -u mailuser -p
-
-3. SSL issues:
-   - Check certificates: ls -la /etc/letsencrypt/live/
-   - Test: openssl s_client -connect hostname:993
-
-4. DNS issues:
-   - Test SPF: dig txt domain.com
-   - Test DKIM: dig txt mail._domainkey.domain.com
-   - Test MX: dig mx domain.com
-
-5. IP rotation not working:
-   - Check: grep "smtp-ip" /etc/postfix/master.cf
-   - Verify: postconf transport_maps
-
-PERFORMANCE OPTIMIZATION:
--------------------------
-1. Adjust Postfix settings in /etc/postfix/main.cf:
-   - default_process_limit = 100-200
-   - qmgr_message_active_limit = 20000-40000
-   - smtp_destination_concurrency_limit = 20-50
-
-2. MySQL tuning in /etc/mysql/mysql.conf.d/mysqld.cnf:
-   - max_connections = 200
-   - innodb_buffer_pool_size = 256M
-
-3. Monitor server resources:
-   - htop (CPU and memory)
-   - iostat -x 1 (disk I/O)
-   - netstat -an | grep :25 | wc -l (SMTP connections)
-
-SECURITY RECOMMENDATIONS:
---------------------------
-1. Regular updates:
-   apt update && apt upgrade
-
-2. Monitor logs:
-   /usr/local/bin/check-mail-security
-
-3. Check blacklists regularly:
-   for ip in $(cat /root/ip-list.txt); do
-     host $ip.zen.spamhaus.org
-   done
-
-4. Backup regularly:
-   - Database: mysqldump mailserver > backup.sql
-   - Config: tar -czf mail-config.tar.gz /etc/postfix /etc/dovecot
-
-MAILWIZZ INTEGRATION:
----------------------
-See /root/mailwizz-multi-ip-guide.txt for detailed MailWizz setup
-
-Key points:
-1. Create separate delivery server for each IP
-2. Set appropriate hourly/daily limits per IP
-3. Configure webhook for engagement tracking (if sticky IP enabled)
-4. Use delivery server groups for load balancing
-
-MAINTENANCE TASKS:
-------------------
-Daily:
-- Check mail queue: mailq
-- Review logs: grep error /var/log/mail.log
-- Monitor reputation: check blacklists
-
-Weekly:
-- Update IP warmup status: ip-warmup-manager status
-- Review statistics: mail-stats report
-- Check disk space: df -h
-
-Monthly:
-- Update software: apt update && apt upgrade
-- Review security: rkhunter --check
-- Optimize database: mysqlcheck -o mailserver
-
-SUPPORT RESOURCES:
-------------------
-- Documentation: /root/mail-server-multiip-info.txt
-- Quick reference: /root/mail-server-quick-ref.txt
-- MailWizz guide: /root/mailwizz-multi-ip-guide.txt
-- Configuration: /root/mail-server-config.json
-- Logs: /var/log/mail.log
-
-For issues, check:
-1. This documentation
-2. System logs in /var/log/
-3. Service status with systemctl status
 
 ==========================================================
-Installation completed successfully!
+Installation completed!
 Your multi-IP bulk mail server is ready for use.
 ==========================================================
 EOF
@@ -585,151 +575,13 @@ setup_website() {
             font-size: 0.875rem;
             margin-bottom: 2rem;
         }
-        .info {
-            background: #f3f4f6;
-            padding: 1.5rem;
-            border-radius: 8px;
-            margin: 2rem 0;
-        }
-        .info h2 {
-            color: #4b5563;
-            font-size: 1.25rem;
-            margin-bottom: 1rem;
-        }
-        .info p {
-            color: #6b7280;
-            margin-bottom: 0.5rem;
-        }
-        .contact {
-            margin-top: 2rem;
-            padding-top: 2rem;
-            border-top: 1px solid #e5e7eb;
-        }
-        .contact a {
-            color: #764ba2;
-            text-decoration: none;
-            font-weight: 500;
-        }
-        .contact a:hover {
-            text-decoration: underline;
-        }
-        .features {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 1rem;
-            margin: 2rem 0;
-        }
-        .feature {
-            display: flex;
-            align-items: center;
-            color: #4b5563;
-        }
-        .feature::before {
-            content: "✓";
-            display: inline-block;
-            width: 24px;
-            height: 24px;
-            background: #10b981;
-            color: white;
-            border-radius: 50%;
-            text-align: center;
-            line-height: 24px;
-            margin-right: 0.5rem;
-            font-weight: bold;
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>${brand_name}</h1>
         <span class="status">● Mail Server Active</span>
-        
-        <div class="info">
-            <h2>Professional Email Service</h2>
-            <p>This is a private mail server for ${domain}.</p>
-            <p>Authorized users can access their email using standard mail clients.</p>
-        </div>
-        
-        <div class="features">
-            <div class="feature">IMAP/SMTP Support</div>
-            <div class="feature">SSL/TLS Security</div>
-            <div class="feature">Spam Protection</div>
-            <div class="feature">Multi-IP Delivery</div>
-        </div>
-        
-        <div class="info">
-            <h2>Mail Client Configuration</h2>
-            <p><strong>Incoming Server (IMAP):</strong></p>
-            <p>Server: ${domain}</p>
-            <p>Port: 993 (SSL/TLS)</p>
-            <p>Security: SSL/TLS</p>
-            <br>
-            <p><strong>Outgoing Server (SMTP):</strong></p>
-            <p>Server: ${domain}</p>
-            <p>Port: 587 (STARTTLS) or 465 (SSL/TLS)</p>
-            <p>Security: STARTTLS or SSL/TLS</p>
-            <p>Authentication: Required</p>
-        </div>
-        
-        <div class="contact">
-            <p>For support, contact: <a href="mailto:${admin_email}">${admin_email}</a></p>
-        </div>
-    </div>
-</body>
-</html>
-EOF
-    
-    # Create robots.txt to prevent indexing
-    cat > /var/www/html/robots.txt <<EOF
-User-agent: *
-Disallow: /
-EOF
-    
-    # Create a simple 404 page
-    cat > /var/www/html/404.html <<EOF
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>404 - Page Not Found</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            margin: 0;
-            background: #f3f4f6;
-        }
-        .error-container {
-            text-align: center;
-            padding: 2rem;
-        }
-        h1 {
-            font-size: 6rem;
-            margin: 0;
-            color: #764ba2;
-        }
-        p {
-            font-size: 1.25rem;
-            color: #6b7280;
-        }
-        a {
-            color: #764ba2;
-            text-decoration: none;
-        }
-        a:hover {
-            text-decoration: underline;
-        }
-    </style>
-</head>
-<body>
-    <div class="error-container">
-        <h1>404</h1>
-        <p>Page not found</p>
-        <p><a href="/">Return to homepage</a></p>
+        <p>Professional Email Service for ${domain}</p>
     </div>
 </body>
 </html>
