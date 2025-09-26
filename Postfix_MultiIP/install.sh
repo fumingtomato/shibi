@@ -3,7 +3,7 @@
 # =================================================================
 # Multi-IP Bulk Mail Server Master Installer
 # Version: 16.0.0
-# Repository: https://github.com/fumingtomato/maileristhegame
+# Repository: https://github.com/fumingtomato/shibi
 # =================================================================
 
 set -e
@@ -91,17 +91,25 @@ done
 
 print_message "All modules downloaded successfully"
 
-# Source all modules
+# Source all modules with error handling
 print_message "Loading modules..."
 for module in "${modules[@]}"; do
     print_message "Loading module: $module"
-    source "./$module"
+    if ! source "./$module"; then
+        print_error "Error loading module: $module"
+        exit 1
+    fi
 done
 
 print_message "All modules loaded successfully"
 
-# Run the main menu
-main_menu
+# Run the main menu only once
+if type main_menu &>/dev/null; then
+    main_menu
+else
+    print_error "main_menu function not available. Installation failed."
+    exit 1
+fi
 
 # Cleanup
 cd /
