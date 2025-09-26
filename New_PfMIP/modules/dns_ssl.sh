@@ -55,7 +55,38 @@ delete_cf_record() {
     fi
 }
 
-# Create Cloudflare DNS records
+# Delete ALL records for a given name (used for DKIM cleanup)
+delete_all_cf_records_for_name() {
+    local name=$1
+    
+    print_debug "Deleting all DNS records for name: $name"
+    
+    # Get ALL records for this name (not just TXT)
+    local response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$name" \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json")
+    
+    # Extract all record IDs
+    local record_ids=$(echo "$response" | grep -o '"id":"[^"]*"' | cut -d '"' -f4)
+    
+    if [ ! -z "$record_ids" ]; then
+        local deleted_count=0
+        while IFS= read -r record_id; do
+            if [ ! -z "$record_id" ]; then
+                if delete_cf_record "$record_id"; then
+                    deleted_count=$((deleted_count + 1))
+                    print_debug "Deleted record with ID: $record_id"
+                fi
+            fi
+        done <<< "$record_ids"
+        
+        if [ $deleted_count -gt 0 ]; then
+            print_message "Deleted $deleted_count existing record(s) for $name"
+        fi
+    fi
+}
+
+# Create Cloudflare DNS records with improved DKIM handling
 create_cf_record() {
     local type=$1
     local name=$2
@@ -65,24 +96,33 @@ create_cf_record() {
     
     print_debug "Creating $type record for $name..."
     
-    record_id=$(check_cf_record_exists "$type" "$name")
-    
-    if [ ! -z "$record_id" ]; then
-        if [ "$force" = true ]; then
-            curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
-                -H "Authorization: Bearer $CF_API_TOKEN" \
-                -H "Content-Type: application/json" > /dev/null
-            print_message "Force deleted existing $type record for $name"
-        else
-            read -p "Record $type for $name already exists. Overwrite? (y/n): " overwrite
-            if [[ "$overwrite" != "y" && "$overwrite" != "Y" ]]; then
-                print_message "Skipping creation of $type record for $name"
-                return 0
-            else
+    # Special handling for DKIM records - always delete ALL old records
+    if [[ "$name" == *"._domainkey."* ]] || [[ "$name" == "mail._domainkey"* ]]; then
+        print_message "DKIM record detected. Removing ALL old DKIM records for $name..."
+        delete_all_cf_records_for_name "$name"
+        # Small delay to ensure Cloudflare processes the deletion
+        sleep 1
+    else
+        # For non-DKIM records, check if record exists
+        record_id=$(check_cf_record_exists "$type" "$name")
+        
+        if [ ! -z "$record_id" ]; then
+            if [ "$force" = true ]; then
                 curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
                     -H "Authorization: Bearer $CF_API_TOKEN" \
                     -H "Content-Type: application/json" > /dev/null
-                print_message "Deleted existing $type record for $name"
+                print_message "Force deleted existing $type record for $name"
+            else
+                read -p "Record $type for $name already exists. Overwrite? (y/n): " overwrite
+                if [[ "$overwrite" != "y" && "$overwrite" != "Y" ]]; then
+                    print_message "Skipping creation of $type record for $name"
+                    return 0
+                else
+                    curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
+                        -H "Authorization: Bearer $CF_API_TOKEN" \
+                        -H "Content-Type: application/json" > /dev/null
+                    print_message "Deleted existing $type record for $name"
+                fi
             fi
         fi
     fi
@@ -93,7 +133,9 @@ create_cf_record() {
         mx_content=$(echo "$content" | cut -d ' ' -f2-)
         json_data="{\"type\":\"$type\",\"name\":\"$name\",\"content\":\"$mx_content\",\"priority\":$priority,\"ttl\":1,\"proxied\":false}"
     elif [ "$type" = "TXT" ]; then
-        json_data="{\"type\":\"$type\",\"name\":\"$name\",\"content\":\"$content\",\"ttl\":1,\"proxied\":false}"
+        # Escape the content properly for JSON
+        content_escaped=$(echo "$content" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
+        json_data="{\"type\":\"$type\",\"name\":\"$name\",\"content\":\"$content_escaped\",\"ttl\":1,\"proxied\":false}"
     else
         json_data="{\"type\":\"$type\",\"name\":\"$name\",\"content\":\"$content\",\"ttl\":1,\"proxied\":$proxied}"
     fi
@@ -117,7 +159,7 @@ create_cf_record() {
     fi
 }
 
-# Create DNS records for multiple IPs
+# Create DNS records for multiple IPs with improved DKIM handling
 create_multi_ip_dns_records() {
     local domain=$1
     local hostname=$2
@@ -170,9 +212,15 @@ create_multi_ip_dns_records() {
     local spf_content="v=spf1 mx a${spf_ips} ~all"
     create_cf_record "TXT" "$domain" "$spf_content" false true
     
-    # Create DKIM record
+    # Create DKIM record - with complete cleanup of old records
     local dkim_value=$(get_dkim_value "$domain")
-    create_cf_record "TXT" "mail._domainkey.$domain" "v=DKIM1; k=rsa; p=$dkim_value" false true
+    if [ ! -z "$dkim_value" ]; then
+        print_message "Creating DKIM record with new key..."
+        # The create_cf_record function will now properly delete ALL old DKIM records
+        create_cf_record "TXT" "mail._domainkey.$domain" "v=DKIM1; k=rsa; p=$dkim_value" false true
+    else
+        print_warning "DKIM key not found. Please configure DKIM manually."
+    fi
     
     # Create DMARC record
     create_cf_record "TXT" "_dmarc.$domain" "v=DMARC1; p=none; rua=mailto:$ADMIN_EMAIL" false true
@@ -403,4 +451,5 @@ EOF
 }
 
 export -f check_any_cf_record_exists check_cf_record_exists delete_cf_record
-export -f create_cf_record create_multi_ip_dns_records setup_nginx get_ssl_certificates
+export -f delete_all_cf_records_for_name create_cf_record create_multi_ip_dns_records 
+export -f setup_nginx get_ssl_certificates
