@@ -12,10 +12,10 @@ harden_server() {
     
     print_header "Applying Server Hardening Measures"
     
-    # System Updates
+    # System Updates - Changed from apt to apt-get
     print_message "Ensuring system is up to date..."
-    apt update
-    apt upgrade -y
+    apt-get update
+    apt-get upgrade -y
     
     # SSH Hardening
     print_message "Hardening SSH configuration..."
@@ -33,9 +33,9 @@ harden_server() {
         print_warning "SSH service not found. Please restart SSH manually."
     fi
     
-    # Firewall Configuration with UFW
+    # Firewall Configuration with UFW - Changed from apt install to apt-get install
     print_message "Setting up firewall..."
-    apt install -y ufw
+    apt-get install -y ufw
     
     # SSH access
     ufw allow ssh
@@ -55,9 +55,9 @@ harden_server() {
     # Enable firewall
     echo "y" | ufw enable
     
-    # Fail2Ban Installation
+    # Fail2Ban Installation - Changed from apt install to apt-get install
     print_message "Installing and configuring Fail2Ban..."
-    apt install -y fail2ban >/dev/null 2>&1
+    apt-get install -y fail2ban >/dev/null 2>&1
     
     # Create Fail2Ban configuration for mail services
     cat > /etc/fail2ban/jail.local <<EOF
@@ -141,9 +141,9 @@ EOF
     
     sysctl -p /etc/sysctl.d/50-security-hardening.conf
     
-    # Setup Logwatch for log monitoring
+    # Setup Logwatch for log monitoring - Changed from apt install to apt-get install
     print_message "Setting up log monitoring..."
-    apt install -y logwatch
+    apt-get install -y logwatch
     
     # Configure logwatch to send daily reports
     cat > /etc/cron.daily/00logwatch <<EOF
@@ -153,9 +153,9 @@ EOF
     
     chmod +x /etc/cron.daily/00logwatch
     
-    # Setup Rootkit detection
+    # Setup Rootkit detection - Changed from apt install to apt-get install
     print_message "Installing rootkit detection..."
-    apt install -y rkhunter
+    apt-get install -y rkhunter
     
     # Configure rkhunter
     sed -i 's/CRON_DAILY_RUN=""/CRON_DAILY_RUN="yes"/g' /etc/default/rkhunter
@@ -203,9 +203,9 @@ EOF
     
     chmod +x /usr/local/bin/check-mail-security
     
-    # Setup unattended security updates
+    # Setup unattended security updates - Changed from apt install to apt-get install
     print_message "Configuring unattended security updates..."
-    apt install -y unattended-upgrades apt-listchanges
+    apt-get install -y unattended-upgrades apt-listchanges
     
     cat > /etc/apt/apt.conf.d/50unattended-upgrades <<EOF
 Unattended-Upgrade::Allowed-Origins {
