@@ -55,34 +55,85 @@ delete_cf_record() {
     fi
 }
 
-# Delete ALL records for a given name (used for DKIM cleanup)
+# Delete ALL records for a given name - ENHANCED VERSION
 delete_all_cf_records_for_name() {
     local name=$1
+    local max_iterations=5  # Prevent infinite loop
+    local iteration=0
+    local total_deleted=0
     
-    print_debug "Deleting all DNS records for name: $name"
+    print_debug "Deleting ALL DNS records for name: $name"
     
-    # Get ALL records for this name (not just TXT)
-    local response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$name" \
-        -H "Authorization: Bearer $CF_API_TOKEN" \
-        -H "Content-Type: application/json")
-    
-    # Extract all record IDs
-    local record_ids=$(echo "$response" | grep -o '"id":"[^"]*"' | cut -d '"' -f4)
-    
-    if [ ! -z "$record_ids" ]; then
-        local deleted_count=0
+    while [ $iteration -lt $max_iterations ]; do
+        iteration=$((iteration + 1))
+        
+        # Get ALL records for this name (any type)
+        local response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$name&per_page=100" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+        
+        # Check if there are any records
+        local count=$(echo "$response" | grep -o '"count":[0-9]*' | cut -d ':' -f2)
+        
+        if [ -z "$count" ] || [ "$count" -eq 0 ]; then
+            break
+        fi
+        
+        # Extract ALL record IDs from the response
+        local record_ids=$(echo "$response" | python3 -c "
+import json
+import sys
+try:
+    data = json.load(sys.stdin)
+    for record in data.get('result', []):
+        print(record.get('id', ''))
+except:
+    pass
+" 2>/dev/null)
+        
+        # If python3 is not available, use grep method
+        if [ -z "$record_ids" ]; then
+            record_ids=$(echo "$response" | grep -o '"id":"[^"]*"' | cut -d '"' -f4)
+        fi
+        
+        if [ -z "$record_ids" ]; then
+            break
+        fi
+        
+        # Delete each record
+        local deleted_in_iteration=0
         while IFS= read -r record_id; do
             if [ ! -z "$record_id" ]; then
                 if delete_cf_record "$record_id"; then
-                    deleted_count=$((deleted_count + 1))
+                    deleted_in_iteration=$((deleted_in_iteration + 1))
+                    total_deleted=$((total_deleted + 1))
                     print_debug "Deleted record with ID: $record_id"
                 fi
             fi
         done <<< "$record_ids"
         
-        if [ $deleted_count -gt 0 ]; then
-            print_message "Deleted $deleted_count existing record(s) for $name"
+        # If nothing was deleted in this iteration, break
+        if [ $deleted_in_iteration -eq 0 ]; then
+            break
         fi
+        
+        # Small delay between iterations
+        sleep 1
+    done
+    
+    if [ $total_deleted -gt 0 ]; then
+        print_message "Deleted $total_deleted existing record(s) for $name"
+    fi
+    
+    # Final verification - check if any records still exist
+    sleep 2
+    local final_check=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$name" \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json")
+    
+    local remaining=$(echo "$final_check" | grep -o '"count":[0-9]*' | cut -d ':' -f2)
+    if [ ! -z "$remaining" ] && [ "$remaining" -gt 0 ]; then
+        print_warning "Warning: $remaining record(s) may still exist for $name after deletion attempt"
     fi
 }
 
@@ -96,12 +147,31 @@ create_cf_record() {
     
     print_debug "Creating $type record for $name..."
     
-    # Special handling for DKIM records - always delete ALL old records
+    # Special handling for DKIM records - ENHANCED deletion
     if [[ "$name" == *"._domainkey."* ]] || [[ "$name" == "mail._domainkey"* ]]; then
-        print_message "DKIM record detected. Removing ALL old DKIM records for $name..."
+        print_message "DKIM record detected. Performing thorough cleanup of old DKIM records..."
+        
+        # First, delete all records with exact name match
         delete_all_cf_records_for_name "$name"
-        # Small delay to ensure Cloudflare processes the deletion
-        sleep 1
+        
+        # Wait for Cloudflare to process
+        sleep 2
+        
+        # Double-check: Try to delete any TXT records specifically
+        local txt_records=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=TXT&name=$name" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+        
+        local txt_ids=$(echo "$txt_records" | grep -o '"id":"[^"]*"' | cut -d '"' -f4)
+        if [ ! -z "$txt_ids" ]; then
+            print_warning "Found additional TXT records to delete..."
+            while IFS= read -r txt_id; do
+                if [ ! -z "$txt_id" ]; then
+                    delete_cf_record "$txt_id"
+                fi
+            done <<< "$txt_ids"
+            sleep 1
+        fi
     else
         # For non-DKIM records, check if record exists
         record_id=$(check_cf_record_exists "$type" "$name")
@@ -152,6 +222,23 @@ create_cf_record() {
     success=$(echo "$response" | grep -o '"success":true')
     if [ -n "$success" ]; then
         print_message "Created $type record for $name"
+        
+        # For DKIM records, verify it was created correctly
+        if [[ "$name" == *"._domainkey."* ]]; then
+            sleep 2
+            local verify=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=TXT&name=$name" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json")
+            
+            local verify_count=$(echo "$verify" | grep -o '"count":[0-9]*' | cut -d ':' -f2)
+            if [ "$verify_count" -eq 1 ]; then
+                print_message "✓ DKIM record verified - exactly one record exists"
+            elif [ "$verify_count" -gt 1 ]; then
+                print_warning "⚠ Warning: Multiple DKIM records exist for $name"
+            else
+                print_error "✗ DKIM record verification failed"
+            fi
+        fi
     else
         print_error "Failed to create $type record for $name"
         print_debug "API call failed: $response"
