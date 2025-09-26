@@ -123,7 +123,7 @@ print_message "Downloading installer modules..."
 # CRITICAL: Module loading order is important for dependencies
 modules=(
     "core_functions.sh"          # Basic functions needed by all
-    "packages_systems.sh"          # NEW - System packages and missing functions
+    "packages_system.sh"         # NEW - System packages and missing functions
     "multiip_config.sh"          # IP configuration
     "mysql_dovecot.sh"           # MySQL and Dovecot setup
     "postfix_setup.sh"           # Postfix configuration
