@@ -246,7 +246,7 @@ create_cf_record() {
     fi
 }
 
-# Create DNS records for multiple IPs with improved DKIM handling
+# Create DNS records for multiple IPs with new numbered subdomain format
 create_multi_ip_dns_records() {
     local domain=$1
     local hostname=$2
@@ -258,8 +258,14 @@ create_multi_ip_dns_records() {
         print_message "Please manually create the following DNS records:"
         
         echo "1. A Records:"
-        for ip in "${IP_ADDRESSES[@]}"; do
-            echo "   - mail.${domain} -> $ip"
+        for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
+            local ip="${IP_ADDRESSES[$i]}"
+            if [ $i -eq 0 ]; then
+                echo "   - ${SUBDOMAIN}.${domain} -> $ip"
+            else
+                local suffix=$(printf "%03d" $i)
+                echo "   - ${SUBDOMAIN}${suffix}.${domain} -> $ip"
+            fi
         done
         
         echo "2. SPF Record:"
@@ -269,35 +275,64 @@ create_multi_ip_dns_records() {
         done
         echo "   TXT @ -> v=spf1 mx a${spf_ips} ~all"
         
-        echo "3. Reverse DNS (PTR Records):"
+        echo "3. SPF Records for HELO hostnames:"
+        for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
+            if [ $i -eq 0 ]; then
+                echo "   TXT ${SUBDOMAIN}.${domain} -> v=spf1 a -all"
+            else
+                local suffix=$(printf "%03d" $i)
+                echo "   TXT ${SUBDOMAIN}${suffix}.${domain} -> v=spf1 a -all"
+            fi
+        done
+        
+        echo "4. Reverse DNS (PTR Records):"
         echo "   Configure with your hosting provider for each IP"
         
         return
     fi
     
-    # Create A records for each IP
+    # Create A records for each IP with new naming convention
     local ip_index=0
     for ip in "${IP_ADDRESSES[@]}"; do
         ip_index=$((ip_index + 1))
         
         if [ $ip_index -eq 1 ]; then
+            # Primary IP gets the main subdomain and domain root
             create_cf_record "A" "$hostname" "$ip" false true
             create_cf_record "A" "$domain" "$ip" false true
         else
-            create_cf_record "A" "mail${ip_index}.${domain}" "$ip" false true
+            # Additional IPs get numbered subdomains (subdomain001, subdomain002, etc.)
+            local suffix=$(printf "%03d" $((ip_index - 1)))
+            local numbered_hostname="${SUBDOMAIN}${suffix}.${domain}"
+            create_cf_record "A" "$numbered_hostname" "$ip" false true
         fi
     done
     
     # Create MX record
     create_cf_record "MX" "$domain" "10 $hostname" false true
     
-    # Create SPF record with all IPs
+    # Create SPF record with all IPs for main domain
     local spf_ips=""
     for ip in "${IP_ADDRESSES[@]}"; do
         spf_ips="${spf_ips} ip4:${ip}"
     done
     local spf_content="v=spf1 mx a${spf_ips} ~all"
     create_cf_record "TXT" "$domain" "$spf_content" false true
+    
+    # Create SPF records for all HELO hostnames to prevent SPF_HELO_NONE
+    print_message "Creating SPF records for HELO hostnames..."
+    
+    # Primary hostname SPF
+    create_cf_record "TXT" "$hostname" "v=spf1 a -all" false true
+    
+    # Numbered hostnames SPF
+    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+        for ((i=2; i<=${#IP_ADDRESSES[@]}; i++)); do
+            local suffix=$(printf "%03d" $((i - 1)))
+            local numbered_hostname="${SUBDOMAIN}${suffix}.${domain}"
+            create_cf_record "TXT" "$numbered_hostname" "v=spf1 a -all" false true
+        done
+    fi
     
     # Create DKIM record - with complete cleanup of old records
     local dkim_value=$(get_dkim_value "$domain")
@@ -312,10 +347,10 @@ create_multi_ip_dns_records() {
     # Create DMARC record
     create_cf_record "TXT" "_dmarc.$domain" "v=DMARC1; p=none; rua=mailto:$ADMIN_EMAIL" false true
     
-    print_message "Multi-IP DNS records created"
+    print_message "Multi-IP DNS records created with numbered subdomain format"
 }
 
-# Configure Nginx for Let's Encrypt and SSL
+# Configure Nginx for Let's Encrypt and SSL with numbered subdomains
 setup_nginx() {
     local domain=$1
     local hostname=$2
@@ -339,7 +374,7 @@ server {
 }
 EOF
     
-    # Create Nginx configuration for mail subdomain
+    # Create Nginx configuration for primary mail subdomain
     cat > /etc/nginx/sites-available/$hostname <<EOF
 server {
     listen 80;
@@ -355,6 +390,32 @@ server {
 }
 EOF
     
+    # Create Nginx configurations for numbered subdomains if multiple IPs
+    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+        for ((i=2; i<=${#IP_ADDRESSES[@]}; i++)); do
+            local suffix=$(printf "%03d" $((i - 1)))
+            local numbered_hostname="${SUBDOMAIN}${suffix}.${domain}"
+            
+            cat > /etc/nginx/sites-available/$numbered_hostname <<EOF
+server {
+    listen 80;
+    server_name $numbered_hostname;
+    
+    location ~ /.well-known {
+        allow all;
+    }
+    
+    location / {
+        return 301 https://$domain\$request_uri;
+    }
+}
+EOF
+            
+            # Enable the numbered subdomain site
+            ln -sf /etc/nginx/sites-available/$numbered_hostname /etc/nginx/sites-enabled/
+        done
+    fi
+    
     # Enable sites and create web root
     mkdir -p /etc/nginx/sites-enabled/
     ln -sf /etc/nginx/sites-available/$domain /etc/nginx/sites-enabled/
@@ -365,7 +426,7 @@ EOF
     print_message "Nginx configuration completed."
 }
 
-# Advanced SSL certificate management
+# Advanced SSL certificate management with numbered subdomains
 get_ssl_certificates() {
     local domain=$1
     local hostname=$2
@@ -442,6 +503,31 @@ get_ssl_certificates() {
                                 hostname_cert_exists=true
                                 print_message "Using main domain certificate for $hostname"
                             fi
+                        fi
+                    fi
+                fi
+            done
+        fi
+        
+        # Get certificates for numbered subdomains if multiple IPs
+        if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+            print_message "Obtaining certificates for numbered subdomains..."
+            for ((i=2; i<=${#IP_ADDRESSES[@]}; i++)); do
+                local suffix=$(printf "%03d" $((i - 1)))
+                local numbered_hostname="${SUBDOMAIN}${suffix}.${domain}"
+                local numbered_cert_dir="/etc/letsencrypt/live/$numbered_hostname"
+                
+                if [ -d "$numbered_cert_dir" ] && [ -f "$numbered_cert_dir/fullchain.pem" ]; then
+                    print_message "Certificate already exists for $numbered_hostname"
+                else
+                    print_message "Obtaining certificate for $numbered_hostname..."
+                    if certbot certonly --standalone -d $numbered_hostname --non-interactive --agree-tos --email $email; then
+                        print_message "Certificate for $numbered_hostname obtained successfully"
+                    else
+                        print_warning "Failed to obtain certificate for $numbered_hostname. Using main certificate as fallback."
+                        if $domain_cert_exists; then
+                            mkdir -p "$numbered_cert_dir"
+                            cp "$domain_cert_dir"/* "$numbered_cert_dir/"
                         fi
                     fi
                 fi
