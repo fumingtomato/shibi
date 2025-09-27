@@ -472,7 +472,7 @@ if [[ "${MULTI_IP,,}" == "y" ]]; then
         # Check for comma-separated IPs
         if [[ "$ip_input" == *","* ]]; then
             IFS=',' read -ra ADDR_ARRAY <<< "$ip_input"
-            local count=0
+            count=0
             for addr in "${ADDR_ARRAY[@]}"; do
                 if validate_ip "$addr"; then
                     if [[ "$addr" != "$PRIMARY_IP" ]]; then
@@ -488,12 +488,12 @@ if [[ "${MULTI_IP,,}" == "y" ]]; then
         
         # Check for IP range
         elif [[ "$ip_input" == *"-"* ]]; then
-            local start_ip=${ip_input%-*}
-            local end_ip=${ip_input#*-}
+            start_ip=${ip_input%-*}
+            end_ip=${ip_input#*-}
             
             # Handle short notation (192.168.1.100-110)
             if [[ ! "$end_ip" == *.*.*.* ]]; then
-                local base_ip=${start_ip%.*}
+                base_ip=${start_ip%.*}
                 end_ip="$base_ip.$end_ip"
             fi
             
@@ -517,7 +517,7 @@ if [[ "${MULTI_IP,,}" == "y" ]]; then
         fi
         
         # Show current count
-        local unique_ips=($(echo "${IP_ADDRESSES[@]}" | tr ' ' '\n' | sort -u))
+        unique_ips=($(echo "${IP_ADDRESSES[@]}" | tr ' ' '\n' | sort -u))
         echo "  Current total: ${#unique_ips[@]} unique IPs"
         
         # Safety limit
