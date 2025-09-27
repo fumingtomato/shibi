@@ -1,137 +1,328 @@
 #!/bin/bash
 
 # =================================================================
-# MAIN INSTALLER MODULE - PART 1
+# MAIN INSTALLER MODULE - PART 1 - FIXED VERSION
 # Core installation logic and menu system
+# Fixed: Added proper MySQL wait loop, progress tracking, and preflight checks
 # =================================================================
+
+# Function to wait for MySQL to be ready
+wait_for_mysql() {
+    local max_wait=30
+    print_message "Waiting for MySQL to be ready..."
+    
+    for i in $(seq 1 $max_wait); do
+        if mysqladmin ping &>/dev/null; then
+            print_message "✓ MySQL is ready"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    
+    echo ""
+    print_error "MySQL failed to start within ${max_wait} seconds"
+    return 1
+}
+
+# Function to save installation progress
+save_progress() {
+    local step=$1
+    local progress_file="/root/.installer_progress"
+    
+    echo "LAST_COMPLETED_STEP=$step" > "$progress_file"
+    echo "TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S')" >> "$progress_file"
+    echo "VERSION=$INSTALLER_VERSION" >> "$progress_file"
+    
+    # Save critical variables for resume
+    echo "DOMAIN_NAME=$DOMAIN_NAME" >> "$progress_file"
+    echo "HOSTNAME=$HOSTNAME" >> "$progress_file"
+    echo "SUBDOMAIN=$SUBDOMAIN" >> "$progress_file"
+    echo "ADMIN_EMAIL=$ADMIN_EMAIL" >> "$progress_file"
+    echo "BRAND_NAME=$BRAND_NAME" >> "$progress_file"
+    echo "IP_COUNT=$IP_COUNT" >> "$progress_file"
+    echo "ENABLE_STICKY_IP=$ENABLE_STICKY_IP" >> "$progress_file"
+    
+    print_debug "Progress saved: $step"
+}
+
+# Function to check for previous installation
+check_previous_installation() {
+    local progress_file="/root/.installer_progress"
+    
+    if [ -f "$progress_file" ]; then
+        source "$progress_file"
+        print_warning "Previous installation detected!"
+        echo "Last completed step: $LAST_COMPLETED_STEP"
+        echo "Timestamp: $TIMESTAMP"
+        echo ""
+        
+        read -p "Do you want to resume the previous installation? (y/n): " resume_choice
+        if [[ "$resume_choice" == "y" || "$resume_choice" == "Y" ]]; then
+            return 0
+        else
+            read -p "Start fresh installation? This will remove previous progress. (y/n): " fresh_choice
+            if [[ "$fresh_choice" == "y" || "$fresh_choice" == "Y" ]]; then
+                rm -f "$progress_file"
+                return 1
+            else
+                print_message "Installation cancelled."
+                exit 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
+# Preflight check function
+preflight_check() {
+    print_header "Running Preflight Checks"
+    
+    local errors=0
+    local warnings=0
+    
+    # Check if running as root
+    if [ "$(id -u)" != "0" ]; then
+        print_error "✗ Must run as root"
+        errors=$((errors + 1))
+    else
+        print_message "✓ Running as root"
+    fi
+    
+    # Check disk space (need at least 5GB)
+    local disk_free=$(df / | awk 'NR==2 {print $4}')
+    if [ "$disk_free" -lt 5242880 ]; then
+        print_error "✗ Insufficient disk space (need 5GB, have $((disk_free/1024/1024))GB)"
+        errors=$((errors + 1))
+    else
+        print_message "✓ Disk space: $((disk_free/1024/1024))GB available"
+    fi
+    
+    # Check memory (warn if less than 1GB)
+    local mem_total=$(free -m | awk '/^Mem:/{print $2}')
+    if [ "$mem_total" -lt 1024 ]; then
+        print_warning "⚠ Low memory: ${mem_total}MB (recommended: 1GB+)"
+        warnings=$((warnings + 1))
+    else
+        print_message "✓ Memory: ${mem_total}MB"
+    fi
+    
+    # Check if mail ports are already in use
+    local ports_in_use=()
+    for port in 25 587 143 993 110 995; do
+        if netstat -tuln 2>/dev/null | grep -q ":$port "; then
+            ports_in_use+=($port)
+        fi
+    done
+    
+    if [ ${#ports_in_use[@]} -gt 0 ]; then
+        print_warning "⚠ Mail ports already in use: ${ports_in_use[*]}"
+        print_warning "  Existing mail services may need to be stopped"
+        warnings=$((warnings + 1))
+    else
+        print_message "✓ Mail ports available"
+    fi
+    
+    # Check network connectivity
+    if ping -c 1 -W 2 8.8.8.8 &>/dev/null || ping -c 1 -W 2 1.1.1.1 &>/dev/null; then
+        print_message "✓ Internet connectivity OK"
+    else
+        print_error "✗ No internet connectivity"
+        errors=$((errors + 1))
+    fi
+    
+    # Check DNS resolution
+    if host google.com &>/dev/null; then
+        print_message "✓ DNS resolution working"
+    else
+        print_warning "⚠ DNS resolution issues detected"
+        warnings=$((warnings + 1))
+    fi
+    
+    # Check OS compatibility
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [[ "$ID" =~ ^(ubuntu|debian)$ ]]; then
+            print_message "✓ Operating System: $NAME $VERSION"
+        else
+            print_warning "⚠ Untested OS: $NAME $VERSION (optimized for Ubuntu/Debian)"
+            warnings=$((warnings + 1))
+        fi
+    else
+        print_warning "⚠ Could not determine OS version"
+        warnings=$((warnings + 1))
+    fi
+    
+    echo ""
+    print_message "Preflight Check Summary:"
+    print_message "  Errors: $errors"
+    print_message "  Warnings: $warnings"
+    echo ""
+    
+    if [ $errors -gt 0 ]; then
+        print_error "Critical errors found. Please fix them before continuing."
+        read -p "Continue anyway? (not recommended) (y/n): " force_continue
+        if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
+            exit 1
+        fi
+    elif [ $warnings -gt 0 ]; then
+        print_warning "Some warnings detected. Installation should proceed but monitor for issues."
+        read -p "Continue? (y/n): " continue_install
+        if [[ "$continue_install" != "y" && "$continue_install" != "Y" ]]; then
+            exit 0
+        fi
+    else
+        print_message "✓ All preflight checks passed!"
+    fi
+    
+    return $errors
+}
 
 # Main installation function for multi-IP setup
 first_time_installation_multi_ip() {
     print_header "Mail Server Installation - Multi-IP Bulk Mail Edition"
     
-    # Check system requirements
-    check_system_requirements
+    # Run preflight checks
+    preflight_check
     
-    # Get all server IPs
-    get_all_server_ips
-    
-    # Gather basic information
-    read -p "Enter the primary domain name (e.g. example.com): " DOMAIN_NAME
-    validate_domain "$DOMAIN_NAME" || exit 1
-    
-    # CHANGED: Ask for subdomain only, not full hostname
-    read -p "Enter your mail server subdomain (e.g. mta, mail, smtp): " SUBDOMAIN
-    # Validate subdomain (alphanumeric and hyphens only, no dots)
-    if [[ ! "$SUBDOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$ ]]; then
-        print_error "Invalid subdomain format. Use only letters, numbers, and hyphens (no dots)."
-        exit 1
-    fi
-    
-    # Create primary hostname from subdomain and domain
-    HOSTNAME="${SUBDOMAIN}.${DOMAIN_NAME}"
-    print_message "Primary hostname will be: $HOSTNAME"
-    
-    # Create array of hostnames for multiple IPs (subdomain001, subdomain002, etc.)
-    HOSTNAMES=()
-    HOSTNAMES+=("$HOSTNAME")  # Primary hostname remains unchanged
-    
-    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-        print_message "Creating additional hostnames for multiple IPs:"
-        for ((i=2; i<=${#IP_ADDRESSES[@]}; i++)); do
-            # Format with 3-digit zero padding (001, 002, etc.)
-            local suffix=$(printf "%03d" $((i-1)))
-            local multi_hostname="${SUBDOMAIN}${suffix}.${DOMAIN_NAME}"
-            HOSTNAMES+=("$multi_hostname")
-            print_message "  IP #$i: $multi_hostname"
+    # Check for previous installation
+    if check_previous_installation; then
+        print_message "Resuming previous installation..."
+        # Variables should already be loaded from progress file
+    else
+        # Fresh installation - gather information
+        print_message "Starting fresh installation..."
+        
+        # Check system requirements
+        check_system_requirements
+        
+        # Get all server IPs
+        get_all_server_ips
+        
+        # Gather basic information
+        read -p "Enter the primary domain name (e.g. example.com): " DOMAIN_NAME
+        validate_domain "$DOMAIN_NAME" || exit 1
+        
+        # Ask for subdomain only
+        read -p "Enter your mail server subdomain (e.g. mta, mail, smtp): " SUBDOMAIN
+        # Validate subdomain (alphanumeric and hyphens only, no dots)
+        if [[ ! "$SUBDOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$ ]]; then
+            print_error "Invalid subdomain format. Use only letters, numbers, and hyphens (no dots)."
+            exit 1
+        fi
+        
+        # Create primary hostname from subdomain and domain
+        HOSTNAME="${SUBDOMAIN}.${DOMAIN_NAME}"
+        print_message "Primary hostname will be: $HOSTNAME"
+        
+        # Create array of hostnames for multiple IPs
+        HOSTNAMES=()
+        HOSTNAMES+=("$HOSTNAME")  # Primary hostname
+        
+        if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+            print_message "Creating additional hostnames for multiple IPs:"
+            for ((i=2; i<=${#IP_ADDRESSES[@]}; i++)); do
+                local suffix=$(printf "%03d" $((i-1)))
+                local multi_hostname="${SUBDOMAIN}${suffix}.${DOMAIN_NAME}"
+                HOSTNAMES+=("$multi_hostname")
+                print_message "  IP #$i: $multi_hostname"
+            done
+        fi
+        
+        export HOSTNAMES
+        export SUBDOMAIN
+        
+        read -p "Enter admin email address: " ADMIN_EMAIL
+        validate_email "$ADMIN_EMAIL" || exit 1
+        
+        # Using domain as brand name automatically
+        BRAND_NAME="$DOMAIN_NAME"
+        print_message "Using domain name as brand name: $BRAND_NAME"
+        
+        read -p "Enter the username for the first mail account: " MAIL_USERNAME
+        read -s -p "Enter password for mail account: " MAIL_PASSWORD
+        echo
+        read -s -p "Confirm password: " MAIL_PASSWORD_CONFIRM
+        echo
+        
+        if [ "$MAIL_PASSWORD" != "$MAIL_PASSWORD_CONFIRM" ]; then
+            print_error "Passwords do not match. Please try again."
+            exit 1
+        fi
+        
+        # Setup timezone and export the variable
+        setup_timezone
+        export timezone
+        
+        # Ask about Sticky IP feature
+        print_header "Sticky IP Configuration"
+        print_message "The Sticky IP feature ensures that contacts who engage with your emails"
+        print_message "always receive future emails from the same IP address, improving deliverability."
+        
+        read -p "Enable Sticky IP feature? (y/n) [y]: " enable_sticky_ip
+        enable_sticky_ip=${enable_sticky_ip:-y}
+        
+        # Cloudflare integration
+        print_header "Cloudflare Integration (Optional)"
+        print_message "To automatically configure DNS records, please provide your Cloudflare credentials."
+        print_message "Leave blank to skip automatic DNS configuration."
+        read -p "Enter your Cloudflare API token (or press Enter to skip): " CF_API_TOKEN
+        
+        if [ ! -z "$CF_API_TOKEN" ]; then
+            read -p "Enter your Cloudflare zone ID for $DOMAIN_NAME: " CF_ZONE_ID
+        fi
+        
+        # Configuration summary
+        print_header "Configuration Summary"
+        echo "Primary Domain: $DOMAIN_NAME"
+        echo "Brand Name: $BRAND_NAME"
+        echo "Mail Subdomain: $SUBDOMAIN"
+        echo "Primary Hostname: $HOSTNAME"
+        
+        if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+            echo "Additional Hostnames:"
+            for ((i=1; i<${#HOSTNAMES[@]}; i++)); do
+                echo "  - ${HOSTNAMES[$i]}"
+            done
+        fi
+        
+        echo "Admin Email: $ADMIN_EMAIL"
+        echo "Mail Username: $MAIL_USERNAME@$DOMAIN_NAME"
+        echo "Number of IPs: ${#IP_ADDRESSES[@]}"
+        echo "IP Addresses:"
+        for ip in "${IP_ADDRESSES[@]}"; do
+            echo "  - $ip"
         done
+        echo "IP Distribution: Round-robin (default)"
+        echo "Sticky IP Feature: $([[ "$enable_sticky_ip" == "y" ]] && echo "Enabled" || echo "Disabled")"
+        echo "Timezone: ${timezone:-$(timedatectl | grep 'Time zone' | awk '{print $3}')}"
+        
+        read -p "Is this information correct? (y/n): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            print_error "Installation cancelled. Please run the script again."
+            exit 1
+        fi
+        
+        # Export variables for other modules
+        export DOMAIN_NAME HOSTNAME ADMIN_EMAIL BRAND_NAME
+        export MAIL_USERNAME MAIL_PASSWORD
+        export CF_API_TOKEN CF_ZONE_ID
+        export ENABLE_STICKY_IP=$enable_sticky_ip
+        
+        save_progress "configuration_complete"
     fi
     
-    # Export the hostnames array for use in other modules
-    export HOSTNAMES
-    export SUBDOMAIN
-    
-    read -p "Enter admin email address: " ADMIN_EMAIL
-    validate_email "$ADMIN_EMAIL" || exit 1
-    
-    # Using domain as brand name automatically
-    BRAND_NAME="$DOMAIN_NAME"
-    print_message "Using domain name as brand name: $BRAND_NAME"
-    
-    read -p "Enter the username for the first mail account: " MAIL_USERNAME
-    read -s -p "Enter password for mail account: " MAIL_PASSWORD
-    echo
-    read -s -p "Confirm password: " MAIL_PASSWORD_CONFIRM
-    echo
-    
-    if [ "$MAIL_PASSWORD" != "$MAIL_PASSWORD_CONFIRM" ]; then
-        print_error "Passwords do not match. Please try again."
-        exit 1
-    fi
-    
-    # Setup timezone and export the variable
-    setup_timezone
-    export timezone
-    
-    # Ask about Sticky IP feature
-    print_header "Sticky IP Configuration"
-    print_message "The Sticky IP feature ensures that contacts who engage with your emails"
-    print_message "always receive future emails from the same IP address, improving deliverability."
-    
-    read -p "Enable Sticky IP feature? (y/n) [y]: " enable_sticky_ip
-    enable_sticky_ip=${enable_sticky_ip:-y}
-    
-    # Cloudflare integration
-    print_header "Cloudflare Integration (Optional)"
-    print_message "To automatically configure DNS records, please provide your Cloudflare credentials."
-    print_message "Leave blank to skip automatic DNS configuration."
-    read -p "Enter your Cloudflare API token (or press Enter to skip): " CF_API_TOKEN
-    
-    if [ ! -z "$CF_API_TOKEN" ]; then
-        read -p "Enter your Cloudflare zone ID for $DOMAIN_NAME: " CF_ZONE_ID
-    fi
-    
-    # Configuration summary
-    print_header "Configuration Summary"
-    echo "Primary Domain: $DOMAIN_NAME"
-    echo "Brand Name: $BRAND_NAME"
-    echo "Mail Subdomain: $SUBDOMAIN"
-    echo "Primary Hostname: $HOSTNAME"
-    
-    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-        echo "Additional Hostnames:"
-        for ((i=1; i<${#HOSTNAMES[@]}; i++)); do
-            echo "  - ${HOSTNAMES[$i]}"
-        done
-    fi
-    
-    echo "Admin Email: $ADMIN_EMAIL"
-    echo "Mail Username: $MAIL_USERNAME@$DOMAIN_NAME"
-    echo "Number of IPs: ${#IP_ADDRESSES[@]}"
-    echo "IP Addresses:"
-    for ip in "${IP_ADDRESSES[@]}"; do
-        echo "  - $ip"
-    done
-    echo "IP Distribution: Round-robin (default)"
-    echo "Sticky IP Feature: $([[ "$enable_sticky_ip" == "y" ]] && echo "Enabled" || echo "Disabled")"
-    echo "Timezone: ${timezone:-$(timedatectl | grep 'Time zone' | awk '{print $3}')}"
-    
-    read -p "Is this information correct? (y/n): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        print_error "Installation cancelled. Please run the script again."
-        exit 1
-    fi
-    
-    # Export variables for other modules
-    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL BRAND_NAME
-    export MAIL_USERNAME MAIL_PASSWORD
-    export CF_API_TOKEN CF_ZONE_ID
-    export ENABLE_STICKY_IP=$enable_sticky_ip
-    
-    # Start installation
+    # Start installation with progress tracking
     print_message "Starting multi-IP mail server installation..."
     
     # Install packages
-    install_required_packages
+    if [[ "$LAST_COMPLETED_STEP" != "packages_installed" ]] && \
+       [[ "$LAST_COMPLETED_STEP" != "mysql_configured" ]] && \
+       [[ "$LAST_COMPLETED_STEP" != "postfix_configured" ]]; then
+        install_required_packages
+        save_progress "packages_installed"
+    fi
     
     # Configure hostname
     configure_hostname "$HOSTNAME"
@@ -140,75 +331,88 @@ first_time_installation_multi_ip() {
     if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
         configure_network_interfaces
     fi
+    save_progress "network_configured"
     
-    # Fixed order: MySQL must be setup before anything that uses it
-    setup_mysql
+    # Setup MySQL with proper wait
+    if [[ "$LAST_COMPLETED_STEP" != "mysql_configured" ]] && \
+       [[ "$LAST_COMPLETED_STEP" != "postfix_configured" ]]; then
+        setup_mysql
+        wait_for_mysql || {
+            print_error "MySQL setup failed"
+            exit 1
+        }
+        save_progress "mysql_configured"
+    fi
     
-    # Small delay to ensure MySQL is fully ready
-    sleep 2
-    
-    # Now add domain and user to MySQL
+    # Add domain and user to MySQL
     add_domain_to_mysql "$DOMAIN_NAME"
     add_email_user "${MAIL_USERNAME}@${DOMAIN_NAME}" "${MAIL_PASSWORD}"
     
-    # Setup Sticky IP if enabled (after MySQL is ready)
+    # Setup Sticky IP if enabled
     if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
-        if type setup_sticky_ip_db &>/dev/null; then
+        if type setup_sticky_ip_db &>/dev/null 2>&1; then
             setup_sticky_ip_db
+            save_progress "sticky_ip_db_configured"
         else
-            print_warning "Sticky IP module not loaded properly. Skipping sticky IP setup."
+            print_warning "Sticky IP module not loaded properly. Disabling sticky IP."
+            ENABLE_STICKY_IP="n"
         fi
     fi
     
     # Setup Dovecot (needs MySQL)
     setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"
+    save_progress "dovecot_configured"
     
     # Setup Postfix (needs MySQL) - with warning suppression
     print_message "Configuring Postfix multi-IP setup..."
     setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME" 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry"
+    save_progress "postfix_configured"
     
     # Configure IP rotation
     create_ip_rotation_config
     
     # Configure Sticky IP Postfix settings if enabled
     if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
-        if type configure_sticky_ip_postfix &>/dev/null; then
+        if type configure_sticky_ip_postfix &>/dev/null 2>&1; then
             configure_sticky_ip_postfix
-        else
-            print_warning "Sticky IP module not loaded properly. Skipping sticky IP postfix config."
+            save_progress "sticky_ip_postfix_configured"
         fi
     fi
     
     # Setup DKIM (must be done before DNS configuration)
     setup_opendkim "$DOMAIN_NAME"
+    save_progress "dkim_configured"
     
     # Setup SPF with hostname for HELO fix
     setup_spf "$DOMAIN_NAME" "$HOSTNAME"
     
     # Setup DMARC
     setup_dmarc "$DOMAIN_NAME"
+    save_progress "email_auth_configured"
     
-    # Wait a moment for DKIM keys to be generated
+    # Wait for DKIM keys to be ready
     sleep 2
     
     # Setup web and SSL
     setup_nginx "$DOMAIN_NAME" "$HOSTNAME"
+    save_progress "nginx_configured"
     
     # Setup DNS records (now DKIM keys are ready)
     if [ ! -z "$CF_API_TOKEN" ] && [ ! -z "$CF_ZONE_ID" ]; then
         create_multi_ip_dns_records "$DOMAIN_NAME" "$HOSTNAME"
+        save_progress "dns_configured"
     else
         print_message "Skipping automatic DNS configuration (no Cloudflare credentials provided)"
-        
-        # Create manual DNS instructions
         create_manual_dns_instructions "$DOMAIN_NAME" "$HOSTNAME"
     fi
     
     # Get SSL certificates
     get_ssl_certificates "$DOMAIN_NAME" "$HOSTNAME" "$ADMIN_EMAIL"
+    save_progress "ssl_configured"
     
     # Setup website with color scheme selection
     setup_website "$DOMAIN_NAME" "$ADMIN_EMAIL" "$BRAND_NAME"
+    save_progress "website_configured"
     
     # Create management scripts
     create_utility_scripts "$DOMAIN_NAME"
@@ -218,25 +422,27 @@ first_time_installation_multi_ip() {
     
     # Create Sticky IP utilities if enabled
     if [[ "$ENABLE_STICKY_IP" == "y" ]]; then
-        if type create_sticky_ip_utility &>/dev/null; then
+        if type create_sticky_ip_utility &>/dev/null 2>&1; then
             create_sticky_ip_utility
             create_mailwizz_sticky_ip_integration
-        else
-            print_warning "Sticky IP module not loaded properly. Skipping sticky IP utilities."
+            save_progress "sticky_ip_utilities_created"
         fi
     fi
     
-    # Create PTR instructions with new hostname format
+    # Create PTR instructions
     create_ptr_instructions
+    save_progress "documentation_created"
     
     # Apply hardening
     harden_server "$DOMAIN_NAME" "$HOSTNAME"
+    save_progress "hardening_applied"
     
     # Setup email aliases with warning suppression
     setup_email_aliases 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry"
     
     # Restart services in the correct order
     restart_services_ordered
+    save_progress "services_restarted"
     
     # Save configuration
     save_configuration
@@ -246,6 +452,12 @@ first_time_installation_multi_ip() {
     
     # Run post-installation checks
     run_post_installation_checks
+    
+    # Mark installation as complete
+    save_progress "installation_complete"
+    
+    # Clean up progress file
+    rm -f /root/.installer_progress
     
     print_header "Installation Complete!"
     print_message "Your Multi-IP Bulk Mail Server has been successfully installed!"
@@ -303,7 +515,7 @@ add the following DNS records to your domain's DNS management:
 -----------------------------------
 EOF
     
-    # Use the HOSTNAMES array if available, otherwise fall back to old logic
+    # Use the HOSTNAMES array if available
     if [ ! -z "${HOSTNAMES}" ]; then
         for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
             local ip="${IP_ADDRESSES[$i]}"
@@ -396,13 +608,14 @@ EOF
     fi
     
     echo "   dig TXT mail._domainkey.$domain" >> /root/manual-dns-setup.txt
+    echo "   dig TXT _dmarc.$domain" >> /root/manual-dns-setup.txt
     echo "" >> /root/manual-dns-setup.txt
     echo "==========================================================" >> /root/manual-dns-setup.txt
     
     print_message "Manual DNS instructions saved to /root/manual-dns-setup.txt"
 }
 
-# Restart services in the correct order with dependency checking and warning suppression
+# Restart services in the correct order with dependency checking
 restart_services_ordered() {
     print_header "Restarting Services in Correct Order"
     
@@ -430,14 +643,7 @@ restart_services_ordered() {
             
             # Special wait for MySQL to be fully ready
             if [ "$service" = "mysql" ]; then
-                print_message "Waiting for MySQL to be fully ready..."
-                for i in {1..10}; do
-                    if mysqladmin ping &>/dev/null; then
-                        print_message "✓ MySQL is ready"
-                        break
-                    fi
-                    sleep 1
-                done
+                wait_for_mysql
             fi
         else
             print_error "✗ Failed to start $service"
@@ -505,6 +711,16 @@ run_post_installation_checks() {
         all_good=false
     fi
     
+    # Check IP configuration
+    print_message "Checking IP configuration..."
+    local configured_ips=0
+    for ip in "${IP_ADDRESSES[@]}"; do
+        if ip addr show | grep -q "$ip"; then
+            configured_ips=$((configured_ips + 1))
+        fi
+    done
+    print_message "  IPs configured: $configured_ips/${#IP_ADDRESSES[@]}"
+    
     # Summary
     echo ""
     if [ "$all_good" = true ]; then
@@ -515,8 +731,12 @@ run_post_installation_checks() {
     fi
 }
 
-# Export the main function
+# Export the main functions
 export -f first_time_installation_multi_ip
 export -f create_manual_dns_instructions
 export -f restart_services_ordered
 export -f run_post_installation_checks
+export -f wait_for_mysql
+export -f save_progress
+export -f check_previous_installation
+export -f preflight_check
