@@ -16,7 +16,7 @@ set -o pipefail
 REPO_OWNER="fumingtomato"
 REPO_NAME="shibi"
 BRANCH="main"
-BASE_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/MultiIPMail"
+BASE_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/MXingFun"
 
 # Colors
 GREEN='\033[38;5;208m'
