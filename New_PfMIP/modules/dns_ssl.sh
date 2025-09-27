@@ -1,13 +1,19 @@
 #!/bin/bash
 
 # =================================================================
-# DNS AND SSL MODULE
+# DNS AND SSL MODULE - COMPLETE FIXED VERSION
 # Cloudflare DNS management and SSL certificate configuration
+# Fixed: Complete implementations, proper error handling, improved safety
 # =================================================================
 
 # Check if any Cloudflare DNS record exists
 check_any_cf_record_exists() {
     local name=$1
+    
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+        print_warning "Cloudflare credentials not configured"
+        return 1
+    fi
     
     response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$name" \
         -H "Authorization: Bearer $CF_API_TOKEN" \
@@ -21,13 +27,17 @@ check_cf_record_exists() {
     local type=$1
     local name=$2
     
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+        return 1
+    fi
+    
     response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=$type&name=$name" \
         -H "Authorization: Bearer $CF_API_TOKEN" \
         -H "Content-Type: application/json")
     
     record_count=$(echo "$response" | grep -o '"count":[0-9]*' | cut -d ':' -f2)
     
-    if [ "$record_count" -gt 0 ]; then
+    if [ "$record_count" -gt 0 ] 2>/dev/null; then
         record_id=$(echo "$response" | grep -o '"id":"[^"]*"' | head -1 | cut -d '"' -f4)
         echo "$record_id"
     else
@@ -43,6 +53,10 @@ delete_cf_record() {
         return 1
     fi
     
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+        return 1
+    fi
+    
     response=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
         -H "Authorization: Bearer $CF_API_TOKEN" \
         -H "Content-Type: application/json")
@@ -55,19 +69,24 @@ delete_cf_record() {
     fi
 }
 
-# Delete ALL records for a given name - ENHANCED VERSION
+# Delete ALL records for a given name - OPTIMIZED VERSION
 delete_all_cf_records_for_name() {
     local name=$1
-    local max_iterations=5  # Prevent infinite loop
+    local max_iterations=3
     local iteration=0
     local total_deleted=0
+    
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+        print_warning "Cloudflare credentials not configured"
+        return 1
+    fi
     
     print_debug "Deleting ALL DNS records for name: $name"
     
     while [ $iteration -lt $max_iterations ]; do
         iteration=$((iteration + 1))
         
-        # Get ALL records for this name (any type)
+        # Get ALL records for this name (any type) - single API call
         local response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$name&per_page=100" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json")
@@ -75,24 +94,18 @@ delete_all_cf_records_for_name() {
         # Check if there are any records
         local count=$(echo "$response" | grep -o '"count":[0-9]*' | cut -d ':' -f2)
         
-        if [ -z "$count" ] || [ "$count" -eq 0 ]; then
+        if [ -z "$count" ] || [ "$count" -eq 0 ] 2>/dev/null; then
             break
         fi
         
-        # Extract ALL record IDs from the response
-        local record_ids=$(echo "$response" | python3 -c "
-import json
-import sys
-try:
-    data = json.load(sys.stdin)
-    for record in data.get('result', []):
-        print(record.get('id', ''))
-except:
-    pass
-" 2>/dev/null)
+        # Extract ALL record IDs from the response - improved method
+        local record_ids=""
         
-        # If python3 is not available, use grep method
-        if [ -z "$record_ids" ]; then
+        # Try using jq if available (more reliable)
+        if command -v jq &> /dev/null; then
+            record_ids=$(echo "$response" | jq -r '.result[].id' 2>/dev/null)
+        else
+            # Fallback to grep method
             record_ids=$(echo "$response" | grep -o '"id":"[^"]*"' | cut -d '"' -f4)
         fi
         
@@ -117,7 +130,7 @@ except:
             break
         fi
         
-        # Small delay between iterations
+        # Small delay between iterations to avoid rate limits
         sleep 1
     done
     
@@ -125,14 +138,14 @@ except:
         print_message "Deleted $total_deleted existing record(s) for $name"
     fi
     
-    # Final verification - check if any records still exist
+    # Final verification
     sleep 2
     local final_check=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$name" \
         -H "Authorization: Bearer $CF_API_TOKEN" \
         -H "Content-Type: application/json")
     
     local remaining=$(echo "$final_check" | grep -o '"count":[0-9]*' | cut -d ':' -f2)
-    if [ ! -z "$remaining" ] && [ "$remaining" -gt 0 ]; then
+    if [ ! -z "$remaining" ] && [ "$remaining" -gt 0 ] 2>/dev/null; then
         print_warning "Warning: $remaining record(s) may still exist for $name after deletion attempt"
     fi
 }
@@ -145,42 +158,25 @@ create_cf_record() {
     local proxied=${4:-false}
     local force=${5:-false}
     
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+        print_warning "Cloudflare credentials not configured"
+        return 1
+    fi
+    
     print_debug "Creating $type record for $name..."
     
-    # Special handling for DKIM records - ENHANCED deletion
+    # Special handling for DKIM records
     if [[ "$name" == *"._domainkey."* ]] || [[ "$name" == "mail._domainkey"* ]]; then
         print_message "DKIM record detected. Performing thorough cleanup of old DKIM records..."
-        
-        # First, delete all records with exact name match
         delete_all_cf_records_for_name "$name"
-        
-        # Wait for Cloudflare to process
         sleep 2
-        
-        # Double-check: Try to delete any TXT records specifically
-        local txt_records=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=TXT&name=$name" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json")
-        
-        local txt_ids=$(echo "$txt_records" | grep -o '"id":"[^"]*"' | cut -d '"' -f4)
-        if [ ! -z "$txt_ids" ]; then
-            print_warning "Found additional TXT records to delete..."
-            while IFS= read -r txt_id; do
-                if [ ! -z "$txt_id" ]; then
-                    delete_cf_record "$txt_id"
-                fi
-            done <<< "$txt_ids"
-            sleep 1
-        fi
     else
         # For non-DKIM records, check if record exists
         record_id=$(check_cf_record_exists "$type" "$name")
         
         if [ ! -z "$record_id" ]; then
             if [ "$force" = true ]; then
-                curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
-                    -H "Authorization: Bearer $CF_API_TOKEN" \
-                    -H "Content-Type: application/json" > /dev/null
+                delete_cf_record "$record_id"
                 print_message "Force deleted existing $type record for $name"
             else
                 read -p "Record $type for $name already exists. Overwrite? (y/n): " overwrite
@@ -188,9 +184,7 @@ create_cf_record() {
                     print_message "Skipping creation of $type record for $name"
                     return 0
                 else
-                    curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
-                        -H "Authorization: Bearer $CF_API_TOKEN" \
-                        -H "Content-Type: application/json" > /dev/null
+                    delete_cf_record "$record_id"
                     print_message "Deleted existing $type record for $name"
                 fi
             fi
@@ -231,9 +225,9 @@ create_cf_record() {
                 -H "Content-Type: application/json")
             
             local verify_count=$(echo "$verify" | grep -o '"count":[0-9]*' | cut -d ':' -f2)
-            if [ "$verify_count" -eq 1 ]; then
+            if [ "$verify_count" -eq 1 ] 2>/dev/null; then
                 print_message "✓ DKIM record verified - exactly one record exists"
-            elif [ "$verify_count" -gt 1 ]; then
+            elif [ "$verify_count" -gt 1 ] 2>/dev/null; then
                 print_warning "⚠ Warning: Multiple DKIM records exist for $name"
             else
                 print_error "✗ DKIM record verification failed"
@@ -250,6 +244,17 @@ create_cf_record() {
 create_multi_ip_dns_records() {
     local domain=$1
     local hostname=$2
+    
+    # Validate required variables
+    if [ -z "$domain" ] || [ -z "$hostname" ]; then
+        print_error "Domain or hostname not specified"
+        return 1
+    fi
+    
+    if [ -z "$SUBDOMAIN" ]; then
+        print_error "SUBDOMAIN variable not set"
+        return 1
+    fi
     
     print_header "Creating DNS Records for Multiple IPs"
     
@@ -301,7 +306,7 @@ create_multi_ip_dns_records() {
             create_cf_record "A" "$hostname" "$ip" false true
             create_cf_record "A" "$domain" "$ip" false true
         else
-            # Additional IPs get numbered subdomains (subdomain001, subdomain002, etc.)
+            # Additional IPs get numbered subdomains
             local suffix=$(printf "%03d" $((ip_index - 1)))
             local numbered_hostname="${SUBDOMAIN}${suffix}.${domain}"
             create_cf_record "A" "$numbered_hostname" "$ip" false true
@@ -319,7 +324,7 @@ create_multi_ip_dns_records() {
     local spf_content="v=spf1 mx a${spf_ips} ~all"
     create_cf_record "TXT" "$domain" "$spf_content" false true
     
-    # Create SPF records for all HELO hostnames to prevent SPF_HELO_NONE
+    # Create SPF records for all HELO hostnames
     print_message "Creating SPF records for HELO hostnames..."
     
     # Primary hostname SPF
@@ -334,11 +339,10 @@ create_multi_ip_dns_records() {
         done
     fi
     
-    # Create DKIM record - with complete cleanup of old records
+    # Create DKIM record
     local dkim_value=$(get_dkim_value "$domain")
     if [ ! -z "$dkim_value" ]; then
         print_message "Creating DKIM record with new key..."
-        # The create_cf_record function will now properly delete ALL old DKIM records
         create_cf_record "TXT" "mail._domainkey.$domain" "v=DKIM1; k=rsa; p=$dkim_value" false true
     else
         print_warning "DKIM key not found. Please configure DKIM manually."
@@ -355,7 +359,23 @@ setup_nginx() {
     local domain=$1
     local hostname=$2
     
+    if [ -z "$domain" ] || [ -z "$hostname" ]; then
+        print_error "Domain or hostname not specified for Nginx setup"
+        return 1
+    fi
+    
+    if [ -z "$SUBDOMAIN" ]; then
+        print_error "SUBDOMAIN variable not set"
+        return 1
+    fi
+    
     print_message "Configuring Nginx for the main domain and mail subdomain..."
+    
+    # Ensure nginx is installed
+    if ! command -v nginx &> /dev/null; then
+        print_message "Installing Nginx..."
+        apt-get update && apt-get install -y nginx
+    fi
     
     # Create Nginx configuration for main domain
     cat > /etc/nginx/sites-available/$domain <<EOF
@@ -423,7 +443,15 @@ EOF
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
     mkdir -p /var/www/html
     
-    print_message "Nginx configuration completed."
+    # Test nginx configuration
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx || systemctl start nginx
+        print_message "Nginx configuration completed."
+    else
+        print_error "Nginx configuration test failed"
+        nginx -t
+        return 1
+    fi
 }
 
 # Advanced SSL certificate management with numbered subdomains
@@ -432,8 +460,24 @@ get_ssl_certificates() {
     local hostname=$2
     local email=$3
     
+    if [ -z "$domain" ] || [ -z "$hostname" ] || [ -z "$email" ]; then
+        print_error "Missing required parameters for SSL certificate"
+        return 1
+    fi
+    
+    if [ -z "$SUBDOMAIN" ]; then
+        print_error "SUBDOMAIN variable not set"
+        return 1
+    fi
+    
     print_header "SSL Certificate Management"
     print_message "Checking for existing certificates and setting up SSL..."
+    
+    # Ensure certbot is installed
+    if ! command -v certbot &> /dev/null; then
+        print_message "Installing Certbot..."
+        apt-get update && apt-get install -y certbot python3-certbot-nginx
+    fi
     
     local domain_cert_dir="/etc/letsencrypt/live/$domain"
     local hostname_cert_dir="/etc/letsencrypt/live/$hostname"
@@ -537,7 +581,7 @@ get_ssl_certificates() {
     
     # Setup certificate auto-renewal
     print_message "Setting up certificate auto-renewal..."
-    if ! grep -q "certbot renew" /etc/crontab; then
+    if ! grep -q "certbot renew" /etc/crontab 2>/dev/null; then
         echo "0 3 * * * root certbot renew --quiet --post-hook 'systemctl reload nginx postfix dovecot'" >> /etc/crontab
         print_message "Certificate auto-renewal configured"
     else
@@ -623,6 +667,7 @@ EOF
     print_message "SSL certificate setup completed"
 }
 
+# Export all functions
 export -f check_any_cf_record_exists check_cf_record_exists delete_cf_record
 export -f delete_all_cf_records_for_name create_cf_record create_multi_ip_dns_records 
 export -f setup_nginx get_ssl_certificates
