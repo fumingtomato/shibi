@@ -365,7 +365,7 @@ EOF
     chmod +x /usr/local/bin/postfix-random-transport
 }
 
-# Configure reverse DNS instructions
+# Configure reverse DNS instructions with numbered subdomain format
 create_ptr_instructions() {
     local output_file="/root/ptr-records-setup.txt"
     
@@ -381,37 +381,126 @@ Your IP addresses and suggested PTR records:
 
 EOF
     
-    local idx=1
-    for ip in "${IP_ADDRESSES[@]}"; do
+    # Use the new numbered subdomain format for PTR records
+    for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
+        local ip="${IP_ADDRESSES[$i]}"
+        local ptr_hostname
+        
+        if [ $i -eq 0 ]; then
+            # Primary IP uses the main subdomain
+            ptr_hostname="${SUBDOMAIN}.${DOMAIN_NAME}"
+        else
+            # Additional IPs use numbered format (subdomain001, subdomain002, etc.)
+            local suffix=$(printf "%03d" $i)
+            ptr_hostname="${SUBDOMAIN}${suffix}.${DOMAIN_NAME}"
+        fi
+        
         cat >> "$output_file" <<EOF
-IP Address #$idx: $ip
-Suggested PTR: mail${idx}.$DOMAIN_NAME
+IP Address #$((i+1)): $ip
+Suggested PTR: $ptr_hostname
 
 EOF
-        idx=$((idx + 1))
     done
     
     cat >> "$output_file" <<EOF
+==========================================================
+WHY THE NUMBERED FORMAT?
+
+The numbered subdomain format (${SUBDOMAIN}001, ${SUBDOMAIN}002, etc.)
+provides several benefits:
+
+1. Clean Organization: Easy to identify which hostname belongs to which IP
+2. Professional Appearance: Looks more professional than mail1, mail2, etc.
+3. Scalability: Can easily add more IPs up to 999 without naming conflicts
+4. Consistency: Matches the HELO hostname used by each IP in Postfix
+
 ==========================================================
 HOW TO CONFIGURE:
 
 1. Contact your hosting provider's support
 2. Request PTR record configuration for each IP
-3. Provide the IP address and desired hostname
+3. Provide the IP address and desired hostname exactly as shown above
 4. Wait for confirmation (usually 24-48 hours)
 
 VERIFICATION:
 
-Once configured, verify with:
-dig -x IP_ADDRESS
+Once configured, verify each PTR record with:
+EOF
+    
+    # Add verification commands for each IP
+    for ip in "${IP_ADDRESSES[@]}"; do
+        echo "dig -x $ip" >> "$output_file"
+    done
+    
+    echo "" >> "$output_file"
+    echo "or:" >> "$output_file"
+    echo "" >> "$output_file"
+    
+    for ip in "${IP_ADDRESSES[@]}"; do
+        echo "host $ip" >> "$output_file"
+    done
+    
+    cat >> "$output_file" <<EOF
 
-or:
-host IP_ADDRESS
+EXPECTED RESULTS:
+
+The commands above should return the hostname you configured.
+For example:
+  dig -x ${IP_ADDRESSES[0]} 
+  Should return: ${SUBDOMAIN}.${DOMAIN_NAME}
+
+==========================================================
+TROUBLESHOOTING:
+
+If PTR records are not resolving correctly:
+
+1. Wait at least 48 hours for propagation
+2. Verify with your hosting provider that records were set
+3. Check for typos in the hostname
+4. Ensure the forward DNS (A record) also exists for each hostname
+
+IMPORTANCE FOR EMAIL DELIVERY:
+
+Proper PTR records are CRITICAL for email delivery:
+- Many mail servers reject email from IPs without PTR records
+- PTR must match the HELO hostname used by your mail server
+- Mismatched PTR records can trigger spam filters
+
+==========================================================
+QUICK REFERENCE:
+
+Subdomain: ${SUBDOMAIN}
+Domain: ${DOMAIN_NAME}
+Number of IPs: ${#IP_ADDRESSES[@]}
+
+Hostname Format:
+- Primary: ${SUBDOMAIN}.${DOMAIN_NAME}
+- Additional: ${SUBDOMAIN}XXX.${DOMAIN_NAME} (where XXX is 001, 002, etc.)
 
 ==========================================================
 EOF
     
     print_message "PTR record instructions saved to $output_file"
+    
+    # Also create a simple CSV file for easy copy/paste
+    local csv_file="/root/ptr-records.csv"
+    echo "IP Address,PTR Record" > "$csv_file"
+    
+    for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
+        local ip="${IP_ADDRESSES[$i]}"
+        local ptr_hostname
+        
+        if [ $i -eq 0 ]; then
+            ptr_hostname="${SUBDOMAIN}.${DOMAIN_NAME}"
+        else
+            local suffix=$(printf "%03d" $i)
+            ptr_hostname="${SUBDOMAIN}${suffix}.${DOMAIN_NAME}"
+        fi
+        
+        echo "$ip,$ptr_hostname" >> "$csv_file"
+    done
+    
+    print_message "PTR records CSV saved to $csv_file (for easy copy/paste)"
 }
 
 export -f get_all_server_ips configure_network_interfaces create_ip_rotation_config
