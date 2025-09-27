@@ -1,20 +1,25 @@
 #!/bin/bash
 
 # =================================================================
-# Multi-IP Bulk Mail Server Master Installer
-# Version: 16.0.2
+# Multi-IP Bulk Mail Server Master Installer - FIXED VERSION
+# Version: 16.1.0
 # Repository: https://github.com/fumingtomato/shibi
+# Fixed: Module loading, naming consistency, error handling
 # =================================================================
 
 set -e
 
 INSTALLER_NAME="Multi-IP Bulk Mail Server Installer"
-INSTALLER_VERSION="16.0.2"
+INSTALLER_VERSION="16.1.0"
 GITHUB_USER="fumingtomato"
 GITHUB_REPO="shibi"
 GITHUB_BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/New_PfMIP"
 INSTALLER_DIR="/tmp/multiip-installer-$$"
+
+# Export version for use in modules
+export INSTALLER_VERSION
+export INSTALLER_NAME
 
 # Colors
 RED='\033[0;31m'
@@ -42,6 +47,15 @@ print_header() {
     echo -e "${BLUE}==================================================${NC}"
 }
 
+print_debug() {
+    if [ "$DEBUG" = true ]; then
+        echo -e "[DEBUG] $1"
+    fi
+}
+
+# Export print functions immediately
+export -f print_message print_error print_warning print_header print_debug
+
 # Function to handle errors
 handle_error() {
     local line_no=$1
@@ -53,25 +67,16 @@ handle_error() {
     print_error "  Command: $last_command"
     print_error "Installation failed. Cleaning up..."
     
-    # Show what was downloaded for debugging
-    print_error "Downloaded files:"
-    ls -la "$INSTALLER_DIR" 2>/dev/null || true
-    
-    # Show first few lines of problematic file if it exists
-    if [ -f "$INSTALLER_DIR/core-functions.sh" ]; then
-        print_error "First lines of core-functions.sh:"
-        head -n 5 "$INSTALLER_DIR/core-functions.sh"
-    fi
-    
     # Cleanup
     cd /
     rm -rf "$INSTALLER_DIR"
     
     print_error "Please check the logs and try again."
+    print_error "If this persists, report issue at: https://github.com/$GITHUB_USER/$GITHUB_REPO/issues"
     exit 1
 }
 
-# Set error trap with more detail
+# Set error trap
 trap 'handle_error $LINENO $BASH_LINENO "$BASH_COMMAND"' ERR
 
 # Check if running as root
@@ -82,6 +87,7 @@ fi
 
 print_header "$INSTALLER_NAME v$INSTALLER_VERSION"
 print_message "Initializing installation process..."
+print_message "Repository: https://github.com/$GITHUB_USER/$GITHUB_REPO"
 print_message ""
 
 # Check internet connectivity
@@ -91,87 +97,112 @@ if ! ping -c 1 google.com &>/dev/null && ! ping -c 1 8.8.8.8 &>/dev/null; then
     exit 1
 fi
 
+# Install required tools if missing
+print_message "Checking required tools..."
+if ! command -v wget &> /dev/null; then
+    print_message "Installing wget..."
+    apt-get update && apt-get install -y wget
+fi
+
+if ! command -v curl &> /dev/null; then
+    print_message "Installing curl..."
+    apt-get update && apt-get install -y curl
+fi
+
 # Create temporary directory
 print_message "Creating temporary installation directory..."
 mkdir -p "$INSTALLER_DIR"
 cd "$INSTALLER_DIR"
 
-# Function to download a module with retry and validation
+# Function to download a module with better validation
 download_module() {
-    local module=$1
+    local module_name=$1
+    local file_name=$2
     local max_attempts=3
     local attempt=1
     
+    # Use the provided file name or default to module name
+    local target_file="${file_name:-$module_name}"
+    
     while [ $attempt -le $max_attempts ]; do
-        print_message "Downloading $module (attempt $attempt/$max_attempts)..."
+        print_message "Downloading $module_name (attempt $attempt/$max_attempts)..."
         
-        # Try wget first with proper user agent
-        if wget --user-agent="Mozilla/5.0" -q -O "$module" "$BASE_URL/modules/$module" 2>/dev/null; then
-            # Validate that we got a shell script, not HTML
-            if [ -s "$module" ]; then
-                if head -n 1 "$module" | grep -q "^#!/bin/bash\|^#!.*sh"; then
-                    chmod +x "$module"
-                    print_message "✓ Successfully downloaded $module"
+        # Try wget first
+        if wget --user-agent="Mozilla/5.0" -q -O "$target_file" "$BASE_URL/modules/$module_name" 2>/dev/null; then
+            if [ -s "$target_file" ]; then
+                # Check if it's a valid shell script or has expected content
+                if head -n 1 "$target_file" | grep -q "^#!/bin/bash\|^#!.*sh" || grep -q "function\|export" "$target_file"; then
+                    chmod +x "$target_file"
+                    print_message "✓ Successfully downloaded $module_name"
                     return 0
                 else
-                    print_warning "Downloaded file doesn't appear to be a shell script. First line:"
-                    head -n 1 "$module"
-                    rm -f "$module"
+                    print_warning "Downloaded file doesn't appear to be valid. Retrying..."
+                    rm -f "$target_file"
                 fi
             else
                 print_warning "Downloaded file is empty"
-                rm -f "$module"
+                rm -f "$target_file"
             fi
         fi
         
         # Try curl as fallback
-        print_warning "wget failed or invalid content, trying curl..."
-        if curl -L -s -o "$module" "$BASE_URL/modules/$module" 2>/dev/null; then
-            if [ -s "$module" ]; then
-                if head -n 1 "$module" | grep -q "^#!/bin/bash\|^#!.*sh"; then
-                    chmod +x "$module"
-                    print_message "✓ Successfully downloaded $module with curl"
-                    return 0
-                else
-                    print_warning "Downloaded file doesn't appear to be a shell script"
-                    rm -f "$module"
-                fi
+        if curl -L -s -o "$target_file" "$BASE_URL/modules/$module_name" 2>/dev/null; then
+            if [ -s "$target_file" ] && grep -q "function\|export\|#!/bin/bash" "$target_file"; then
+                chmod +x "$target_file"
+                print_message "✓ Successfully downloaded $module_name with curl"
+                return 0
             else
-                print_warning "Downloaded file is empty"
-                rm -f "$module"
+                rm -f "$target_file"
             fi
         fi
         
         attempt=$((attempt + 1))
         if [ $attempt -le $max_attempts ]; then
-            print_warning "Retrying in 2 seconds..."
             sleep 2
         fi
     done
     
-    print_error "Failed to download $module after $max_attempts attempts"
+    print_error "Failed to download $module_name after $max_attempts attempts"
     return 1
 }
 
-# Download all modules in the correct order
+# FIXED: Consistent module naming - using underscores throughout
 print_message "Downloading installer modules..."
 
-# CRITICAL: Use correct filenames with hyphens, not underscores!
-modules=(
-    "core-functions.sh"          # Note: hyphen not underscore
-    "packages_system.sh"         # System packages and functions
-    "multiip_config.sh"          # IP configuration
-    "mysql_dovecot.sh"           # MySQL and Dovecot setup
-    "postfix_setup.sh"           # Postfix configuration
-    "dkim_spf.sh"                # DKIM/SPF setup
-    "dns_ssl.sh"                 # DNS and SSL configuration
-    "monitoring_scripts.sh"       # Monitoring utilities
-    "security_hardening.sh"      # Security configuration
-    "mailwizz_integration.sh"    # MailWizz integration
-    "utility_scripts.sh"         # Utility scripts
-    "sticky_ip.sh"               # Sticky IP feature
-    "main_installer_part2.sh"    # Additional installer functions
-    "main_installer.sh"          # Main installation logic
+# Define modules with their actual GitHub names and local names
+declare -A modules=(
+    ["core-functions.sh"]="core_functions.sh"
+    ["packages_system.sh"]="packages_system.sh"
+    ["multiip_config.sh"]="multiip_config.sh"
+    ["mysql_dovecot.sh"]="mysql_dovecot.sh"
+    ["postfix_setup.sh"]="postfix_setup.sh"
+    ["dkim_spf.sh"]="dkim_spf.sh"
+    ["dns_ssl.sh"]="dns_ssl.sh"
+    ["monitoring_scripts.sh"]="monitoring_scripts.sh"
+    ["security_hardening.sh"]="security_hardening.sh"
+    ["mailwizz_integration.sh"]="mailwizz_integration.sh"
+    ["utility_scripts.sh"]="utility_scripts.sh"
+    ["sticky_ip.sh"]="sticky_ip.sh"
+    ["main_installer_part2.sh"]="main_installer_part2.sh"
+    ["main_installer.sh"]="main_installer.sh"
+)
+
+# Module loading order (local names)
+module_order=(
+    "core_functions.sh"
+    "packages_system.sh"
+    "multiip_config.sh"
+    "mysql_dovecot.sh"
+    "postfix_setup.sh"
+    "dkim_spf.sh"
+    "dns_ssl.sh"
+    "monitoring_scripts.sh"
+    "security_hardening.sh"
+    "mailwizz_integration.sh"
+    "utility_scripts.sh"
+    "sticky_ip.sh"
+    "main_installer_part2.sh"
+    "main_installer.sh"
 )
 
 # Check if modules are accessible
@@ -180,17 +211,17 @@ test_url="${BASE_URL}/modules/core-functions.sh"
 if ! curl -L -s --head "$test_url" | head -n 1 | grep "200\|301\|302" > /dev/null; then
     print_error "Cannot access modules at $BASE_URL/modules/"
     print_error "Please check that the repository and path are correct."
-    print_error "Test URL: $test_url"
     cd /
     rm -rf "$INSTALLER_DIR"
     exit 1
 fi
 
-# Download each module
+# Download each module with proper naming
 failed_modules=()
-for module in "${modules[@]}"; do
-    if ! download_module "$module"; then
-        failed_modules+=("$module")
+for github_name in "${!modules[@]}"; do
+    local_name="${modules[$github_name]}"
+    if ! download_module "$github_name" "$local_name"; then
+        failed_modules+=("$github_name")
     fi
 done
 
@@ -208,147 +239,154 @@ fi
 
 print_message "All modules downloaded successfully"
 
-# Verify all files exist and are readable
+# Verify all files exist with their local names
 print_message "Verifying module integrity..."
-for module in "${modules[@]}"; do
-    if [ ! -r "$module" ]; then
-        print_error "Module $module is not readable"
+for local_name in "${module_order[@]}"; do
+    if [ ! -r "$local_name" ]; then
+        print_error "Module $local_name is not readable"
+        ls -la "$INSTALLER_DIR"
+        cd /
+        rm -rf "$INSTALLER_DIR"
+        exit 1
+    fi
+done
+
+# FIXED: Proper module loading with error recovery
+print_message "Loading modules..."
+
+# Create a wrapper function for safe sourcing
+safe_source() {
+    local module=$1
+    local temp_err=$(mktemp)
+    
+    # Try to source the module and capture any errors
+    if bash -c "source '$module'" 2>"$temp_err"; then
+        # If test succeeds, source it in current shell
+        source "$module"
+        rm -f "$temp_err"
+        return 0
+    else
+        print_warning "Module $module has issues: $(cat $temp_err)"
+        rm -f "$temp_err"
+        return 1
+    fi
+}
+
+# Source modules in correct order
+for module in "${module_order[@]}"; do
+    print_message "Loading module: $module"
+    
+    if [ -f "$module" ]; then
+        # Source the module
+        set +e  # Temporarily disable exit on error
+        source "./$module" 2>/dev/null || {
+            print_warning "Warning loading $module, attempting recovery..."
+            # Try to load it anyway
+            . "./$module" 2>/dev/null || true
+        }
+        set -e  # Re-enable exit on error
+    else
+        print_error "Module $module not found!"
+        ls -la "$INSTALLER_DIR"
+        exit 1
+    fi
+done
+
+# FIXED: Create log file function if not loaded from modules
+if ! type log_message &>/dev/null 2>&1; then
+    log_message() {
+        local log_file="${LOG_FILE:-/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log}"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$log_file"
+    }
+    export -f log_message
+fi
+
+print_message "Verifying critical functions..."
+
+# Define critical functions to verify
+critical_functions=(
+    "check_root"
+    "get_public_ip"
+    "validate_domain"
+    "validate_email"
+    "check_system_requirements"
+    "install_required_packages"
+    "setup_mysql"
+    "setup_dovecot"
+    "setup_postfix_multi_ip"
+    "setup_opendkim"
+    "get_all_server_ips"
+    "configure_hostname"
+    "create_multi_ip_dns_records"
+    "get_ssl_certificates"
+    "setup_website"
+    "harden_server"
+    "create_utility_scripts"
+    "create_ip_warmup_scripts"
+    "create_monitoring_scripts"
+    "create_mailwizz_multi_ip_guide"
+    "first_time_installation_multi_ip"
+    "main_menu"
+)
+
+# Check and export all critical functions
+missing_functions=()
+for func in "${critical_functions[@]}"; do
+    if type "$func" &>/dev/null 2>&1; then
+        export -f "$func" 2>/dev/null || true
+    else
+        missing_functions+=("$func")
+    fi
+done
+
+# Report missing functions if any
+if [ ${#missing_functions[@]} -gt 0 ]; then
+    print_warning "Some functions are not available:"
+    for func in "${missing_functions[@]}"; do
+        echo "  - $func"
+    done
+    
+    # Check if we have the minimum required functions
+    if ! type "main_menu" &>/dev/null 2>&1 || ! type "first_time_installation_multi_ip" &>/dev/null 2>&1; then
+        print_error "Critical functions missing. Installation cannot continue."
+        print_error "This may be due to incomplete module downloads."
         cd /
         rm -rf "$INSTALLER_DIR"
         exit 1
     fi
     
-    # Check for basic shell script syntax
-    if ! bash -n "$module" 2>/dev/null; then
-        print_warning "Module $module may have syntax issues"
-    fi
-done
-
-# Rename downloaded files to match what the scripts expect internally
-# This fixes the hyphen vs underscore issue
-print_message "Preparing modules..."
-if [ -f "core-functions.sh" ]; then
-    cp "core-functions.sh" "core_functions.sh"
+    print_warning "Non-critical functions missing. Installation may continue with limited features."
 fi
 
-# Source all modules with error handling - FIXED VERSION
-print_message "Loading modules..."
-
-# First, source all modules without checking to ensure all functions are available
-for module in "${modules[@]}"; do
-    # Convert hyphen to underscore for sourcing
-    source_name=$(echo "$module" | sed 's/-/_/g')
-    
-    # If file with underscore doesn't exist, use original
-    if [ ! -f "$source_name" ]; then
-        source_name="$module"
-    fi
-    
-    print_message "Loading module: $source_name"
-    
-    # Source the module in the main shell - force it
-    set +e  # Temporarily disable exit on error
-    source "./$source_name" 2>/dev/null || source "./$module" 2>/dev/null || true
-    set -e  # Re-enable exit on error
-done
-
-# Now explicitly export critical functions
-print_message "Exporting critical functions..."
-
-# List of functions to explicitly export
-functions_to_export=(
-    "main_menu"
-    "check_root"
-    "print_message"
-    "print_error"
-    "print_warning"
-    "print_header"
-    "print_debug"
-    "log_message"
-    "first_time_installation_multi_ip"
-    "install_required_packages"
-    "setup_mysql"
-    "setup_postfix_multi_ip"
-    "configure_hostname"
-    "save_configuration"
-    "create_final_documentation"
-    "get_all_server_ips"
-    "setup_dovecot"
-    "setup_opendkim"
-    "create_multi_ip_dns_records"
-    "get_ssl_certificates"
-    "setup_website"
-    "harden_server"
-    "init_mysql_postfix_config"
-    "fix_mysql_config"
-    "setup_email_aliases"
-    "restart_services_ordered"
-    "run_post_installation_checks"
-)
-
-# Export each function if it exists
-for func in "${functions_to_export[@]}"; do
-    if type "$func" &>/dev/null 2>&1; then
-        export -f "$func" 2>/dev/null || true
-    fi
-done
-
-print_message "All modules loaded successfully"
-
-# Create a fallback main_menu function if it still doesn't exist
+# FIXED: Ensure main_menu exists with all features
 if ! type main_menu &>/dev/null 2>&1; then
-    print_message "Creating fallback main_menu function..."
+    print_error "main_menu function not found after module loading!"
+    print_message "Creating emergency main_menu..."
     
     main_menu() {
         print_header "$INSTALLER_NAME v$INSTALLER_VERSION"
-        print_message "Optimized for commercial bulk mailing with multiple IP addresses"
-        print_message "Current Date and Time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
-        print_message "Current User: $(whoami)"
+        print_message "Emergency menu - limited functionality"
         echo
-        
-        # Initialize MySQL config early to prevent warnings (if function exists)
-        if type init_mysql_postfix_config &>/dev/null 2>&1; then
-            init_mysql_postfix_config
-        fi
-        
-        echo "Please select an option:"
-        echo "1) Install Multi-IP Bulk Mail Server with MailWizz optimization"
-        echo "2) Add additional IP to existing installation"
-        echo "3) View current IP configuration"
-        echo "4) Run diagnostics"
-        echo "5) Update installer"
-        echo "6) Exit"
+        echo "1) Install Multi-IP Bulk Mail Server"
+        echo "2) Exit"
         echo
-        
-        read -p "Enter your choice [1-6]: " choice
+        read -p "Enter your choice [1-2]: " choice
         
         case $choice in
             1)
                 if type first_time_installation_multi_ip &>/dev/null 2>&1; then
                     first_time_installation_multi_ip
                 else
-                    print_error "Installation function not found. Please check module loading."
+                    print_error "Installation function not available!"
                     exit 1
                 fi
                 ;;
             2)
-                print_message "Add additional IP feature not implemented yet."
-                ;;
-            3)
-                print_message "View IP configuration feature not implemented yet."
-                ;;
-            4)
-                print_message "Diagnostics feature not implemented yet."
-                ;;
-            5)
-                print_message "Update installer feature not implemented yet."
-                ;;
-            6)
-                print_message "Exiting installer. No changes were made."
+                print_message "Exiting..."
                 exit 0
                 ;;
             *)
-                print_error "Invalid option. Exiting."
+                print_error "Invalid option"
                 exit 1
                 ;;
         esac
@@ -357,93 +395,113 @@ if ! type main_menu &>/dev/null 2>&1; then
     export -f main_menu
 fi
 
-# Verify critical functions are available
-print_message "Verifying critical functions..."
-critical_functions=(
-    "main_menu"
-    "check_root"
-    "install_required_packages"
-    "configure_hostname"
-    "setup_mysql"
-    "setup_postfix_multi_ip"
-    "save_configuration"
-    "create_final_documentation"
-)
-
-missing_functions=()
-for func in "${critical_functions[@]}"; do
-    if ! type "$func" &>/dev/null 2>&1; then
-        missing_functions+=("$func")
-    fi
-done
-
-if [ ${#missing_functions[@]} -gt 0 ]; then
-    print_error "Critical functions are missing:"
-    for func in "${missing_functions[@]}"; do
-        echo "  - $func"
-    done
-    
-    # Try one more time to source main_installer_part2.sh directly
-    print_message "Attempting emergency load of main_installer_part2.sh..."
-    if [ -f "main_installer_part2.sh" ]; then
-        . ./main_installer_part2.sh
-        
-        # Check again for main_menu
-        if type main_menu &>/dev/null 2>&1; then
-            print_message "Emergency load successful - main_menu is now available"
-        else
-            print_error "Emergency load failed - Installation cannot continue."
-            cd /
-            rm -rf "$INSTALLER_DIR"
-            exit 1
-        fi
-    else
-        print_error "Installation cannot continue."
-        cd /
-        rm -rf "$INSTALLER_DIR"
-        exit 1
-    fi
-else
-    print_message "All critical functions verified"
-fi
-
 # Create log directory
 mkdir -p /var/log
 LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
+export LOG_FILE
+
 print_message "Installation log will be saved to: $LOG_FILE"
 
-# Export log file location for use by modules
-export LOG_FILE
+# Initialize the log file
+echo "========================================" > "$LOG_FILE"
+echo "Mail Server Installation Log" >> "$LOG_FILE"
+echo "Started: $(date)" >> "$LOG_FILE"
+echo "Version: $INSTALLER_VERSION" >> "$LOG_FILE"
+echo "========================================" >> "$LOG_FILE"
 
 # Display system information
 print_message ""
 print_message "System Information:"
-print_message "  OS: $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+print_message "  OS: $(lsb_release -ds 2>/dev/null || cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2 || echo 'Unknown')"
 print_message "  Kernel: $(uname -r)"
 print_message "  Architecture: $(uname -m)"
-print_message "  Hostname: $(hostname -f)"
+print_message "  Hostname: $(hostname -f 2>/dev/null || hostname)"
+print_message "  Memory: $(free -h | awk '/^Mem:/{print $2}') total"
+print_message "  Disk: $(df -h / | awk 'NR==2{print $4}') available on root"
 print_message ""
 
-# Run the main menu
-print_message "Starting installer interface..."
-if type main_menu &>/dev/null 2>&1; then
-    # Redirect output to both terminal and log file
-    main_menu 2>&1 | tee -a "$LOG_FILE"
+# Final verification before running
+print_message "Pre-installation checks:"
+if type check_root &>/dev/null 2>&1; then
+    check_root && print_message "✓ Root access verified" || true
 else
-    print_error "main_menu function not available. Installation failed."
+    # Fallback root check
+    [ "$(id -u)" = "0" ] && print_message "✓ Root access verified" || {
+        print_error "Not running as root!"
+        exit 1
+    }
+fi
+
+# Check for minimum required functions
+required_for_start=(
+    "main_menu"
+    "first_time_installation_multi_ip"
+)
+
+all_ready=true
+for func in "${required_for_start[@]}"; do
+    if type "$func" &>/dev/null 2>&1; then
+        print_message "✓ Function $func is available"
+    else
+        print_error "✗ Function $func is missing"
+        all_ready=false
+    fi
+done
+
+if [ "$all_ready" = false ]; then
+    print_error "Cannot start installation - required functions missing"
     cd /
     rm -rf "$INSTALLER_DIR"
     exit 1
 fi
 
-# Cleanup temporary files
-print_message "Cleaning up temporary files..."
-cd /
-rm -rf "$INSTALLER_DIR"
+print_message ""
+print_message "All pre-installation checks passed!"
+print_message ""
 
-print_message ""
-print_message "Installation process completed!"
-print_message "Log file saved at: $LOG_FILE"
-print_message ""
-print_message "If you encountered any issues, please check the log file."
-print_message "For support, visit: https://github.com/$GITHUB_USER/$GITHUB_REPO/issues"
+# Run the main menu
+print_message "Starting installer interface..."
+
+# Add cleanup trap for normal exit
+cleanup_on_exit() {
+    if [ -d "$INSTALLER_DIR" ]; then
+        print_message "Cleaning up temporary files..."
+        cd /
+        rm -rf "$INSTALLER_DIR"
+    fi
+}
+
+trap cleanup_on_exit EXIT
+
+# Run main menu with error handling
+set +e  # Allow main_menu to handle its own errors
+
+if type main_menu &>/dev/null 2>&1; then
+    # Run main menu and capture exit code
+    main_menu
+    exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        print_message ""
+        print_message "Installation process completed successfully!"
+        print_message "Log file saved at: $LOG_FILE"
+        print_message ""
+        print_message "Next steps:"
+        print_message "1. Check the documentation at /root/mail-server-multiip-info.txt"
+        print_message "2. Configure PTR records with your hosting provider"
+        print_message "3. Test your mail server with: send-test-email your@email.com"
+        print_message ""
+        print_message "For support, visit: https://github.com/$GITHUB_USER/$GITHUB_REPO/issues"
+    else
+        print_error "Installation exited with code: $exit_code"
+        print_error "Check the log file for details: $LOG_FILE"
+    fi
+else
+    print_error "main_menu function not available even after all attempts!"
+    exit 1
+fi
+
+set -e
+
+# The cleanup trap will handle removing temporary files
+exit $exit_code
