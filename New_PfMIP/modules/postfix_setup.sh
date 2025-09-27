@@ -89,20 +89,32 @@ mailman   unix  -       n       n       -       -       pipe
 # Multiple SMTP instances for different IPs
 EOF
     
-    # Add SMTP instances for each IP with proper formatting
+    # Add SMTP instances for each IP with new hostname format
     local transport_count=0
     for ip in "${IP_ADDRESSES[@]}"; do
         transport_count=$((transport_count + 1))
+        
+        # Determine the HELO hostname based on IP index
+        local helo_name
+        if [ $transport_count -eq 1 ]; then
+            # First IP uses primary hostname (subdomain.domain)
+            helo_name="${HOSTNAME}"
+        else
+            # Additional IPs use numbered format (subdomain001.domain, subdomain002.domain, etc.)
+            local suffix=$(printf "%03d" $((transport_count - 1)))
+            helo_name="${SUBDOMAIN}${suffix}.${domain}"
+        fi
+        
         cat >> /etc/postfix/master.cf <<EOF
 smtp-ip${transport_count} unix - - y - - smtp
   -o syslog_name=postfix/smtp-ip${transport_count}
   -o smtp_bind_address=${ip}
-  -o smtp_helo_name=mail${transport_count}.${domain}
+  -o smtp_helo_name=${helo_name}
 
 EOF
     done
     
-    print_message "Created ${transport_count} SMTP transport instances"
+    print_message "Created ${transport_count} SMTP transport instances with proper HELO names"
     
     # Create transport maps directory
     mkdir -p /etc/postfix/transport_maps
@@ -354,7 +366,7 @@ test_postfix_config() {
     return 0
 }
 
-# Create Postfix reference file
+# Create Postfix reference file with new hostname format
 create_postfix_reference_file() {
     local domain=$1
     
@@ -364,6 +376,7 @@ Postfix Multi-IP Configuration Summary
 =================================================
 Generated: $(date)
 Total IPs Configured: ${#IP_ADDRESSES[@]}
+Subdomain: ${SUBDOMAIN}
 
 IP Transport Mappings:
 ----------------------
@@ -371,9 +384,17 @@ EOF
     
     local idx=1
     for ip in "${IP_ADDRESSES[@]}"; do
+        local helo_name
+        if [ $idx -eq 1 ]; then
+            helo_name="${HOSTNAME}"
+        else
+            local suffix=$(printf "%03d" $((idx - 1)))
+            helo_name="${SUBDOMAIN}${suffix}.$domain"
+        fi
+        
         echo "Transport: smtp-ip${idx}" >> /root/postfix-ip-assignments.txt
         echo "IP Address: $ip" >> /root/postfix-ip-assignments.txt
-        echo "HELO Name: mail${idx}.$domain" >> /root/postfix-ip-assignments.txt
+        echo "HELO Name: $helo_name" >> /root/postfix-ip-assignments.txt
         echo "" >> /root/postfix-ip-assignments.txt
         idx=$((idx + 1))
     done
@@ -407,13 +428,16 @@ tail -f /var/log/mail.log
 # Flush queue:
 postqueue -f
 
+# Check HELO names for each transport:
+grep -A1 "smtp-ip[0-9]" /etc/postfix/master.cf | grep smtp_helo_name
+
 =================================================
 EOF
     
     print_message "Configuration summary saved to /root/postfix-ip-assignments.txt"
 }
 
-# Create Postfix monitoring script
+# Create Postfix monitoring script with new hostname format awareness
 create_postfix_monitor() {
     cat > /usr/local/bin/monitor-postfix <<'EOF'
 #!/bin/bash
@@ -473,14 +497,15 @@ else
     echo "Mail log not found"
 fi
 
-# Check IP transport configuration
+# Check IP transport configuration with HELO names
 echo -e "\n${GREEN}[IP Transport Configuration]${NC}"
 transport_count=0
 for i in {1..20}; do
     if grep -q "smtp-ip${i} " /etc/postfix/master.cf 2>/dev/null; then
         ip_addr=$(grep -A2 "smtp-ip${i} " /etc/postfix/master.cf | grep smtp_bind_address | awk -F'=' '{print $2}' | tr -d ' ')
+        helo_name=$(grep -A2 "smtp-ip${i} " /etc/postfix/master.cf | grep smtp_helo_name | awk -F'=' '{print $2}' | tr -d ' ')
         if [ ! -z "$ip_addr" ]; then
-            echo "smtp-ip${i}: $ip_addr"
+            echo "smtp-ip${i}: $ip_addr (HELO: $helo_name)"
             transport_count=$((transport_count + 1))
         fi
     fi
