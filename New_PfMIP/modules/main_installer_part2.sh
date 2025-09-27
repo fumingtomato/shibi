@@ -88,9 +88,10 @@ EOF
     print_message "MySQL configuration cleanup completed"
 }
 
-# Wrapper function to suppress duplicate warnings in command output
+# Enhanced wrapper function to suppress duplicate warnings more effectively
 suppress_mysql_warnings() {
-    "$@" 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "dynamicmaps.*duplicate" || true
+    # Execute command and filter out MySQL warnings completely
+    "$@" 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "dynamicmaps.*duplicate" | grep -v "ignoring duplicate entry" || true
 }
 
 # Setup email aliases with improved duplicate handling
@@ -135,8 +136,9 @@ EOF
     # Move the clean file back
     mv "$temp_aliases" /etc/aliases
     
-    # Apply aliases with warning suppression
-    suppress_mysql_warnings newaliases
+    # Apply aliases with warning suppression - ENHANCED
+    print_message "Applying email aliases..."
+    newaliases 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry" || true
     
     print_message "Email aliases configured"
 }
@@ -157,8 +159,8 @@ restart_all_services() {
         systemctl stop $service 2>/dev/null || true
         sleep 1
         
-        # Start the service with warning suppression
-        if suppress_mysql_warnings systemctl start $service; then
+        # Start the service with complete warning suppression
+        if systemctl start $service 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry"; then
             print_message "✓ $service started successfully"
             systemctl enable $service 2>/dev/null
         else
@@ -167,16 +169,24 @@ restart_all_services() {
     done
 }
 
-# Initialize MySQL configuration early in the installation
+# Initialize MySQL configuration early in the installation - ENHANCED
 init_mysql_postfix_config() {
-    print_message "Initializing MySQL-Postfix configuration..."
-    
-    # Ensure clean state from the beginning
-    fix_mysql_config
+    # Silently clean up MySQL config without output
+    {
+        # Remove all existing MySQL entries
+        if [ -d /etc/postfix/dynamicmaps.cf.d ]; then
+            find /etc/postfix/dynamicmaps.cf.d -type f -name "*mysql*" -delete 2>/dev/null || true
+        fi
+        
+        # Clear cache files
+        rm -f /var/lib/postfix/dynamicmaps.cf.db 2>/dev/null
+        rm -f /var/spool/postfix/etc/dynamicmaps.cf.db 2>/dev/null
+        rm -f /etc/postfix/dynamicmaps.cf.db 2>/dev/null
+    } 2>/dev/null
     
     # Pre-create necessary directories
-    mkdir -p /etc/postfix/dynamicmaps.cf.d
-    mkdir -p /var/spool/postfix/etc/postfix
+    mkdir -p /etc/postfix/dynamicmaps.cf.d 2>/dev/null
+    mkdir -p /var/spool/postfix/etc/postfix 2>/dev/null
     
     # Ensure postfix user can read MySQL configs
     if id "postfix" &>/dev/null; then
@@ -184,14 +194,14 @@ init_mysql_postfix_config() {
     fi
 }
 
-# Postfix check wrapper
+# Enhanced Postfix check wrapper
 postfix_check_clean() {
-    suppress_mysql_warnings postfix check
+    postfix check 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry" || true
 }
 
-# Postmap wrapper
+# Enhanced Postmap wrapper
 postmap_clean() {
-    suppress_mysql_warnings postmap "$@"
+    postmap "$@" 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry" || true
 }
 
 # Main menu function - THIS IS THE CRITICAL FUNCTION
@@ -202,7 +212,7 @@ main_menu() {
     print_message "Current User: $(whoami)"
     echo
     
-    # Initialize MySQL config early to prevent warnings
+    # Initialize MySQL config early to prevent warnings - done silently
     init_mysql_postfix_config
     
     echo "Please select an option:"
@@ -249,10 +259,10 @@ main_menu() {
     esac
 }
 
-# Clean Postfix output wrapper
+# Enhanced clean Postfix output wrapper
 clean_postfix_output() {
     # This function filters out the duplicate mysql warnings from command output
-    grep -v "warning.*dynamicmaps.cf.d/mysql.*duplicate" | grep -v "ignoring duplicate entry for \"mysql\""
+    grep -v "warning.*dynamicmaps.cf.d/mysql.*duplicate" | grep -v "ignoring duplicate entry for \"mysql\"" | grep -v "warning.*duplicate.*mysql"
 }
 
 # Export ALL functions to make them available in other scripts
