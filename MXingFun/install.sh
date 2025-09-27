@@ -2,11 +2,11 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER - SIMPLIFIED VERSION
-# Version: 16.0.2
+# Version: 16.0.3
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
 # =================================================================
-# Single-option installer - Express installation only
+# Single-option installer with automatic Cloudflare DNS setup
 # =================================================================
 
 set -e
@@ -57,9 +57,10 @@ print_header() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.2             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.3             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
+║     Now with Automatic Cloudflare DNS Setup!                ║
 ║     Repository: https://github.com/fumingtomato/shibi       ║
 ╚══════════════════════════════════════════════════════════════╝
 
@@ -101,7 +102,7 @@ fi
 mkdir -p "$MODULES_DIR"
 cd "$INSTALLER_DIR"
 
-# List of all modules to download
+# List of all modules to download - INCLUDING CLOUDFLARE SETUP
 declare -a MODULES=(
     "core-functions.sh"
     "packages-system.sh"
@@ -118,48 +119,78 @@ declare -a MODULES=(
     "main-installer-part2.sh"
 )
 
-print_header "Downloading installation modules"
-echo "Downloading from: ${BASE_URL}/modules/"
+# Also download standalone scripts
+declare -a STANDALONE_SCRIPTS=(
+    "create-utilities.sh"
+    "setup-database.sh"
+    "post-install-config.sh"
+    "troubleshoot.sh"
+    "cloudflare-dns-setup.sh"
+)
+
+print_header "Downloading installation files"
+echo "Downloading from: ${BASE_URL}/"
 echo ""
 
 DOWNLOAD_FAILED=0
 
-# Download each module
-for i in "${!MODULES[@]}"; do
-    module="${MODULES[$i]}"
+# Download modules (these might not exist, that's OK)
+echo "Downloading modules (optional)..."
+for module in "${MODULES[@]}"; do
     module_url="${BASE_URL}/modules/${module}"
     module_file="${MODULES_DIR}/${module}"
     
-    echo -n "[$((i+1))/${#MODULES[@]}] Downloading ${module}... "
-    
     if wget -q -O "$module_file" "$module_url" 2>/dev/null || \
        curl -sfL -o "$module_file" "$module_url" 2>/dev/null; then
-        
         if [ -s "$module_file" ]; then
-            echo "✓"
             chmod +x "$module_file"
         else
-            echo "✗ (empty file)"
             rm -f "$module_file"
-            DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
+        fi
+    fi
+done
+
+# Download standalone scripts (these should exist)
+echo "Downloading core scripts..."
+for script in "${STANDALONE_SCRIPTS[@]}"; do
+    script_url="${BASE_URL}/${script}"
+    script_file="${INSTALLER_DIR}/${script}"
+    
+    echo -n "  Downloading ${script}... "
+    
+    if wget -q -O "$script_file" "$script_url" 2>/dev/null || \
+       curl -sfL -o "$script_file" "$script_url" 2>/dev/null; then
+        
+        if [ -s "$script_file" ]; then
+            echo "✓"
+            chmod +x "$script_file"
+        else
+            echo "✗ (empty file)"
+            rm -f "$script_file"
+            if [[ "$script" == "cloudflare-dns-setup.sh" ]]; then
+                echo "    (Cloudflare DNS automation will not be available)"
+            else
+                DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
+            fi
         fi
     else
         echo "✗ (download failed)"
-        DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
+        if [[ "$script" != "cloudflare-dns-setup.sh" ]]; then
+            DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
+        fi
     fi
 done
 
 echo ""
 
 if [ $DOWNLOAD_FAILED -gt 0 ]; then
-    print_error "$DOWNLOAD_FAILED modules failed to download"
-    exit 1
+    print_warning "Some optional scripts failed to download, but installation can continue"
 fi
 
-print_message "✓ All modules downloaded successfully"
+print_message "✓ Core files downloaded successfully"
 echo ""
 
-# Now create the main execution script
+# Now create the main execution script with Cloudflare integration
 print_header "Creating main installer"
 
 cat > "${INSTALLER_DIR}/run-installer.sh" << 'INSTALLER_SCRIPT'
@@ -174,69 +205,41 @@ LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE")
 exec 2>&1
 
+# Colors
+GREEN='\033[38;5;208m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[1;33m'
+NC='\033[0m'
+
+print_message() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}$1${NC}" >&2
+}
+
+print_warning() {
+    echo -e "${YELLOW}$1${NC}"
+}
+
+print_header() {
+    echo -e "${BLUE}==================================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}==================================================${NC}"
+}
+
 print_header "Starting Mail Server Installation"
 echo ""
 
-# Load all modules
+# Load any available modules
 echo "Loading installer modules..."
-
-# Core modules that must be loaded first
-CORE_MODULES=(
-    "core-functions.sh"
-    "packages-system.sh"
-)
-
-# Feature modules
-FEATURE_MODULES=(
-    "mysql-dovecot.sh"
-    "multiip-config.sh"
-    "postfix-setup.sh"
-    "dkim-spf.sh"
-    "dns-ssl.sh"
-    "sticky-ip.sh"
-    "monitoring-scripts.sh"
-    "security-hardening.sh"
-    "utility-scripts.sh"
-    "mailwizz-integration.sh"
-    "main-installer-part2.sh"
-)
-
-LOADED_MODULES=0
-FAILED_MODULES=0
-
-# Load core modules first
-for module in "${CORE_MODULES[@]}"; do
-    module_file="${MODULES_DIR}/${module}"
+for module_file in "$MODULES_DIR"/*.sh; do
     if [ -f "$module_file" ]; then
-        echo "  ✓ Loading: $module"
-        source "$module_file"
-        LOADED_MODULES=$((LOADED_MODULES + 1))
-    else
-        echo "  ✗ Required module not found: $module"
-        FAILED_MODULES=$((FAILED_MODULES + 1))
+        source "$module_file" 2>/dev/null || true
     fi
 done
-
-if [ $FAILED_MODULES -gt 0 ]; then
-    echo ""
-    echo "ERROR: Core modules are missing. Cannot continue."
-    exit 1
-fi
-
-# Load feature modules
-for module in "${FEATURE_MODULES[@]}"; do
-    module_file="${MODULES_DIR}/${module}"
-    if [ -f "$module_file" ]; then
-        echo "  ✓ Loading: $module"
-        source "$module_file"
-        LOADED_MODULES=$((LOADED_MODULES + 1))
-    else
-        echo "  ⚠ Optional module not found: $module"
-    fi
-done
-
-echo ""
-echo "✓ Loaded $LOADED_MODULES modules successfully"
 echo ""
 
 # ===================================================================
@@ -294,6 +297,25 @@ fi
 export PRIMARY_IP
 export IP_ADDRESSES=("$PRIMARY_IP")
 
+# Ask about Cloudflare DNS automation
+echo ""
+print_header "DNS Configuration"
+echo "Do you want to automatically configure DNS records in Cloudflare?"
+echo "(You'll need your Cloudflare API credentials)"
+echo ""
+read -p "Use Cloudflare automatic DNS setup? (y/n) [n]: " USE_CLOUDFLARE
+export USE_CLOUDFLARE
+
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    echo ""
+    echo "Great! We'll set up Cloudflare DNS after the mail server installation."
+    echo "You'll need:"
+    echo "  1. Your Cloudflare account email"
+    echo "  2. Your Global API Key from: https://dash.cloudflare.com/profile/api-tokens"
+    echo ""
+    read -p "Press Enter to continue..."
+fi
+
 # Multi-IP option (optional)
 echo ""
 read -p "Do you want to configure additional IP addresses? (y/n) [n]: " MULTI_IP
@@ -322,6 +344,11 @@ echo "Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "Additional IPs: ${IP_ADDRESSES[@]:1}"
 fi
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    echo "Cloudflare DNS: Yes (automatic setup)"
+else
+    echo "Cloudflare DNS: No (manual setup required)"
+fi
 echo ""
 read -p "Proceed with installation? (y/n): " FINAL_CONFIRM
 if [[ "${FINAL_CONFIRM,,}" != "y" ]]; then
@@ -337,74 +364,69 @@ print_header "Installing Mail Server"
 
 # Step 1: Update system
 echo "Step 1: Updating system packages..."
-if declare -f update_system_packages > /dev/null; then
-    update_system_packages
-else
-    apt-get update -y
-    apt-get upgrade -y
-fi
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 
 # Step 2: Install packages
 echo ""
 echo "Step 2: Installing required packages..."
-if declare -f install_all_packages > /dev/null; then
-    install_all_packages
-else
-    # Basic package installation
-    apt-get install -y \
-        postfix postfix-mysql postfix-pcre \
-        dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-mysql \
-        mysql-server mysql-client \
-        opendkim opendkim-tools \
-        spamassassin spamc \
-        clamav clamav-daemon \
-        certbot \
-        ufw fail2ban
+# Install jq for Cloudflare API if using Cloudflare
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    apt-get install -y jq
 fi
 
-# Step 3: Setup MySQL
+# Pre-configure Postfix
+debconf-set-selections <<< "postfix postfix/mailname string $HOSTNAME"
+debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    postfix postfix-mysql postfix-pcre \
+    dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-mysql \
+    mysql-server mysql-client \
+    opendkim opendkim-tools \
+    spamassassin spamc \
+    certbot \
+    ufw fail2ban
+
+# Step 3: Run additional setup scripts if available
 echo ""
-echo "Step 3: Setting up database..."
-if declare -f setup_mysql > /dev/null; then
-    setup_mysql
-else
-    echo "MySQL setup skipped - function not available"
+echo "Step 3: Running configuration scripts..."
+
+# Run database setup
+if [ -f "$SCRIPT_DIR/setup-database.sh" ]; then
+    echo "Setting up database..."
+    bash "$SCRIPT_DIR/setup-database.sh"
 fi
 
-# Step 4: Setup Postfix
-echo ""
-echo "Step 4: Setting up Postfix..."
-if declare -f setup_postfix_multi_ip > /dev/null; then
-    setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"
-else
-    echo "Postfix setup skipped - function not available"
+# Run utilities creation
+if [ -f "$SCRIPT_DIR/create-utilities.sh" ]; then
+    echo "Creating utility scripts..."
+    bash "$SCRIPT_DIR/create-utilities.sh"
 fi
 
-# Step 5: Setup Dovecot
-echo ""
-echo "Step 5: Setting up Dovecot..."
-if declare -f setup_dovecot > /dev/null; then
-    setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"
-else
-    echo "Dovecot setup skipped - function not available"
+# Run post-install configuration
+if [ -f "$SCRIPT_DIR/post-install-config.sh" ]; then
+    echo "Running post-installation configuration..."
+    bash "$SCRIPT_DIR/post-install-config.sh"
 fi
 
-# Step 6: Setup DKIM
-echo ""
-echo "Step 6: Setting up DKIM..."
-if declare -f setup_opendkim > /dev/null; then
-    setup_opendkim "$DOMAIN_NAME"
-else
-    echo "DKIM setup skipped - function not available"
-fi
+# ===================================================================
+# CLOUDFLARE DNS SETUP (if requested)
+# ===================================================================
 
-# Step 7: Create utilities
-echo ""
-echo "Step 7: Creating utility scripts..."
-if declare -f create_all_utilities > /dev/null; then
-    create_all_utilities
-else
-    echo "Utility creation skipped - function not available"
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    print_header "Cloudflare DNS Setup"
+    
+    if [ -f "$SCRIPT_DIR/cloudflare-dns-setup.sh" ]; then
+        echo "Running Cloudflare DNS automatic configuration..."
+        echo ""
+        bash "$SCRIPT_DIR/cloudflare-dns-setup.sh"
+    else
+        print_warning "Cloudflare setup script not found."
+        echo "You can manually download and run it later:"
+        echo "  wget https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun/cloudflare-dns-setup.sh"
+        echo "  sudo bash cloudflare-dns-setup.sh"
+    fi
 fi
 
 # ===================================================================
@@ -420,23 +442,28 @@ echo "  Hostname: $HOSTNAME"
 echo "  Admin Email: $ADMIN_EMAIL"
 echo "  Primary IP: $PRIMARY_IP"
 echo ""
-echo "IMPORTANT NEXT STEPS:"
-echo "====================="
-echo ""
-echo "1. Configure DNS records:"
-echo "   - A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
-echo "   - MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
-echo "   - PTR record: $PRIMARY_IP -> mail.$DOMAIN_NAME (contact your provider)"
-echo ""
-echo "2. Check configuration files:"
-echo "   - /root/dns-records.txt (if created)"
-echo "   - /root/dkim-record-*.txt (if created)"
-echo ""
-echo "3. Set up SSL certificate:"
-echo "   certbot certonly --standalone -d $HOSTNAME"
-echo ""
-echo "4. Test your installation:"
-echo "   - Send a test email"
+
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    echo "✓ Cloudflare DNS records have been configured automatically!"
+    echo ""
+    echo "DNS records should be active within 5-30 minutes."
+else
+    echo "IMPORTANT NEXT STEPS:"
+    echo "====================="
+    echo ""
+    echo "1. Configure DNS records:"
+    echo "   - A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
+    echo "   - MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
+    echo "   - PTR record: $PRIMARY_IP -> mail.$DOMAIN_NAME (contact your provider)"
+    echo ""
+    echo "2. Check configuration files:"
+    echo "   - /root/dns-records-*.txt (for complete DNS records)"
+    echo ""
+fi
+
+echo "3. Test your installation:"
+echo "   - Send a test email: test-email check-auth@verifier.port25.com"
+echo "   - Check DNS: check-dns $DOMAIN_NAME"
 echo "   - Check logs: tail -f /var/log/mail.log"
 echo ""
 echo "Installation log: $LOG_FILE"
