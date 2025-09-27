@@ -304,14 +304,18 @@ EOF
 
 chmod +x /usr/local/bin/fix-dkim-now
 
-# Setup SPF record
+# Setup SPF record - ENHANCED to include hostname for SPF_HELO_NONE fix
 setup_spf() {
     local domain=$1
+    local hostname=${2:-mail.$domain}  # Use provided hostname or default to mail.domain
     
     print_header "SPF Configuration"
     
-    # Build SPF record with all IPs
+    # Build SPF record with all IPs and includes
     local spf_record="v=spf1"
+    
+    # Add the hostname to fix SPF_HELO_NONE
+    spf_record="${spf_record} include:${hostname}"
     
     # Add all server IPs
     if [ ! -z "${IP_ADDRESSES}" ]; then
@@ -325,29 +329,46 @@ setup_spf() {
         done
     fi
     
-    # Add domain and finish record
+    # Add domain mechanisms
     spf_record="${spf_record} mx a ~all"
     
-    print_message "Add the following DNS TXT record for SPF:"
+    print_message "Add the following DNS TXT records for SPF:"
     echo ""
     echo "=========================================="
+    echo "Main SPF Record:"
     echo "DNS Record Type: TXT"
     echo "Name: @ (or ${domain})"
     echo "Value: ${spf_record}"
+    echo ""
+    echo "Hostname SPF Record (fixes SPF_HELO_NONE):"
+    echo "DNS Record Type: TXT"
+    echo "Name: ${hostname}"
+    echo "Value: v=spf1 a -all"
     echo "=========================================="
     echo ""
     
-    # Save SPF record to file
+    # Save SPF records to file
     cat > /root/spf-record-${domain}.txt <<EOF
-SPF DNS Record for ${domain}
+SPF DNS Records for ${domain}
 Generated: $(date)
 
+MAIN SPF RECORD:
+================
 Add this TXT record to your DNS:
 Name: @ (or ${domain})
 Value: ${spf_record}
+
+HOSTNAME SPF RECORD (fixes SPF_HELO_NONE):
+===========================================
+Add this TXT record to your DNS:
+Name: ${hostname}
+Value: v=spf1 a -all
+
+This second record ensures your mail server's HELO hostname has SPF configured,
+which prevents the SPF_HELO_NONE warning in SpamAssassin.
 EOF
     
-    print_message "SPF record saved to: /root/spf-record-${domain}.txt"
+    print_message "SPF records saved to: /root/spf-record-${domain}.txt"
     
     return 0
 }
