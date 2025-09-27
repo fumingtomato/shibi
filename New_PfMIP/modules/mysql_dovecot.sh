@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # =================================================================
-# MYSQL AND DOVECOT CONFIGURATION MODULE
+# MYSQL AND DOVECOT CONFIGURATION MODULE - COMPLETE FIXED VERSION
 # Database setup, user authentication, and mail storage
+# Fixed: Complete implementations, proper MySQL handling, no duplicate warnings
 # =================================================================
 
-# Setup MySQL server for mail storage
+# Setup MySQL server for mail storage with proper duplicate handling
 setup_mysql() {
     print_header "Setting up MySQL Database Server"
     
@@ -18,24 +19,28 @@ setup_mysql() {
     print_message "Installing postfix-mysql package..."
     apt-get install -y postfix-mysql
     
-    # Make sure the postfix-mysql package is properly registered with Postfix
-    print_message "Creating MySQL dynamic maps configuration for Postfix..."
+    # Clean up any existing MySQL dynamic maps to prevent duplicates
+    print_message "Cleaning up MySQL dynamic maps configuration..."
     
-    # First check if postfix-mysql is properly loaded
-    postconf -m | grep -q mysql
-    if [ $? -ne 0 ]; then
-        print_warning "MySQL support not detected in Postfix, ensuring package is properly installed..."
-        apt-get install --reinstall postfix-mysql
+    # Remove all existing mysql dynamicmaps files
+    rm -f /etc/postfix/dynamicmaps.cf.d/mysql* 2>/dev/null
+    rm -f /etc/postfix/dynamicmaps.cf.d/*mysql* 2>/dev/null
+    
+    # Clean the main dynamicmaps file
+    if [ -f /etc/postfix/dynamicmaps.cf ]; then
+        grep -v "mysql" /etc/postfix/dynamicmaps.cf > /tmp/dynamicmaps.cf.clean 2>/dev/null || true
+        if [ -s /tmp/dynamicmaps.cf.clean ]; then
+            mv /tmp/dynamicmaps.cf.clean /etc/postfix/dynamicmaps.cf
+        fi
     fi
+    
+    # Clear all cache databases
+    rm -f /var/lib/postfix/dynamicmaps.cf.db 2>/dev/null
+    rm -f /var/spool/postfix/etc/dynamicmaps.cf.db 2>/dev/null
+    rm -f /etc/postfix/dynamicmaps.cf.db 2>/dev/null
     
     # Create the directory if it doesn't exist
     mkdir -p /etc/postfix/dynamicmaps.cf.d
-    
-    # Remove any existing mysql file to prevent duplicates
-    if [ -f /etc/postfix/dynamicmaps.cf.d/mysql ]; then
-        print_message "Removing existing mysql dynamicmaps file to prevent duplicates..."
-        rm -f /etc/postfix/dynamicmaps.cf.d/mysql
-    fi
     
     # Find the correct MySQL library path
     local mysql_lib=""
@@ -59,14 +64,15 @@ setup_mysql() {
         mysql_lib="postfix-mysql.so.1.0.1"
     fi
     
-    # Create the MySQL dynamic maps configuration file with correct content
-    cat > /etc/postfix/dynamicmaps.cf.d/mysql <<EOF
-mysql   $mysql_lib   dict_mysql_open
+    # Create a single MySQL dynamic maps configuration file
+    cat > /etc/postfix/dynamicmaps.cf.d/50-mysql.cf <<EOF
+# MySQL support for Postfix
+mysql	${mysql_lib}	dict_mysql_open
 EOF
     
     # Ensure proper ownership and permissions
-    chown root:root /etc/postfix/dynamicmaps.cf.d/mysql
-    chmod 644 /etc/postfix/dynamicmaps.cf.d/mysql
+    chown root:root /etc/postfix/dynamicmaps.cf.d/50-mysql.cf
+    chmod 644 /etc/postfix/dynamicmaps.cf.d/50-mysql.cf
     
     # Also fix main dynamicmaps.cf file permissions
     if [ -f /etc/postfix/dynamicmaps.cf ]; then
@@ -93,6 +99,10 @@ EOF
         if mysqladmin ping &>/dev/null; then
             print_message "MySQL is ready"
             break
+        fi
+        if [ $i -eq 30 ]; then
+            print_error "MySQL failed to start within 30 seconds"
+            return 1
         fi
         sleep 1
     done
@@ -162,13 +172,13 @@ EOF
         print_error "Failed to create MySQL database"
         cat "$SQL_TMPFILE" # Show SQL for debugging
         rm -f "$SQL_TMPFILE"
-        exit 1
+        return 1
     fi
     
     # Remove temporary SQL file
     rm -f "$SQL_TMPFILE"
     
-    # Create MySQL configuration files for Postfix (only once, here)
+    # Create MySQL configuration files for Postfix
     print_message "Creating MySQL configuration files for Postfix..."
     
     # Virtual domains configuration
@@ -214,23 +224,20 @@ EOF
     
     # Fix root alias in /etc/aliases if needed
     if ! grep -q "^root:" /etc/aliases 2>/dev/null; then
-        echo "root: $ADMIN_EMAIL" >> /etc/aliases
-        newaliases
+        if [ ! -z "$ADMIN_EMAIL" ]; then
+            echo "root: $ADMIN_EMAIL" >> /etc/aliases
+            newaliases 2>/dev/null || true
+        fi
     fi
     
     # Verify mysql module is loaded
-    if ! postconf -m | grep -q mysql; then
-        print_error "MySQL module still not detected in Postfix after configuration"
-        print_message "Attempting to fix by updating configuration..."
-        
-        # Update postfix to recognize mysql
-        postconf -e "mysql = yes"
-        
-        # Reload postfix configuration
+    if ! postconf -m 2>/dev/null | grep -q mysql; then
+        print_warning "MySQL module not detected in Postfix, attempting to reload..."
         postfix reload 2>/dev/null || true
     fi
     
     print_message "MySQL configuration completed successfully"
+    return 0
 }
 
 # Add a domain to the MySQL database with proper error handling
@@ -245,6 +252,11 @@ add_domain_to_mysql() {
     # Ensure DB_PASSWORD is available
     if [ -z "$DB_PASSWORD" ] && [ -f /root/.mail_db_password ]; then
         DB_PASSWORD=$(cat /root/.mail_db_password)
+    fi
+    
+    if [ -z "$DB_PASSWORD" ]; then
+        print_error "Database password not found"
+        return 1
     fi
     
     local SQL_TMPFILE=$(mktemp)
@@ -280,14 +292,17 @@ VALUES (@domain_id, 'webmaster@$domain_escaped', 'root@localhost')
 ON DUPLICATE KEY UPDATE destination='root@localhost';
 EOF
     
-    if mysql -u root < "$SQL_TMPFILE"; then
+    if mysql -u root < "$SQL_TMPFILE" 2>/dev/null; then
         print_message "Domain $domain added successfully to MySQL database"
     else
         print_error "Failed to add domain $domain to MySQL database"
         cat "$SQL_TMPFILE" # Show SQL for debugging
+        rm -f "$SQL_TMPFILE"
+        return 1
     fi
     
     rm -f "$SQL_TMPFILE"
+    return 0
 }
 
 # Add an email user to the MySQL database with validation
@@ -314,22 +329,35 @@ add_email_user() {
         DB_PASSWORD=$(cat /root/.mail_db_password)
     fi
     
+    if [ -z "$DB_PASSWORD" ]; then
+        print_error "Database password not found"
+        return 1
+    fi
+    
     local SQL_TMPFILE=$(mktemp)
     chmod 600 "$SQL_TMPFILE"
     
     # Generate salted SHA512 password hash
-    local hashed_password=$(doveadm pw -s SHA512-CRYPT -p "$password" 2>/dev/null)
+    local hashed_password=""
+    if command -v doveadm &> /dev/null; then
+        hashed_password=$(doveadm pw -s SHA512-CRYPT -p "$password" 2>/dev/null)
+    fi
     
     # If doveadm is not available yet, use alternative method
     if [ -z "$hashed_password" ]; then
         print_warning "Doveadm not available, using alternative password hashing"
-        # Use MySQL's ENCRYPT function as fallback
-        hashed_password="ENCRYPT('$password', CONCAT('\$6\$', SUBSTRING(SHA(RAND()), -16)))"
-        use_mysql_encrypt=true
-    else
-        # Escape the hashed password for SQL
-        hashed_password=$(echo "$hashed_password" | sed "s/'/\\\\'/g")
-        use_mysql_encrypt=false
+        # Use Python as fallback for password hashing
+        if command -v python3 &> /dev/null; then
+            hashed_password=$(python3 -c "
+import crypt, getpass, pwd, random, string
+salt = '\$6\$' + ''.join(random.choices(string.ascii_letters + string.digits, k=16)) + '\$'
+print(crypt.crypt('$password', salt))
+" 2>/dev/null)
+        else
+            # Use simple SHA256 as last resort (less secure)
+            hashed_password=$(echo -n "$password" | sha256sum | cut -d' ' -f1)
+            print_warning "Using simple SHA256 hash (less secure). Install python3 or dovecot for better security."
+        fi
     fi
     
     print_message "Adding email user $email to MySQL database..."
@@ -337,25 +365,9 @@ add_email_user() {
     # Escape values for SQL
     email_escaped=$(echo "$email" | sed "s/'/\\\\'/g")
     domain_escaped=$(echo "$domain" | sed "s/'/\\\\'/g")
+    hashed_password_escaped=$(echo "$hashed_password" | sed "s/'/\\\\'/g")
     
-    if [ "$use_mysql_encrypt" = true ]; then
-        cat > "$SQL_TMPFILE" <<EOF
-USE mailserver;
-
--- Ensure domain exists
-INSERT INTO virtual_domains (name) VALUES ('$domain_escaped')
-ON DUPLICATE KEY UPDATE name=name;
-
--- Get domain ID
-SET @domain_id = (SELECT id FROM virtual_domains WHERE name='$domain_escaped');
-
--- Insert user with MySQL ENCRYPT
-INSERT INTO virtual_users (domain_id, email, password)
-VALUES (@domain_id, '$email_escaped', $hashed_password)
-ON DUPLICATE KEY UPDATE password=$hashed_password;
-EOF
-    else
-        cat > "$SQL_TMPFILE" <<EOF
+    cat > "$SQL_TMPFILE" <<EOF
 USE mailserver;
 
 -- Ensure domain exists
@@ -367,19 +379,21 @@ SET @domain_id = (SELECT id FROM virtual_domains WHERE name='$domain_escaped');
 
 -- Insert user with pre-hashed password
 INSERT INTO virtual_users (domain_id, email, password)
-VALUES (@domain_id, '$email_escaped', '$hashed_password')
-ON DUPLICATE KEY UPDATE password='$hashed_password';
+VALUES (@domain_id, '$email_escaped', '$hashed_password_escaped')
+ON DUPLICATE KEY UPDATE password='$hashed_password_escaped';
 EOF
-    fi
     
-    if mysql -u root < "$SQL_TMPFILE"; then
+    if mysql -u root < "$SQL_TMPFILE" 2>/dev/null; then
         print_message "Email user $email added successfully to MySQL database"
     else
         print_error "Failed to add email user $email to MySQL database"
         cat "$SQL_TMPFILE" # Show SQL for debugging
+        rm -f "$SQL_TMPFILE"
+        return 1
     fi
     
     rm -f "$SQL_TMPFILE"
+    return 0
 }
 
 # Setup Dovecot for IMAP/POP3 with MySQL authentication
@@ -387,11 +401,21 @@ setup_dovecot() {
     local domain=$1
     local hostname=$2
     
+    if [ -z "$domain" ] || [ -z "$hostname" ]; then
+        print_error "Domain or hostname not provided to setup_dovecot"
+        return 1
+    fi
+    
     print_header "Setting up Dovecot IMAP/POP3 Server"
     
     # Ensure DB_PASSWORD is available
     if [ -z "$DB_PASSWORD" ] && [ -f /root/.mail_db_password ]; then
         DB_PASSWORD=$(cat /root/.mail_db_password)
+    fi
+    
+    if [ -z "$DB_PASSWORD" ]; then
+        print_error "Database password not found for Dovecot configuration"
+        return 1
     fi
     
     print_message "Installing Dovecot packages..."
@@ -412,11 +436,11 @@ setup_dovecot() {
     chown -R vmail:vmail /var/vmail
     
     # Backup original configuration
-    backup_config "dovecot" "/etc/dovecot/dovecot.conf"
-    backup_config "dovecot" "/etc/dovecot/conf.d/10-mail.conf"
-    backup_config "dovecot" "/etc/dovecot/conf.d/10-auth.conf"
-    backup_config "dovecot" "/etc/dovecot/conf.d/auth-sql.conf.ext"
-    backup_config "dovecot" "/etc/dovecot/dovecot-sql.conf.ext"
+    for config_file in dovecot.conf conf.d/10-mail.conf conf.d/10-auth.conf conf.d/auth-sql.conf.ext dovecot-sql.conf.ext; do
+        if [ -f "/etc/dovecot/$config_file" ]; then
+            cp "/etc/dovecot/$config_file" "/etc/dovecot/${config_file}.backup.$(date +%Y%m%d)" 2>/dev/null || true
+        fi
+    done
     
     # Configure Dovecot main settings
     cat > /etc/dovecot/dovecot.conf <<EOF
@@ -713,13 +737,6 @@ auth_debug_passwords = no
 # Mail logging
 mail_debug = no
 verbose_ssl = no
-
-# Plugin logging
-plugin {
-  # mail_log plugin provides more event logging
-  #mail_log_events = delete undelete expunge copy mailbox_delete mailbox_rename
-  #mail_log_fields = uid box msgid size
-}
 EOF
     
     # Create log files with proper permissions
@@ -746,6 +763,7 @@ EOF
     postconf -e "smtpd_tls_auth_only = yes"
     
     print_message "Dovecot integration with Postfix completed"
+    return 0
 }
 
 # Export functions to make them available to other scripts
