@@ -19,13 +19,41 @@ first_time_installation_multi_ip() {
     read -p "Enter the primary domain name (e.g. example.com): " DOMAIN_NAME
     validate_domain "$DOMAIN_NAME" || exit 1
     
-    read -p "Enter your server's primary hostname (e.g. mail.example.com): " HOSTNAME
-    validate_domain "$HOSTNAME" || exit 1
+    # CHANGED: Ask for subdomain only, not full hostname
+    read -p "Enter your mail server subdomain (e.g. mta, mail, smtp): " SUBDOMAIN
+    # Validate subdomain (alphanumeric and hyphens only, no dots)
+    if [[ ! "$SUBDOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$ ]]; then
+        print_error "Invalid subdomain format. Use only letters, numbers, and hyphens (no dots)."
+        exit 1
+    fi
+    
+    # Create primary hostname from subdomain and domain
+    HOSTNAME="${SUBDOMAIN}.${DOMAIN_NAME}"
+    print_message "Primary hostname will be: $HOSTNAME"
+    
+    # Create array of hostnames for multiple IPs (subdomain001, subdomain002, etc.)
+    HOSTNAMES=()
+    HOSTNAMES+=("$HOSTNAME")  # Primary hostname remains unchanged
+    
+    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+        print_message "Creating additional hostnames for multiple IPs:"
+        for ((i=2; i<=${#IP_ADDRESSES[@]}; i++)); do
+            # Format with 3-digit zero padding (001, 002, etc.)
+            local suffix=$(printf "%03d" $((i-1)))
+            local multi_hostname="${SUBDOMAIN}${suffix}.${DOMAIN_NAME}"
+            HOSTNAMES+=("$multi_hostname")
+            print_message "  IP #$i: $multi_hostname"
+        done
+    fi
+    
+    # Export the hostnames array for use in other modules
+    export HOSTNAMES
+    export SUBDOMAIN
     
     read -p "Enter admin email address: " ADMIN_EMAIL
     validate_email "$ADMIN_EMAIL" || exit 1
     
-    # CHANGED: No longer asking for brand name - using domain automatically
+    # Using domain as brand name automatically
     BRAND_NAME="$DOMAIN_NAME"
     print_message "Using domain name as brand name: $BRAND_NAME"
     
@@ -52,7 +80,7 @@ first_time_installation_multi_ip() {
     read -p "Enable Sticky IP feature? (y/n) [y]: " enable_sticky_ip
     enable_sticky_ip=${enable_sticky_ip:-y}
     
-    # Cloudflare integration - Fix variable consistency
+    # Cloudflare integration
     print_header "Cloudflare Integration (Optional)"
     print_message "To automatically configure DNS records, please provide your Cloudflare credentials."
     print_message "Leave blank to skip automatic DNS configuration."
@@ -66,7 +94,16 @@ first_time_installation_multi_ip() {
     print_header "Configuration Summary"
     echo "Primary Domain: $DOMAIN_NAME"
     echo "Brand Name: $BRAND_NAME"
+    echo "Mail Subdomain: $SUBDOMAIN"
     echo "Primary Hostname: $HOSTNAME"
+    
+    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+        echo "Additional Hostnames:"
+        for ((i=1; i<${#HOSTNAMES[@]}; i++)); do
+            echo "  - ${HOSTNAMES[$i]}"
+        done
+    fi
+    
     echo "Admin Email: $ADMIN_EMAIL"
     echo "Mail Username: $MAIL_USERNAME@$DOMAIN_NAME"
     echo "Number of IPs: ${#IP_ADDRESSES[@]}"
@@ -105,7 +142,7 @@ first_time_installation_multi_ip() {
     fi
     
     # Fixed order: MySQL must be setup before anything that uses it
-    setup_mysql                 # 1. First - Install MySQL & postfix-mysql
+    setup_mysql
     
     # Small delay to ensure MySQL is fully ready
     sleep 2
@@ -189,7 +226,7 @@ first_time_installation_multi_ip() {
         fi
     fi
     
-    # Create PTR instructions
+    # Create PTR instructions with new hostname format
     create_ptr_instructions
     
     # Apply hardening
@@ -247,7 +284,7 @@ first_time_installation_multi_ip() {
     fi
 }
 
-# Create manual DNS instructions when Cloudflare is not used - ENHANCED with SPF hostname
+# Create manual DNS instructions with new hostname format
 create_manual_dns_instructions() {
     local domain=$1
     local hostname=$2
@@ -266,16 +303,33 @@ add the following DNS records to your domain's DNS management:
 -----------------------------------
 EOF
     
-    local idx=1
-    for ip in "${IP_ADDRESSES[@]}"; do
-        if [ $idx -eq 1 ]; then
-            echo "   Type: A, Name: @, Value: $ip" >> /root/manual-dns-setup.txt
-            echo "   Type: A, Name: mail, Value: $ip" >> /root/manual-dns-setup.txt
-        else
-            echo "   Type: A, Name: mail${idx}, Value: $ip" >> /root/manual-dns-setup.txt
-        fi
-        idx=$((idx + 1))
-    done
+    # Use the HOSTNAMES array if available, otherwise fall back to old logic
+    if [ ! -z "${HOSTNAMES}" ]; then
+        for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
+            local ip="${IP_ADDRESSES[$i]}"
+            if [ $i -eq 0 ]; then
+                # Primary IP gets both @ and subdomain
+                echo "   Type: A, Name: @, Value: $ip" >> /root/manual-dns-setup.txt
+                echo "   Type: A, Name: $SUBDOMAIN, Value: $ip" >> /root/manual-dns-setup.txt
+            else
+                # Additional IPs get numbered subdomains
+                local suffix=$(printf "%03d" $i)
+                echo "   Type: A, Name: ${SUBDOMAIN}${suffix}, Value: $ip" >> /root/manual-dns-setup.txt
+            fi
+        done
+    else
+        # Fallback to old method if HOSTNAMES not set
+        local idx=1
+        for ip in "${IP_ADDRESSES[@]}"; do
+            if [ $idx -eq 1 ]; then
+                echo "   Type: A, Name: @, Value: $ip" >> /root/manual-dns-setup.txt
+                echo "   Type: A, Name: mail, Value: $ip" >> /root/manual-dns-setup.txt
+            else
+                echo "   Type: A, Name: mail${idx}, Value: $ip" >> /root/manual-dns-setup.txt
+            fi
+            idx=$((idx + 1))
+        done
+    fi
     
     cat >> /root/manual-dns-setup.txt <<EOF
 
@@ -289,9 +343,22 @@ EOF
       Type: TXT, Name: @
       Value: See /root/spf-record-${domain}.txt
    
-   b) Hostname SPF Record (fixes SPF_HELO_NONE):
-      Type: TXT, Name: ${hostname}
-      Value: v=spf1 a -all
+   b) Hostname SPF Records (fixes SPF_HELO_NONE):
+EOF
+    
+    # Add SPF records for all hostnames
+    if [ ! -z "${HOSTNAMES}" ]; then
+        for host in "${HOSTNAMES[@]}"; do
+            echo "      Type: TXT, Name: ${host}" >> /root/manual-dns-setup.txt
+            echo "      Value: v=spf1 a -all" >> /root/manual-dns-setup.txt
+            echo "" >> /root/manual-dns-setup.txt
+        done
+    else
+        echo "      Type: TXT, Name: ${hostname}" >> /root/manual-dns-setup.txt
+        echo "      Value: v=spf1 a -all" >> /root/manual-dns-setup.txt
+    fi
+    
+    cat >> /root/manual-dns-setup.txt <<EOF
 
 4. DKIM RECORD:
 ---------------
@@ -317,11 +384,20 @@ You can verify DNS records using:
    dig A $domain
    dig MX $domain
    dig TXT $domain
-   dig TXT $hostname
-   dig TXT mail._domainkey.$domain
-
-==========================================================
 EOF
+    
+    # Add dig commands for all hostnames
+    if [ ! -z "${HOSTNAMES}" ]; then
+        for host in "${HOSTNAMES[@]}"; do
+            echo "   dig TXT $host" >> /root/manual-dns-setup.txt
+        done
+    else
+        echo "   dig TXT $hostname" >> /root/manual-dns-setup.txt
+    fi
+    
+    echo "   dig TXT mail._domainkey.$domain" >> /root/manual-dns-setup.txt
+    echo "" >> /root/manual-dns-setup.txt
+    echo "==========================================================" >> /root/manual-dns-setup.txt
     
     print_message "Manual DNS instructions saved to /root/manual-dns-setup.txt"
 }
