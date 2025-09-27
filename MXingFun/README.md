@@ -7,7 +7,7 @@ A simplified, single-option mail server installer with multi-IP support for Ubun
 Just run ONE command to install everything:
 
 ```bash
-wget https://raw.githubusercontent.com/fumingtomato/shibi/main/MultiIPMail/install.sh
+wget https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun/install.sh
 chmod +x install.sh
 sudo ./install.sh
 ```
@@ -101,6 +101,8 @@ mail-status
 If you encounter any issues, run the diagnostic tool:
 
 ```bash
+wget https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun/troubleshoot.sh
+chmod +x troubleshoot.sh
 sudo ./troubleshoot.sh
 ```
 
@@ -247,10 +249,30 @@ Repository: [https://github.com/fumingtomato/shibi](https://github.com/fumingtom
 For the brave souls who want to run everything in one go:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/fumingtomato/shibi/main/MultiIPMail/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun/install.sh | sudo bash
 ```
 
 **Note**: Always review scripts before running them with sudo!
+
+---
+
+**Additional Installation Methods**:
+
+```bash
+# Method 1: Download and review first (Recommended)
+wget https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun/install.sh
+less install.sh  # Review the script
+sudo bash install.sh
+
+# Method 2: Clone the entire repository
+git clone https://github.com/fumingtomato/shibi.git
+cd shibi/MXingFun
+sudo bash install.sh
+
+# Method 3: Download all files at once
+wget https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun/{install.sh,create-utilities.sh,setup-database.sh,post-install-config.sh,troubleshoot.sh}
+sudo bash install.sh
+```
 
 ---
 
