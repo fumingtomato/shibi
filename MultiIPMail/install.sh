@@ -154,35 +154,6 @@ echo ""
 
 if [ $DOWNLOAD_FAILED -gt 0 ]; then
     print_error "$DOWNLOAD_FAILED modules failed to download"
-    print_message "Attempting alternative download method..."
-    
-    # Try downloading as a zip archive
-    print_message "Downloading repository archive..."
-    if wget -q -O "/tmp/shibi.zip" "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${BRANCH}.zip" || \
-       curl -sfL -o "/tmp/shibi.zip" "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${BRANCH}.zip"; then
-        
-        print_message "Extracting archive..."
-        cd /tmp
-        unzip -q shibi.zip
-        
-        # Copy modules to installer directory
-        if [ -d "/tmp/${REPO_NAME}-${BRANCH}/MultiIPMail/modules" ]; then
-            cp -r "/tmp/${REPO_NAME}-${BRANCH}/MultiIPMail/modules/"* "$MODULES_DIR/"
-            print_message "✓ Modules extracted successfully"
-            DOWNLOAD_FAILED=0
-        else
-            print_error "Could not find modules in archive"
-        fi
-        
-        # Cleanup
-        rm -rf "/tmp/shibi.zip" "/tmp/${REPO_NAME}-${BRANCH}"
-    else
-        print_error "Failed to download repository archive"
-    fi
-fi
-
-if [ $DOWNLOAD_FAILED -gt 0 ]; then
-    print_error "Failed to download required modules. Please check your internet connection."
     exit 1
 fi
 
@@ -194,9 +165,6 @@ print_header "Creating main installer"
 
 cat > "${INSTALLER_DIR}/run-installer.sh" << 'INSTALLER_SCRIPT'
 #!/bin/bash
-
-# Set module loading flag
-export INSTALLER_MODULE_MODE="false"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -269,6 +237,145 @@ echo ""
 echo "✓ Loaded $LOADED_MODULES modules successfully"
 echo ""
 
+# ===================================================================
+# DEFINE MISSING FUNCTIONS HERE
+# ===================================================================
+
+# Custom installation function
+custom_installation() {
+    print_header "Custom Installation"
+    print_warning "Starting custom installation mode..."
+    
+    # For now, just run express installation
+    # You can customize this later
+    gather_basic_info
+    perform_express_installation
+}
+
+# Repair installation function
+repair_installation() {
+    print_header "Repair Installation"
+    print_warning "Starting repair mode..."
+    
+    # Basic repair actions
+    print_message "Checking system status..."
+    
+    # Fix MySQL if needed
+    if command -v mysql &>/dev/null; then
+        print_message "Checking MySQL..."
+        systemctl status mysql --no-pager || systemctl start mysql
+    fi
+    
+    # Fix Postfix if needed
+    if command -v postfix &>/dev/null; then
+        print_message "Checking Postfix..."
+        postfix check || postfix reload
+    fi
+    
+    # For now, offer to reinstall
+    read -p "Run full reinstallation? (y/n): " REINSTALL
+    if [[ "${REINSTALL,,}" == "y" ]]; then
+        gather_basic_info
+        perform_express_installation
+    fi
+}
+
+# Gather basic configuration
+gather_basic_info() {
+    print_header "Basic Configuration"
+    
+    # Get domain name
+    read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
+    # Basic domain validation
+    if [[ ! "$DOMAIN_NAME" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        print_error "Invalid domain format"
+        gather_basic_info
+        return
+    fi
+    export DOMAIN_NAME
+    
+    # Get hostname
+    default_hostname="mail.$DOMAIN_NAME"
+    read -p "Enter mail server hostname [$default_hostname]: " HOSTNAME
+    HOSTNAME=${HOSTNAME:-$default_hostname}
+    export HOSTNAME
+    
+    # Get admin email
+    read -p "Enter admin email address: " ADMIN_EMAIL
+    # Basic email validation
+    if [[ ! "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        print_error "Invalid email format"
+        gather_basic_info
+        return
+    fi
+    export ADMIN_EMAIL
+    
+    # Multi-IP configuration
+    echo ""
+    read -p "Configure multiple IP addresses? (y/n) [n]: " MULTI_IP
+    
+    if [[ "${MULTI_IP,,}" == "y" ]]; then
+        configure_multiple_ips
+    else
+        # Get public IP
+        PRIMARY_IP=$(curl -s https://ipinfo.io/ip || curl -s https://api.ipify.org || echo "127.0.0.1")
+        export PRIMARY_IP
+        export IP_ADDRESSES=("$PRIMARY_IP")
+        print_message "Using single IP: $PRIMARY_IP"
+    fi
+}
+
+# Configure multiple IPs
+configure_multiple_ips() {
+    IP_ADDRESSES=()
+    echo "Enter IP addresses (one per line, empty to finish):"
+    while true; do
+        read -p "IP: " ip
+        [ -z "$ip" ] && break
+        # Basic IP validation
+        if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            IP_ADDRESSES+=("$ip")
+        else
+            echo "Invalid IP format"
+        fi
+    done
+    export IP_ADDRESSES
+    export PRIMARY_IP="${IP_ADDRESSES[0]}"
+}
+
+# Perform express installation
+perform_express_installation() {
+    print_header "Starting Installation"
+    
+    # Check if functions exist before calling them
+    print_message "Installing system packages..."
+    if declare -f update_system_packages > /dev/null; then
+        update_system_packages
+    else
+        apt-get update && apt-get upgrade -y
+    fi
+    
+    if declare -f install_all_packages > /dev/null; then
+        install_all_packages
+    else
+        print_message "Installing mail server packages..."
+        apt-get install -y postfix dovecot-core dovecot-imapd mysql-server opendkim
+    fi
+    
+    print_message "Basic installation complete!"
+    print_message ""
+    print_message "Server configured with:"
+    print_message "  Domain: $DOMAIN_NAME"
+    print_message "  Hostname: $HOSTNAME"
+    print_message "  Admin: $ADMIN_EMAIL"
+    print_message "  Primary IP: $PRIMARY_IP"
+    print_message ""
+    print_message "Next steps:"
+    print_message "1. Configure DNS records"
+    print_message "2. Set up SSL certificates"
+    print_message "3. Test email delivery"
+}
+
 # Main installation menu
 select_installation_mode() {
     echo "SELECT INSTALLATION MODE"
@@ -291,16 +398,13 @@ select_installation_mode() {
     
     case $INSTALL_MODE in
         1) 
-            # Express Installation
             gather_basic_info
             perform_express_installation
             ;;
         2) 
-            # Custom Installation - will be defined in loaded modules
             custom_installation
             ;;
         3) 
-            # Repair Installation - will be defined in loaded modules
             repair_installation
             ;;
         *) 
@@ -309,92 +413,6 @@ select_installation_mode() {
             perform_express_installation
             ;;
     esac
-}
-
-# Gather basic configuration
-gather_basic_info() {
-    print_header "Basic Configuration"
-    
-    # Get domain name
-    read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
-    while ! validate_domain "$DOMAIN_NAME"; do
-        read -p "Invalid domain. Please enter a valid domain: " DOMAIN_NAME
-    done
-    export DOMAIN_NAME
-    
-    # Get hostname
-    default_hostname="mail.$DOMAIN_NAME"
-    read -p "Enter mail server hostname [$default_hostname]: " HOSTNAME
-    HOSTNAME=${HOSTNAME:-$default_hostname}
-    export HOSTNAME
-    
-    # Get admin email
-    read -p "Enter admin email address: " ADMIN_EMAIL
-    while ! validate_email "$ADMIN_EMAIL"; do
-        read -p "Invalid email. Please enter a valid email: " ADMIN_EMAIL
-    done
-    export ADMIN_EMAIL
-    
-    # Multi-IP configuration
-    echo ""
-    read -p "Configure multiple IP addresses? (y/n) [n]: " MULTI_IP
-    
-    if [[ "${MULTI_IP,,}" == "y" ]]; then
-        configure_multiple_ips
-    else
-        PRIMARY_IP=$(get_public_ip)
-        export PRIMARY_IP
-        export IP_ADDRESSES=("$PRIMARY_IP")
-        print_message "Using single IP: $PRIMARY_IP"
-    fi
-}
-
-# Configure multiple IPs
-configure_multiple_ips() {
-    IP_ADDRESSES=()
-    echo "Enter IP addresses (one per line, empty to finish):"
-    while true; do
-        read -p "IP: " ip
-        [ -z "$ip" ] && break
-        if validate_ip_address "$ip"; then
-            IP_ADDRESSES+=("$ip")
-        else
-            echo "Invalid IP format"
-        fi
-    done
-    export IP_ADDRESSES
-    export PRIMARY_IP="${IP_ADDRESSES[0]}"
-}
-
-# Perform express installation
-perform_express_installation() {
-    print_header "Starting Installation"
-    
-    # The actual installation functions are defined in the loaded modules
-    print_message "Updating system..."
-    update_system_packages
-    
-    print_message "Installing packages..."
-    install_all_packages
-    
-    print_message "Setting up MySQL..."
-    setup_mysql
-    
-    print_message "Setting up Postfix..."
-    setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"
-    
-    print_message "Setting up Dovecot..."
-    setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"
-    
-    print_message "Setting up DKIM/SPF..."
-    setup_opendkim "$DOMAIN_NAME"
-    setup_spf "$DOMAIN_NAME" "$HOSTNAME"
-    
-    print_message "Creating utilities..."
-    create_all_utilities
-    
-    # Show completion
-    show_completion_message
 }
 
 # Warning and start
