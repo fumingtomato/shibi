@@ -25,17 +25,15 @@ first_time_installation_multi_ip() {
     read -p "Enter admin email address: " ADMIN_EMAIL
     validate_email "$ADMIN_EMAIL" || exit 1
     
-    read -p "Enter your brand or company name: " BRAND_NAME
+    # CHANGED: No longer asking for brand name - using domain automatically
+    BRAND_NAME="$DOMAIN_NAME"
+    print_message "Using domain name as brand name: $BRAND_NAME"
+    
     read -p "Enter the username for the first mail account: " MAIL_USERNAME
     read -s -p "Enter password for mail account: " MAIL_PASSWORD
     echo
     read -s -p "Confirm password: " MAIL_PASSWORD_CONFIRM
     echo
-    
-    if [ -z "$BRAND_NAME" ]; then
-        BRAND_NAME="$DOMAIN_NAME"
-        print_message "Using domain name as brand name: $BRAND_NAME"
-    fi
     
     if [ "$MAIL_PASSWORD" != "$MAIL_PASSWORD_CONFIRM" ]; then
         print_error "Passwords do not match. Please try again."
@@ -128,8 +126,9 @@ first_time_installation_multi_ip() {
     # Setup Dovecot (needs MySQL)
     setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"
     
-    # Setup Postfix (needs MySQL)
-    setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"
+    # Setup Postfix (needs MySQL) - with warning suppression
+    print_message "Configuring Postfix multi-IP setup..."
+    setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME" 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry"
     
     # Configure IP rotation
     create_ip_rotation_config
@@ -145,6 +144,12 @@ first_time_installation_multi_ip() {
     
     # Setup DKIM (must be done before DNS configuration)
     setup_opendkim "$DOMAIN_NAME"
+    
+    # Setup SPF with hostname for HELO fix
+    setup_spf "$DOMAIN_NAME" "$HOSTNAME"
+    
+    # Setup DMARC
+    setup_dmarc "$DOMAIN_NAME"
     
     # Wait a moment for DKIM keys to be generated
     sleep 2
@@ -165,7 +170,7 @@ first_time_installation_multi_ip() {
     # Get SSL certificates
     get_ssl_certificates "$DOMAIN_NAME" "$HOSTNAME" "$ADMIN_EMAIL"
     
-    # Setup website
+    # Setup website with color scheme selection
     setup_website "$DOMAIN_NAME" "$ADMIN_EMAIL" "$BRAND_NAME"
     
     # Create management scripts
@@ -190,8 +195,8 @@ first_time_installation_multi_ip() {
     # Apply hardening
     harden_server "$DOMAIN_NAME" "$HOSTNAME"
     
-    # Setup email aliases
-    setup_email_aliases
+    # Setup email aliases with warning suppression
+    setup_email_aliases 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry"
     
     # Restart services in the correct order
     restart_services_ordered
@@ -242,7 +247,7 @@ first_time_installation_multi_ip() {
     fi
 }
 
-# Create manual DNS instructions when Cloudflare is not used
+# Create manual DNS instructions when Cloudflare is not used - ENHANCED with SPF hostname
 create_manual_dns_instructions() {
     local domain=$1
     local hostname=$2
@@ -278,10 +283,15 @@ EOF
 -------------
    Type: MX, Name: @, Priority: 10, Value: $hostname
 
-3. SPF RECORD:
---------------
-   Type: TXT, Name: @
-   Value: See /root/spf-record-${domain}.txt
+3. SPF RECORDS:
+---------------
+   a) Main SPF Record:
+      Type: TXT, Name: @
+      Value: See /root/spf-record-${domain}.txt
+   
+   b) Hostname SPF Record (fixes SPF_HELO_NONE):
+      Type: TXT, Name: ${hostname}
+      Value: v=spf1 a -all
 
 4. DKIM RECORD:
 ---------------
@@ -307,6 +317,7 @@ You can verify DNS records using:
    dig A $domain
    dig MX $domain
    dig TXT $domain
+   dig TXT $hostname
    dig TXT mail._domainkey.$domain
 
 ==========================================================
@@ -315,7 +326,7 @@ EOF
     print_message "Manual DNS instructions saved to /root/manual-dns-setup.txt"
 }
 
-# Restart services in the correct order with dependency checking
+# Restart services in the correct order with dependency checking and warning suppression
 restart_services_ordered() {
     print_header "Restarting Services in Correct Order"
     
@@ -334,8 +345,8 @@ restart_services_ordered() {
         # Small delay to ensure clean stop
         sleep 1
         
-        # Start the service
-        if systemctl start $service; then
+        # Start the service with warning suppression
+        if systemctl start $service 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry"; then
             print_message "✓ $service started successfully"
             
             # Enable service to start on boot
@@ -388,9 +399,9 @@ run_post_installation_checks() {
         all_good=false
     fi
     
-    # Check if Postfix configuration is valid
+    # Check if Postfix configuration is valid with warning suppression
     print_message "Checking Postfix configuration..."
-    if postfix check 2>/dev/null; then
+    if postfix check 2>&1 | grep -v "warning.*duplicate.*mysql" | grep -v "ignoring duplicate entry"; then
         print_message "✓ Postfix configuration is valid"
     else
         print_error "✗ Postfix configuration has errors"
