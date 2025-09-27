@@ -1,504 +1,574 @@
 #!/bin/bash
 
 # =================================================================
-# MULTI-IP BULK MAIL SERVER INSTALLER - MAIN SCRIPT - FIXED VERSION
-# Enhanced module loading, error recovery, and debugging capabilities
+# MULTI-IP BULK MAIL SERVER INSTALLER - MODULE VERSION (FIXED)
 # Version: 16.0.1
-# Fixed: Module name mappings, error handling, and dependency checking
+# Author: fumingtomato
+# Repository: https://github.com/fumingtomato/shibi
+# Date: 2025-09-27
+# Fixed: Path detection when loaded as a module
 # =================================================================
 
-set -o pipefail  # Exit on pipe failure
-set -E           # ERR trap is inherited by shell functions
+# Note: When this file is loaded as a module by install.sh,
+# it should NOT try to detect paths or load other modules
+# as they are already loaded by the main installer
 
-# Configuration
-REPO_URL="https://raw.githubusercontent.com/fumingtomato/shibi/main/MultiIPMail"
-MODULES_DIR="./modules"
-LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
-DEBUG=${DEBUG:-false}
-MAX_DOWNLOAD_RETRIES=3
-MODULE_LOAD_TIMEOUT=30
-
-# Color codes
-GREEN='\033[38;5;208m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BLUE='\033[1;33m'
-NC='\033[0m'
-
-# Initialize log file
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-chmod 640 "$LOG_FILE"
-
-# Basic output functions (before module loading)
-print_message() {
-    echo -e "${GREEN}$1${NC}"
-    log_message "[INFO] $1"
-}
-
-print_error() {
-    echo -e "${RED}$1${NC}" >&2
-    log_message "[ERROR] $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}$1${NC}"
-    log_message "[WARNING] $1"
-}
-
-print_header() {
-    echo -e "${BLUE}==================================================${NC}"
-    echo -e "${BLUE}$1${NC}"
-    echo -e "${BLUE}==================================================${NC}"
-    log_message "[HEADER] $1"
-}
-
-print_debug() {
-    if [ "$DEBUG" = true ]; then
-        echo -e "[DEBUG] $1"
+# Check if we're being loaded as a module or run directly
+if [ -z "$INSTALLER_MODULE_MODE" ]; then
+    # Being run directly (standalone mode)
+    set -e
+    set -o pipefail
+    
+    # Script directory detection for standalone mode
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
+    # Set modules directory
+    if [[ "$(basename "$SCRIPT_DIR")" == "modules" ]]; then
+        MODULES_DIR="${SCRIPT_DIR}"
+        SCRIPT_DIR="$(dirname "$SCRIPT_DIR")"
+    else
+        MODULES_DIR="${SCRIPT_DIR}/modules"
     fi
-    log_message "[DEBUG] $1"
-}
-
-log_message() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
-}
-
-# Enhanced error handling
-handle_error() {
-    local line_no=$1
-    local bash_lineno=$2
-    local last_command=$3
-    local error_code=$4
     
-    print_error "Error occurred in script!"
-    print_error "  Line: $line_no"
-    print_error "  Command: $last_command"
-    print_error "  Exit Code: $error_code"
-    log_message "FATAL ERROR at line $line_no: $last_command (exit code: $error_code)"
+    # Installation log
+    LOG_DIR="/var/log"
+    LOG_FILE="${LOG_DIR}/mail-installer-$(date +%Y%m%d-%H%M%S).log"
     
-    # Save error state for recovery
-    cat > /tmp/installer_error_state <<EOF
-ERROR_LINE=$line_no
-ERROR_COMMAND=$last_command
-ERROR_CODE=$error_code
-ERROR_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
-ERROR_MODULE=${CURRENT_MODULE:-unknown}
+    # Create log file
+    touch "$LOG_FILE"
+    chmod 640 "$LOG_FILE"
+    
+    # Redirect output
+    exec > >(tee -a "$LOG_FILE")
+    exec 2>&1
+    
+    # Show header
+    clear
+    cat << "EOF"
+╔══════════════════════════════════════════════════════════════╗
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.1             ║
+║                                                              ║
+║     Professional Mail Server with Multi-IP Support          ║
+║     Repository: https://github.com/fumingtomato/shibi       ║
+╚══════════════════════════════════════════════════════════════╝
+
 EOF
     
-    print_error ""
-    print_error "Installation failed! Error details saved to /tmp/installer_error_state"
-    print_error "Check log file: $LOG_FILE"
-    print_error ""
-    print_error "You can try:"
-    print_error "  1. Fix the issue and run the installer again"
-    print_error "  2. Run with DEBUG=true for more details"
-    print_error "  3. Check GitHub issues at: https://github.com/fumingtomato/shibi/issues"
-    
-    cleanup_on_exit
-    exit 1
-}
-
-# Set error trap
-trap 'handle_error ${LINENO} ${BASH_LINENO} "$BASH_COMMAND" $?' ERR
-
-# Download module with retry logic and validation
-download_module() {
-    local module_name=$1
-    local github_name=${2:-$module_name}
-    local attempt=1
-    
-    CURRENT_MODULE="$module_name"
-    
-    while [ $attempt -le $MAX_DOWNLOAD_RETRIES ]; do
-        print_debug "Downloading $module_name (attempt $attempt/$MAX_DOWNLOAD_RETRIES)..."
-        
-        local temp_file=$(mktemp)
-        local url="${REPO_URL}/modules/${github_name}.sh"
-        
-        # Download with timeout and proper error handling
-        if curl -fsSL --connect-timeout 10 --max-time 30 \
-                -o "$temp_file" "$url" 2>/dev/null; then
-            
-            # Validate downloaded file
-            if [ -s "$temp_file" ]; then
-                # Check if it's actually a shell script
-                if head -1 "$temp_file" | grep -q '^#!/bin/bash'; then
-                    mv "$temp_file" "${MODULES_DIR}/${module_name}.sh"
-                    chmod +x "${MODULES_DIR}/${module_name}.sh"
-                    print_debug "✓ Successfully downloaded $module_name"
-                    return 0
-                else
-                    print_warning "Downloaded file is not a valid shell script: $module_name"
-                    rm -f "$temp_file"
-                fi
-            else
-                print_warning "Downloaded empty file for $module_name"
-                rm -f "$temp_file"
-            fi
-        else
-            print_debug "Failed to download $module_name (attempt $attempt)"
-            rm -f "$temp_file"
-        fi
-        
-        attempt=$((attempt + 1))
-        if [ $attempt -le $MAX_DOWNLOAD_RETRIES ]; then
-            sleep 2
-        fi
-    done
-    
-    print_error "Failed to download $module_name after $MAX_DOWNLOAD_RETRIES attempts"
-    return 1
-}
-
-# Safe source with validation and timeout
-safe_source() {
-    local module_file=$1
-    local module_name=$(basename "$module_file" .sh)
-    
-    CURRENT_MODULE="$module_name"
-    
-    if [ ! -f "$module_file" ]; then
-        print_error "Module file not found: $module_file"
-        return 1
-    fi
-    
-    # Validate syntax before sourcing
-    if ! bash -n "$module_file" 2>/dev/null; then
-        print_error "Syntax error in module: $module_file"
-        return 1
-    fi
-    
-    print_debug "Loading module: $module_name"
-    
-    # Source the module
-    source "$module_file"
-    
-    if [ $? -eq 0 ]; then
-        print_debug "✓ Successfully loaded $module_name"
-        return 0
-    else
-        print_error "Failed to load module: $module_name"
-        return 1
-    fi
-}
-
-# Check for required commands
-check_requirements() {
-    local missing_commands=()
-    local required_commands=("curl" "wget" "unzip" "systemctl" "git" "bash" "sed" "awk" "grep")
-    
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing_commands+=("$cmd")
-        fi
-    done
-    
-    if [ ${#missing_commands[@]} -gt 0 ]; then
-        print_error "Missing required commands: ${missing_commands[*]}"
-        print_message "Installing missing dependencies..."
-        apt-get update || true
-        apt-get install -y curl wget unzip systemd git sed gawk grep || true
-    fi
-}
-
-# Create module directory
-create_module_directory() {
-    if [ ! -d "$MODULES_DIR" ]; then
-        mkdir -p "$MODULES_DIR"
-        print_debug "Created modules directory: $MODULES_DIR"
-    fi
-}
-
-# Download all modules with progress indication
-download_all_modules() {
-    print_header "Downloading Installation Modules"
-    
-    # Define all modules with their GitHub names (FIXED mappings)
-    declare -A modules=(
-        ["core_functions"]="core-functions"
-        ["packages_system"]="packages-system"
-        ["mysql_dovecot"]="mysql-dovecot"
-        ["postfix_setup"]="postfix-setup"
-        ["multiip_config"]="multiip-config"
-        ["dkim_spf"]="dkim-spf"
-        ["dns_ssl"]="dns-ssl"
-        ["sticky_ip"]="sticky-ip"
-        ["monitoring_scripts"]="monitoring-scripts"
-        ["security_hardening"]="security-hardening"
-        ["utility_scripts"]="utility-scripts"
-        ["mailwizz_integration"]="mailwizz-integration"
-        ["main_installer_part2"]="main-installer-part2"
-        ["main_installer"]="main-installer"
-    )
-    
-    local total_modules=${#modules[@]}
-    local current=0
-    local failed_modules=()
-    
-    for module_name in "${!modules[@]}"; do
-        current=$((current + 1))
-        github_name="${modules[$module_name]}"
-        
-        echo -n "[$current/$total_modules] Downloading $module_name... "
-        
-        if download_module "$module_name" "$github_name"; then
-            echo "✓"
-        else
-            echo "✗"
-            failed_modules+=("$module_name")
-        fi
-    done
-    
-    if [ ${#failed_modules[@]} -gt 0 ]; then
-        print_error "Failed to download modules: ${failed_modules[*]}"
-        print_message "Attempting alternative download method..."
-        
-        # Try alternative download from GitHub archive
-        for module in "${failed_modules[@]}"; do
-            github_name="${modules[$module]}"
-            if download_module_alternative "$module" "$github_name"; then
-                # Remove from failed list if successful
-                failed_modules=("${failed_modules[@]/$module}")
-            fi
-        done
-        
-        # Check if any modules still failed
-        failed_modules=($(echo "${failed_modules[@]}" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' '))
-        if [ ${#failed_modules[@]} -gt 0 ]; then
-            print_error "Could not download required modules: ${failed_modules[*]}"
-            return 1
-        fi
-    fi
-    
-    print_message "All modules downloaded successfully"
-    return 0
-}
-
-# Alternative download method using GitHub archive
-download_module_alternative() {
-    local module_name=$1
-    local github_name=$2
-    
-    print_debug "Trying alternative download for $module_name..."
-    
-    local temp_dir=$(mktemp -d)
-    cd "$temp_dir"
-    
-    # Download entire repository as archive
-    if wget -q "https://github.com/fumingtomato/shibi/archive/refs/heads/main.zip" -O repo.zip; then
-        unzip -q repo.zip
-        
-        # Find and copy the module
-        local module_file="shibi-main/New_PfMIP/modules/${github_name}.sh"
-        if [ -f "$module_file" ]; then
-            cp "$module_file" "${MODULES_DIR}/${module_name}.sh"
-            chmod +x "${MODULES_DIR}/${module_name}.sh"
-            cd - > /dev/null
-            rm -rf "$temp_dir"
-            print_debug "✓ Successfully downloaded $module_name via alternative method"
-            return 0
-        fi
-    fi
-    
-    cd - > /dev/null
-    rm -rf "$temp_dir"
-    return 1
-}
-
-# Load all modules with dependency order
-load_all_modules() {
-    print_header "Loading Installation Modules"
-    
-    # Define loading order (dependencies first) - FIXED ORDER
-    local load_order=(
-        "core_functions"
-        "packages_system"
-        "mysql_dovecot"
-        "multiip_config"
-        "postfix_setup"
-        "dkim_spf"
-        "dns_ssl"
-        "sticky_ip"
-        "monitoring_scripts"
-        "security_hardening"
-        "utility_scripts"
-        "mailwizz_integration"
-        "main_installer_part2"  # Load part2 BEFORE main_installer
-        "main_installer"
-    )
-    
-    local failed_modules=()
-    
-    for module in "${load_order[@]}"; do
-        local module_file="${MODULES_DIR}/${module}.sh"
-        
-        if [ -f "$module_file" ]; then
-            echo -n "Loading $module... "
-            if safe_source "$module_file"; then
-                echo "✓"
-            else
-                echo "✗"
-                failed_modules+=("$module")
-            fi
-        else
-            print_error "Module file not found: $module_file"
-            failed_modules+=("$module")
-        fi
-    done
-    
-    if [ ${#failed_modules[@]} -gt 0 ]; then
-        print_error "Failed to load modules: ${failed_modules[*]}"
-        return 1
-    fi
-    
-    # Verify critical functions are available
-    local critical_functions=(
-        "check_root"
-        "setup_mysql"
-        "setup_postfix_multi_ip"
-        "first_time_installation_multi_ip"
-        "main_menu"
-        "fix_mysql_config"
-        "create_add_ip_script"
-    )
-    
-    print_debug "Verifying critical functions..."
-    local missing_functions=()
-    for func in "${critical_functions[@]}"; do
-        if ! type "$func" &>/dev/null 2>&1; then
-            print_warning "Function not loaded: $func"
-            missing_functions+=("$func")
-        fi
-    done
-    
-    if [ ${#missing_functions[@]} -gt 0 ]; then
-        print_error "Critical functions not loaded: ${missing_functions[*]}"
-        return 1
-    fi
-    
-    print_message "All modules loaded successfully"
-    return 0
-}
-
-# Cleanup function
-cleanup_on_exit() {
-    print_debug "Performing cleanup..."
-    
-    # Save installation state if needed
-    if [ -f /root/.installer_progress ]; then
-        cp /root/.installer_progress /root/.installer_progress.backup 2>/dev/null || true
-    fi
-    
-    # Clear temporary files
-    rm -f /tmp/installer_*.tmp 2>/dev/null || true
-    
-    print_debug "Cleanup completed"
-}
-
-# Set cleanup trap
-trap cleanup_on_exit EXIT
-
-# Self-update check
-check_for_updates() {
-    print_debug "Checking for installer updates..."
-    
-    local current_version="16.0.1"
-    local latest_version_url="${REPO_URL}/version.txt"
-    local latest_version=$(curl -fsSL "$latest_version_url" 2>/dev/null || echo "$current_version")
-    
-    if [ "$latest_version" != "$current_version" ]; then
-        print_warning "New version available: $latest_version (current: $current_version)"
-        read -p "Update installer before continuing? (y/n): " update_choice
-        if [[ "$update_choice" == "y" || "$update_choice" == "Y" ]]; then
-            update_installer
-            exec "$0" "$@"  # Restart with new version
-        fi
-    else
-        print_debug "Installer is up to date (version: $current_version)"
-    fi
-}
-
-# Main execution
-main() {
-    print_header "Multi-IP Bulk Mail Server Installer"
-    print_message "Version: 16.0.1"
-    print_message "Repository: https://github.com/fumingtomato/shibi"
-    print_message ""
+    echo "Installation started at: $(date)"
+    echo "Log file: $LOG_FILE"
+    echo ""
     
     # Check if running as root
-    if [ "$(id -u)" != "0" ]; then
-        print_error "This script must be run as root or with sudo privileges"
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script must be run as root or with sudo privileges"
         echo "Please run: sudo $0"
         exit 1
     fi
     
-    # Parse command line arguments
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --debug)
-                DEBUG=true
-                print_message "Debug mode enabled"
-                ;;
-            --help|-h)
-                echo "Usage: $0 [OPTIONS]"
-                echo "Options:"
-                echo "  --debug    Enable debug output"
-                echo "  --help     Show this help message"
-                exit 0
-                ;;
-            *)
-                print_warning "Unknown option: $1"
-                ;;
-        esac
-        shift
+    # Check modules directory
+    if [ ! -d "$MODULES_DIR" ]; then
+        echo ""
+        echo "ERROR: Modules directory not found at $MODULES_DIR"
+        echo ""
+        echo "Please ensure the following structure exists:"
+        echo "  $SCRIPT_DIR/"
+        echo "  ├── main-installer.sh (or install.sh)"
+        echo "  └── modules/"
+        echo "      ├── core-functions.sh"
+        echo "      ├── packages-system.sh"
+        echo "      └── ... (other modules)"
+        echo ""
+        echo "You can download all modules from:"
+        echo "https://github.com/fumingtomato/shibi"
+        exit 1
+    fi
+    
+    # Load modules in standalone mode
+    echo "Loading installer modules..."
+    
+    CORE_MODULES=(
+        "core-functions.sh"
+        "packages-system.sh"
+    )
+    
+    FEATURE_MODULES=(
+        "mysql-dovecot.sh"
+        "multiip-config.sh"
+        "postfix-setup.sh"
+        "dkim-spf.sh"
+        "dns-ssl.sh"
+        "sticky-ip.sh"
+        "monitoring-scripts.sh"
+        "security-hardening.sh"
+        "utility-scripts.sh"
+        "mailwizz-integration.sh"
+        "main-installer-part2.sh"
+    )
+    
+    LOADED_MODULES=0
+    FAILED_MODULES=0
+    
+    # Load core modules
+    for module in "${CORE_MODULES[@]}"; do
+        module_file="${MODULES_DIR}/${module}"
+        if [ -f "$module_file" ]; then
+            echo "  ✓ Loading: $module"
+            source "$module_file"
+            LOADED_MODULES=$((LOADED_MODULES + 1))
+        else
+            echo "  ✗ Required module not found: $module"
+            FAILED_MODULES=$((FAILED_MODULES + 1))
+        fi
     done
     
-    # Check system requirements
-    check_requirements
-    
-    # Create module directory
-    create_module_directory
-    
-    # Download all required modules
-    if ! download_all_modules; then
-        print_error "Failed to download required modules"
-        print_error "Please check your internet connection and try again"
-        exit 1
-    fi
-    
-    # Load all modules
-    if ! load_all_modules; then
-        print_error "Failed to load required modules"
-        print_error "Installation cannot continue"
-        exit 1
-    fi
-    
-    # Verify we're ready to proceed
-    if type main_menu &>/dev/null 2>&1; then
-        print_message "All modules loaded successfully"
-        print_message "Starting installation menu..."
+    if [ $FAILED_MODULES -gt 0 ]; then
         echo ""
-        
-        # Initialize MySQL configuration early to prevent warnings
-        if type init_mysql_postfix_config &>/dev/null 2>&1; then
-            init_mysql_postfix_config
-        fi
-        
-        # Call the main menu
-        main_menu
-    else
-        print_error "Main menu function not found"
-        print_error "Module loading may have failed"
+        echo "ERROR: Core modules are missing. Cannot continue."
         exit 1
     fi
+    
+    # Load feature modules
+    for module in "${FEATURE_MODULES[@]}"; do
+        module_file="${MODULES_DIR}/${module}"
+        if [ -f "$module_file" ]; then
+            echo "  ✓ Loading: $module"
+            source "$module_file"
+            LOADED_MODULES=$((LOADED_MODULES + 1))
+        else
+            echo "  ⚠ Optional module not found: $module"
+        fi
+    done
+    
+    echo ""
+    echo "✓ Loaded $LOADED_MODULES modules successfully"
+    echo ""
+fi
+
+# =================================================================
+# MAIN INSTALLER FUNCTIONS
+# These functions are available whether loaded as module or standalone
+# =================================================================
+
+# Installation mode selection
+select_installation_mode() {
+    echo "SELECT INSTALLATION MODE"
+    echo "========================"
+    echo ""
+    echo "1. Express Installation (Recommended for new servers)"
+    echo "   - Automatic configuration with sensible defaults"
+    echo "   - Single or multi-IP support"
+    echo "   - Quick setup wizard"
+    echo ""
+    echo "2. Custom Installation (Advanced)"
+    echo "   - Full control over all settings"
+    echo "   - Component selection"
+    echo "   - Manual configuration"
+    echo ""
+    echo "3. Repair/Update Existing Installation"
+    echo "   - Fix configuration issues"
+    echo "   - Update components"
+    echo "   - Reconfigure services"
+    echo ""
+    
+    read -p "Select mode (1-3): " INSTALL_MODE
+    
+    case $INSTALL_MODE in
+        1) express_installation ;;
+        2) custom_installation ;;
+        3) repair_installation ;;
+        *) 
+            echo "Invalid selection. Starting express installation..."
+            express_installation
+            ;;
+    esac
 }
 
-# Check if script is being sourced or executed
-if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
-    # Script is being executed
-    main "$@"
-else
-    # Script is being sourced
-    print_debug "Script sourced - modules loaded but not executing main menu"
+# Express installation
+express_installation() {
+    print_header "Express Installation"
+    
+    # Gather basic information
+    gather_basic_info
+    
+    # Perform installation
+    perform_express_installation
+}
+
+# Gather basic information
+gather_basic_info() {
+    print_header "Basic Configuration"
+    
+    # Get domain name
+    read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
+    while ! validate_domain "$DOMAIN_NAME"; do
+        read -p "Invalid domain. Please enter a valid domain: " DOMAIN_NAME
+    done
+    export DOMAIN_NAME
+    
+    # Get hostname
+    default_hostname="mail.$DOMAIN_NAME"
+    read -p "Enter mail server hostname [$default_hostname]: " HOSTNAME
+    HOSTNAME=${HOSTNAME:-$default_hostname}
+    export HOSTNAME
+    
+    # Get admin email
+    read -p "Enter admin email address: " ADMIN_EMAIL
+    while ! validate_email "$ADMIN_EMAIL"; do
+        read -p "Invalid email. Please enter a valid email: " ADMIN_EMAIL
+    done
+    export ADMIN_EMAIL
+    
+    # Multi-IP configuration
+    echo ""
+    read -p "Configure multiple IP addresses? (y/n) [n]: " MULTI_IP
+    MULTI_IP=${MULTI_IP:-n}
+    
+    if [[ "$MULTI_IP" =~ ^[Yy]$ ]]; then
+        configure_multiple_ips
+    else
+        # Single IP configuration
+        PRIMARY_IP=$(get_public_ip)
+        export PRIMARY_IP
+        export IP_ADDRESSES=("$PRIMARY_IP")
+        export HOSTNAMES=("$HOSTNAME")
+        print_message "Using single IP: $PRIMARY_IP"
+    fi
+    
+    # Sticky IP configuration
+    echo ""
+    read -p "Enable sticky IP mapping? (y/n) [n]: " ENABLE_STICKY_IP
+    export ENABLE_STICKY_IP=${ENABLE_STICKY_IP:-n}
+    
+    # Brand name
+    echo ""
+    read -p "Enter your brand/company name [Mail Server]: " BRAND_NAME
+    export BRAND_NAME=${BRAND_NAME:-"Mail Server"}
+}
+
+# Configure multiple IPs
+configure_multiple_ips() {
+    print_header "Multi-IP Configuration"
+    
+    IP_ADDRESSES=()
+    HOSTNAMES=()
+    IP_DOMAINS=()
+    
+    echo "Enter IP addresses (one per line, empty line to finish):"
+    local count=0
+    while true; do
+        read -p "IP $((count + 1)): " ip
+        if [ -z "$ip" ]; then
+            if [ $count -eq 0 ]; then
+                echo "At least one IP is required"
+                continue
+            fi
+            break
+        fi
+        
+        if validate_ip_address "$ip"; then
+            IP_ADDRESSES+=("$ip")
+            
+            # Get hostname for this IP
+            default_host="mail-$count.$DOMAIN_NAME"
+            read -p "  Hostname for $ip [$default_host]: " host
+            host=${host:-$default_host}
+            HOSTNAMES+=("$host")
+            
+            # Get domain for this IP
+            read -p "  Domain for $ip [$DOMAIN_NAME]: " domain
+            domain=${domain:-$DOMAIN_NAME}
+            IP_DOMAINS+=("$domain")
+            
+            count=$((count + 1))
+        else
+            echo "Invalid IP address format"
+        fi
+    done
+    
+    PRIMARY_IP="${IP_ADDRESSES[0]}"
+    IP_COUNT=${#IP_ADDRESSES[@]}
+    
+    export PRIMARY_IP
+    export IP_ADDRESSES
+    export HOSTNAMES
+    export IP_DOMAINS
+    export IP_COUNT
+    
+    print_message "Configured $IP_COUNT IP addresses"
+}
+
+# Perform express installation
+perform_express_installation() {
+    print_header "Starting Express Installation"
+    
+    # Update system
+    print_message "Updating system packages..."
+    update_system_packages
+    
+    # Install required packages
+    print_message "Installing required packages..."
+    install_all_packages
+    
+    # Setup MySQL
+    print_message "Setting up MySQL database..."
+    setup_mysql
+    
+    # Setup Postfix
+    print_message "Setting up Postfix..."
+    setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME"
+    
+    # Setup Dovecot
+    print_message "Setting up Dovecot..."
+    setup_dovecot "$DOMAIN_NAME" "$HOSTNAME"
+    
+    # Setup DKIM/SPF
+    print_message "Setting up DKIM and SPF..."
+    setup_opendkim "$DOMAIN_NAME"
+    setup_spf "$DOMAIN_NAME" "$HOSTNAME"
+    
+    # Configure multi-IP if needed
+    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+        print_message "Configuring multiple IPs..."
+        setup_multiple_ips
+    fi
+    
+    # Setup sticky IP if enabled
+    if [[ "$ENABLE_STICKY_IP" =~ ^[Yy]$ ]]; then
+        print_message "Setting up sticky IP..."
+        setup_sticky_ip
+    fi
+    
+    # Setup monitoring
+    print_message "Setting up monitoring..."
+    init_monitoring
+    create_monitoring_scripts
+    
+    # Setup security
+    print_message "Applying security hardening..."
+    setup_security_hardening
+    
+    # Create utilities
+    print_message "Creating utility scripts..."
+    create_all_utilities
+    
+    # Generate DNS records
+    print_message "Generating DNS records..."
+    generate_dns_records "$DOMAIN_NAME" "$HOSTNAME"
+    
+    # Final configuration
+    print_message "Finalizing configuration..."
+    finalize_installation
+}
+
+# Custom installation
+custom_installation() {
+    print_header "Custom Installation"
+    
+    echo "Component Selection:"
+    echo "1. MySQL Database"
+    echo "2. Postfix Mail Server"
+    echo "3. Dovecot IMAP/POP3"
+    echo "4. DKIM/SPF/DMARC"
+    echo "5. Multi-IP Configuration"
+    echo "6. Sticky IP"
+    echo "7. Monitoring Tools"
+    echo "8. Security Hardening"
+    echo "9. Utility Scripts"
+    echo "10. All Components"
+    echo ""
+    
+    read -p "Select components to install (comma-separated): " components
+    
+    # Process component selection
+    IFS=',' read -ra SELECTED <<< "$components"
+    
+    gather_basic_info
+    
+    for component in "${SELECTED[@]}"; do
+        case $component in
+            1) setup_mysql ;;
+            2) setup_postfix_multi_ip "$DOMAIN_NAME" "$HOSTNAME" ;;
+            3) setup_dovecot "$DOMAIN_NAME" "$HOSTNAME" ;;
+            4) 
+                setup_opendkim "$DOMAIN_NAME"
+                setup_spf "$DOMAIN_NAME" "$HOSTNAME"
+                setup_dmarc "$DOMAIN_NAME"
+                ;;
+            5) setup_multiple_ips ;;
+            6) setup_sticky_ip ;;
+            7) 
+                init_monitoring
+                create_monitoring_scripts
+                ;;
+            8) setup_security_hardening ;;
+            9) create_all_utilities ;;
+            10) perform_express_installation ;;
+        esac
+    done
+    
+    finalize_installation
+}
+
+# Repair installation
+repair_installation() {
+    print_header "Repair/Update Installation"
+    
+    echo "Repair Options:"
+    echo "1. Fix MySQL connection issues"
+    echo "2. Repair Postfix configuration"
+    echo "3. Fix Dovecot authentication"
+    echo "4. Regenerate DKIM keys"
+    echo "5. Update DNS records"
+    echo "6. Fix permissions"
+    echo "7. Restart all services"
+    echo "8. Run full diagnostic"
+    echo ""
+    
+    read -p "Select repair option: " repair_option
+    
+    case $repair_option in
+        1) 
+            fix_mysql_config
+            test_database_connection
+            ;;
+        2)
+            test_postfix_config
+            postfix check
+            systemctl restart postfix
+            ;;
+        3)
+            systemctl restart dovecot
+            doveadm auth test testuser@example.com testpass
+            ;;
+        4)
+            read -p "Enter domain: " domain
+            generate_dkim_keys "$domain"
+            display_dkim_record "$domain"
+            ;;
+        5)
+            read -p "Enter domain: " domain
+            generate_dns_records "$domain" "mail.$domain"
+            ;;
+        6)
+            fix_permissions
+            ;;
+        7)
+            systemctl restart postfix dovecot mysql opendkim
+            ;;
+        8)
+            mail-diagnostic
+            ;;
+    esac
+}
+
+# Finalize installation
+finalize_installation() {
+    print_header "Finalizing Installation"
+    
+    # Create admin user
+    print_message "Creating admin email account..."
+    add_email_user "$ADMIN_EMAIL" "ChangeMeNow123!"
+    
+    # Start services
+    print_message "Starting services..."
+    systemctl start postfix dovecot opendkim mysql
+    systemctl enable postfix dovecot opendkim mysql
+    
+    # Show completion message
+    show_completion_message
+}
+
+# Fix permissions
+fix_permissions() {
+    print_message "Fixing file permissions..."
+    
+    # Postfix
+    chown -R root:postfix /etc/postfix
+    chmod 644 /etc/postfix/*.cf
+    chmod 640 /etc/postfix/mysql-*.cf
+    
+    # Dovecot
+    chown -R root:dovecot /etc/dovecot
+    chmod 644 /etc/dovecot/*.conf
+    chmod 640 /etc/dovecot/dovecot-sql.conf.ext
+    
+    # Mail storage
+    chown -R vmail:vmail /var/vmail
+    chmod 770 /var/vmail
+    
+    # OpenDKIM
+    chown -R opendkim:opendkim /etc/opendkim
+    chmod 750 /etc/opendkim
+    chmod 600 /etc/opendkim/keys/*/mail.private
+    
+    print_message "✓ Permissions fixed"
+}
+
+# First time installation for multi-IP
+first_time_installation_multi_ip() {
+    print_header "First Time Multi-IP Mail Server Installation"
+    
+    gather_basic_info
+    perform_express_installation
+}
+
+# Main menu (for module mode)
+main_menu() {
+    clear
+    cat << "EOF"
+╔══════════════════════════════════════════════════════════════╗
+║     MULTI-IP BULK MAIL SERVER INSTALLER                     ║
+║                                                              ║
+║     Professional Mail Server with Multi-IP Support          ║
+╚══════════════════════════════════════════════════════════════╝
+
+EOF
+    
+    echo "MAIN MENU"
+    echo "========="
+    echo ""
+    echo "1. New Installation"
+    echo "2. Custom Installation"
+    echo "3. Repair/Update"
+    echo "4. System Information"
+    echo "5. Exit"
+    echo ""
+    
+    read -p "Select option (1-5): " menu_choice
+    
+    case $menu_choice in
+        1) express_installation ;;
+        2) custom_installation ;;
+        3) repair_installation ;;
+        4) mail-info 2>/dev/null || echo "System info not available" ;;
+        5) exit 0 ;;
+        *) 
+            echo "Invalid selection"
+            sleep 2
+            main_menu
+            ;;
+    esac
+}
+
+# Export functions for module mode
+export -f select_installation_mode express_installation custom_installation
+export -f repair_installation gather_basic_info configure_multiple_ips
+export -f perform_express_installation finalize_installation fix_permissions
+export -f first_time_installation_multi_ip main_menu
+
+# If running standalone (not as module), execute main
+if [ -z "$INSTALLER_MODULE_MODE" ] && [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+    # Show warning
+    echo "⚠ WARNING: This installer will modify system configuration files."
+    echo "It is recommended to run this on a fresh server installation."
+    echo ""
+    read -p "Continue with installation? (y/n): " CONTINUE
+    
+    if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+        echo "Installation cancelled."
+        exit 0
+    fi
+    
+    # Start installation
+    select_installation_mode
 fi
