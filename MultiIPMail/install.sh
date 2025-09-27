@@ -11,7 +11,7 @@ set -o pipefail  # Exit on pipe failure
 set -E           # ERR trap is inherited by shell functions
 
 # Configuration
-REPO_URL="https://raw.githubusercontent.com/fumingtomato/shibi/main/New_PfMIP"
+REPO_URL="https://raw.githubusercontent.com/fumingtomato/shibi/main/MultiIPMail"
 MODULES_DIR="./modules"
 LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
 DEBUG=${DEBUG:-false}
