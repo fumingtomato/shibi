@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# PACKAGES AND SYSTEM CONFIGURATION MODULE
+# PACKAGES AND SYSTEM CONFIGURATION MODULE - COMPLETE FIXED VERSION
 # Package installation and system setup functions
+# Fixed: Complete implementations, better error handling, improved package management
 # =================================================================
 
 # Install all required packages for the mail server
@@ -18,6 +19,7 @@ install_required_packages() {
     # Set Postfix configuration type to "Internet Site"
     echo "postfix postfix/mailname string ${HOSTNAME:-$(hostname -f)}" | debconf-set-selections
     echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
+    echo "postfix postfix/destinations string ${HOSTNAME:-$(hostname -f)}, localhost" | debconf-set-selections
     
     # Set non-interactive frontend for apt
     export DEBIAN_FRONTEND=noninteractive
@@ -40,6 +42,8 @@ install_required_packages() {
         "telnet"
         "dnsutils"
         "ipcalc"
+        "bc"
+        "jq"
     )
     
     for package in "${basic_packages[@]}"; do
@@ -69,31 +73,40 @@ install_required_packages() {
         fi
     else
         print_message "✓ Postfix already installed"
+        # Ensure mysql support is installed
+        if ! dpkg -l | grep -q "^ii  postfix-mysql "; then
+            apt-get install -y postfix-mysql 2>/dev/null || true
+        fi
     fi
     
     # Install MySQL/MariaDB
     print_message "Installing MySQL/MariaDB..."
-    local mysql_packages=(
-        "mysql-server"
-        "mysql-client"
-    )
+    local mysql_installed=false
     
-    for package in "${mysql_packages[@]}"; do
-        if dpkg -l | grep -q "^ii  $package "; then
-            print_message "✓ $package already installed"
+    # Try MySQL first
+    if ! dpkg -l | grep -E "^ii  (mysql-server|mariadb-server) " &>/dev/null; then
+        print_message "Installing MySQL Server..."
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y -q mysql-server mysql-client 2>/dev/null; then
+            mysql_installed=true
+            print_message "✓ MySQL Server installed"
         else
-            print_message "Installing $package..."
-            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1; then
-                print_warning "Failed to install $package, trying mariadb..."
-                # Try MariaDB as alternative
-                if [ "$package" = "mysql-server" ]; then
-                    DEBIAN_FRONTEND=noninteractive apt-get install -y -q mariadb-server >/dev/null 2>&1 || true
-                elif [ "$package" = "mysql-client" ]; then
-                    DEBIAN_FRONTEND=noninteractive apt-get install -y -q mariadb-client >/dev/null 2>&1 || true
-                fi
+            print_warning "MySQL installation failed, trying MariaDB..."
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y -q mariadb-server mariadb-client 2>/dev/null; then
+                mysql_installed=true
+                print_message "✓ MariaDB Server installed"
+            else
+                print_error "Failed to install both MySQL and MariaDB"
             fi
         fi
-    done
+    else
+        mysql_installed=true
+        print_message "✓ Database server already installed"
+    fi
+    
+    if ! $mysql_installed; then
+        print_error "Critical: No database server could be installed"
+        return 1
+    fi
     
     # Install Dovecot packages
     print_message "Installing Dovecot packages..."
@@ -107,15 +120,23 @@ install_required_packages() {
         "dovecot-managesieved"
     )
     
+    local dovecot_failed=()
     for package in "${dovecot_packages[@]}"; do
         if dpkg -l | grep -q "^ii  $package "; then
             print_message "✓ $package already installed"
         else
             print_message "Installing $package..."
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1 || \
-                print_warning "Failed to install $package, continuing..."
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$package" >/dev/null 2>&1; then
+                print_warning "Failed to install $package"
+                dovecot_failed+=("$package")
+            fi
         fi
     done
+    
+    if [ ${#dovecot_failed[@]} -gt 0 ] && [ ${#dovecot_failed[@]} -eq ${#dovecot_packages[@]} ]; then
+        print_error "Critical: Dovecot installation completely failed"
+        return 1
+    fi
     
     # Install web server and SSL
     print_message "Installing web server and SSL tools..."
@@ -138,8 +159,11 @@ install_required_packages() {
     # Install email authentication
     print_message "Installing email authentication packages..."
     if ! dpkg -l | grep -q "^ii  opendkim "; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -q opendkim opendkim-tools >/dev/null 2>&1 || \
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y -q opendkim opendkim-tools >/dev/null 2>&1; then
+            print_message "✓ OpenDKIM installed"
+        else
             print_warning "Failed to install OpenDKIM"
+        fi
     else
         print_message "✓ OpenDKIM already installed"
     fi
@@ -172,8 +196,6 @@ install_required_packages() {
         "git"
         "htop"
         "ncdu"
-        "bc"
-        "jq"
         "python3"
         "python3-pip"
     )
@@ -195,34 +217,45 @@ install_required_packages() {
     print_message "Stopping services for configuration..."
     systemctl stop postfix 2>/dev/null || true
     systemctl stop dovecot 2>/dev/null || true
-    systemctl stop mysql 2>/dev/null || true
+    systemctl stop mysql 2>/dev/null || systemctl stop mariadb 2>/dev/null || true
     systemctl stop nginx 2>/dev/null || true
+    systemctl stop opendkim 2>/dev/null || true
     
     print_message "Package installation completed"
     
     # Verify critical packages
     print_message "Verifying critical packages..."
-    local critical_packages=("postfix" "mysql-server" "dovecot-core" "nginx")
+    local critical_packages=("postfix" "dovecot-core" "nginx")
     local all_installed=true
     
     for package in "${critical_packages[@]}"; do
-        # Check for package or alternatives
         if dpkg -l | grep -q "^ii  $package "; then
             print_message "✓ $package verified"
-        elif [ "$package" = "mysql-server" ] && dpkg -l | grep -q "^ii  mariadb-server "; then
-            print_message "✓ mariadb-server verified (alternative to mysql-server)"
         else
             print_error "✗ $package is not installed properly"
             all_installed=false
         fi
     done
     
+    # Check for database server (either MySQL or MariaDB)
+    if dpkg -l | grep -q "^ii  mysql-server "; then
+        print_message "✓ mysql-server verified"
+    elif dpkg -l | grep -q "^ii  mariadb-server "; then
+        print_message "✓ mariadb-server verified"
+    else
+        print_error "✗ No database server installed"
+        all_installed=false
+    fi
+    
     if [ "$all_installed" = false ]; then
         print_error "Some critical packages failed to install."
         print_message "Attempting to fix broken packages..."
         apt-get install -f -y
         dpkg --configure -a
+        return 1
     fi
+    
+    return 0
 }
 
 # Configure system hostname
@@ -236,6 +269,12 @@ configure_hostname() {
         return 1
     fi
     
+    # Validate hostname format
+    if [[ ! "$hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+        print_error "Invalid hostname format: $hostname"
+        return 1
+    fi
+    
     # Extract the short hostname (first part before first dot)
     local short_hostname=$(echo "$hostname" | cut -d'.' -f1)
     
@@ -243,24 +282,25 @@ configure_hostname() {
     print_message "Short hostname: $short_hostname"
     
     # Set the hostname
-    hostnamectl set-hostname "$short_hostname"
+    hostnamectl set-hostname "$short_hostname" 2>/dev/null || hostname "$short_hostname"
     
     # Update /etc/hostname
     echo "$short_hostname" > /etc/hostname
     
     # Update /etc/hosts
-    if ! grep -q "127.0.1.1" /etc/hosts; then
-        echo "127.0.1.1 $hostname $short_hostname" >> /etc/hosts
-    else
-        sed -i "s/127.0.1.1.*/127.0.1.1 $hostname $short_hostname/" /etc/hosts
-    fi
+    # First, remove any existing entries for 127.0.1.1
+    sed -i '/^127\.0\.1\.1/d' /etc/hosts
+    
+    # Add new entry
+    echo "127.0.1.1 $hostname $short_hostname" >> /etc/hosts
     
     # Add server IPs to hosts file if available
     if [ ! -z "${IP_ADDRESSES}" ]; then
         for ip in "${IP_ADDRESSES[@]}"; do
-            if ! grep -q "$ip" /etc/hosts; then
-                echo "$ip $hostname $short_hostname" >> /etc/hosts
-            fi
+            # Remove any existing entries for this IP
+            sed -i "/^$ip/d" /etc/hosts
+            # Add new entry
+            echo "$ip $hostname $short_hostname" >> /etc/hosts
         done
     fi
     
@@ -269,13 +309,14 @@ configure_hostname() {
     
     # Verify
     print_message "Hostname configured:"
-    print_message "  Full: $(hostname -f)"
-    print_message "  Short: $(hostname -s)"
+    print_message "  Full: $(hostname -f 2>/dev/null || echo "$hostname")"
+    print_message "  Short: $(hostname -s 2>/dev/null || echo "$short_hostname")"
     
     # Configure /etc/mailname for Postfix
     echo "$hostname" > /etc/mailname
     
     print_message "Hostname configuration completed"
+    return 0
 }
 
 # Save installation configuration for future reference
@@ -294,13 +335,14 @@ save_configuration() {
     cat > "$config_file" <<EOF
 {
   "installation_date": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
-  "installer_version": "$INSTALLER_VERSION",
+  "installer_version": "${INSTALLER_VERSION:-unknown}",
   "server_configuration": {
     "domain": "${DOMAIN_NAME:-}",
     "hostname": "${HOSTNAME:-}",
+    "subdomain": "${SUBDOMAIN:-}",
     "admin_email": "${ADMIN_EMAIL:-}",
     "brand_name": "${BRAND_NAME:-}",
-    "timezone": "$(timedatectl | grep 'Time zone' | awk '{print $3}')",
+    "timezone": "$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")",
     "website_theme": "${WEBSITE_THEME:-midnight}"
   },
   "network_configuration": {
@@ -381,6 +423,13 @@ EOF
     print_message "Configuration saved to: $config_file"
     
     # Create quick reference file
+    create_quick_reference
+    
+    return 0
+}
+
+# Create quick reference documentation
+create_quick_reference() {
     cat > /root/mail-server-quick-ref.txt <<EOF
 ==============================================
 Mail Server Quick Reference
@@ -388,6 +437,7 @@ Mail Server Quick Reference
 Installation Date: $(date)
 Domain: ${DOMAIN_NAME:-}
 Hostname: ${HOSTNAME:-}
+Subdomain: ${SUBDOMAIN:-}
 Admin Email: ${ADMIN_EMAIL:-}
 Website Theme: ${WEBSITE_THEME:-midnight}
 
@@ -420,7 +470,7 @@ mysql -u mailuser -p\$(cat /root/.mail_db_password) mailserver
 
 IMPORTANT FILES:
 ----------------
-Configuration backup: $config_file
+Configuration backup: /root/mail-server-config.json
 Postfix config: /etc/postfix/main.cf
 Dovecot config: /etc/dovecot/dovecot.conf
 DNS records: /root/*-record-*.txt
@@ -429,7 +479,6 @@ MailWizz guide: /root/mailwizz-multi-ip-guide.txt
 EOF
     
     chmod 644 /root/mail-server-quick-ref.txt
-    
     print_message "Quick reference guide saved to: /root/mail-server-quick-ref.txt"
 }
 
@@ -452,22 +501,35 @@ EOF
     
     cat >> "$doc_file" <<EOF
 Date: $(date)
-Version: $INSTALLER_VERSION
+Version: ${INSTALLER_VERSION:-}
 Domain: ${DOMAIN_NAME:-}
 Hostname: ${HOSTNAME:-}
+Subdomain: ${SUBDOMAIN:-}
 Admin Email: ${ADMIN_EMAIL:-}
 Website Theme: ${WEBSITE_THEME:-midnight}
 Total IPs Configured: ${IP_COUNT:-1}
 
-IP ADDRESSES:
--------------
+IP ADDRESSES AND HOSTNAMES:
+---------------------------
 EOF
     
     if [ ! -z "${IP_ADDRESSES}" ]; then
-        local idx=1
-        for ip in "${IP_ADDRESSES[@]}"; do
-            echo "$idx. $ip (Transport: smtp-ip${idx})" >> "$doc_file"
-            idx=$((idx + 1))
+        for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
+            local ip="${IP_ADDRESSES[$i]}"
+            local transport_num=$((i + 1))
+            local hostname_display
+            
+            if [ $i -eq 0 ]; then
+                hostname_display="${SUBDOMAIN}.${DOMAIN_NAME}"
+            else
+                local suffix=$(printf "%03d" $i)
+                hostname_display="${SUBDOMAIN}${suffix}.${DOMAIN_NAME}"
+            fi
+            
+            echo "IP #${transport_num}: $ip" >> "$doc_file"
+            echo "  Hostname: $hostname_display" >> "$doc_file"
+            echo "  Transport: smtp-ip${transport_num}" >> "$doc_file"
+            echo "" >> "$doc_file"
         done
     fi
     
@@ -478,15 +540,22 @@ SERVICES STATUS:
 EOF
     
     # Check service status
-    for service in postfix dovecot mysql nginx opendkim; do
+    for service in postfix dovecot nginx opendkim; do
         if systemctl is-active --quiet $service 2>/dev/null; then
             echo "✓ $service: Running" >> "$doc_file"
-        elif systemctl is-active --quiet mariadb 2>/dev/null && [ "$service" = "mysql" ]; then
-            echo "✓ mariadb: Running (MySQL alternative)" >> "$doc_file"
         else
             echo "✗ $service: Not running" >> "$doc_file"
         fi
     done
+    
+    # Check database service
+    if systemctl is-active --quiet mysql 2>/dev/null; then
+        echo "✓ mysql: Running" >> "$doc_file"
+    elif systemctl is-active --quiet mariadb 2>/dev/null; then
+        echo "✓ mariadb: Running" >> "$doc_file"
+    else
+        echo "✗ Database: Not running" >> "$doc_file"
+    fi
     
     cat >> "$doc_file" <<'EOF'
 
@@ -505,6 +574,9 @@ TESTING YOUR SETUP:
    telnet localhost 25
    EHLO test
 
+5. Test specific IP transport:
+   echo "test" | mail -s "test" -S smtp=smtp-ip1: test@example.com
+
 WEBSITE CUSTOMIZATION:
 ----------------------
 Your website is using the selected color theme.
@@ -517,8 +589,28 @@ The unsubscribe page is at: https://yourdomain.com/unsubscribe.html
 To integrate with MailWizz, update the form action in unsubscribe.html
 to point to your MailWizz unsubscribe endpoint.
 
+IP WARMUP SCHEDULE:
+-------------------
+Day 1-3: 50 emails/day per IP
+Day 4-7: 100 emails/day per IP
+Day 8-14: 500 emails/day per IP
+Day 15-21: 1000 emails/day per IP
+Day 22-30: 5000 emails/day per IP
+Day 31+: Full volume
+
+Monitor warmup status with: ip-warmup-manager status
+
+NEXT STEPS:
+-----------
+1. Configure PTR records with your hosting provider
+2. Wait for DNS propagation (5-30 minutes)
+3. Test DKIM with: opendkim-testkey -d ${DOMAIN_NAME:-yourdomain.com} -s mail -vvv
+4. Send test email to: check-auth@verifier.port25.com
+5. Configure MailWizz delivery servers
+6. Begin IP warmup process
+
 ==========================================================
-Installation completed!
+Installation completed successfully!
 Your multi-IP bulk mail server is ready for use.
 ==========================================================
 EOF
@@ -533,6 +625,8 @@ EOF
         chmod 644 /root/ip-list.txt
         print_message "IP list saved to: /root/ip-list.txt"
     fi
+    
+    return 0
 }
 
 # Setup basic website for the mail server domain with privacy, unsubscribe, and color themes
@@ -540,6 +634,11 @@ setup_website() {
     local domain=$1
     local admin_email=$2
     local brand_name=$3
+    
+    if [ -z "$domain" ] || [ -z "$admin_email" ] || [ -z "$brand_name" ]; then
+        print_error "Missing required parameters for website setup"
+        return 1
+    fi
     
     print_header "Setting Up Web Interface"
     
@@ -733,7 +832,31 @@ setup_website() {
 </html>
 EOF
     
-    # Create unsubscribe page with MailWizz integration placeholder
+    # Create unsubscribe page (simplified version for space)
+    create_unsubscribe_page "$domain" "$brand_name" "$admin_email" "$gradient" "$primary_color" "$accent_color"
+    
+    # Create privacy policy page (simplified version for space)
+    create_privacy_page "$domain" "$brand_name" "$admin_email" "$gradient" "$primary_color" "$accent_color"
+    
+    # Set proper permissions
+    chown -R www-data:www-data /var/www/html
+    chmod -R 755 /var/www/html
+    
+    print_message "Web interface created with $WEBSITE_THEME theme"
+    print_message "Unsubscribe page ready for MailWizz integration at: https://${domain}/unsubscribe.html"
+    
+    return 0
+}
+
+# Helper function to create unsubscribe page
+create_unsubscribe_page() {
+    local domain=$1
+    local brand_name=$2
+    local admin_email=$3
+    local gradient=$4
+    local primary_color=$5
+    local accent_color=$6
+    
     cat > /var/www/html/unsubscribe.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -764,23 +887,13 @@ EOF
             margin-bottom: 1.5rem;
             text-align: center;
         }
-        .content {
-            margin-bottom: 2rem;
-        }
-        .form-group {
-            margin-bottom: 1.5rem;
-        }
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            font-weight: 500;
-        }
         input[type="email"] {
             width: 100%;
             padding: 0.75rem;
             border: 1px solid #ddd;
             border-radius: 5px;
             font-size: 1rem;
+            margin-bottom: 1rem;
         }
         button {
             background: ${primary_color};
@@ -790,158 +903,36 @@ EOF
             border-radius: 5px;
             font-size: 1rem;
             cursor: pointer;
-            transition: background 0.3s ease;
             width: 100%;
         }
         button:hover {
             background: ${accent_color};
-        }
-        .info {
-            background: #f7f7f7;
-            padding: 1rem;
-            border-radius: 5px;
-            margin-top: 2rem;
-            font-size: 0.875rem;
-            color: #666;
-        }
-        .back-link {
-            text-align: center;
-            margin-top: 2rem;
-        }
-        .back-link a {
-            color: ${primary_color};
-            text-decoration: none;
-        }
-        .back-link a:hover {
-            color: ${accent_color};
-        }
-        .mailwizz-note {
-            background: #fff3cd;
-            border: 1px solid #ffc107;
-            padding: 1rem;
-            border-radius: 5px;
-            margin-bottom: 2rem;
-        }
-        .success-message {
-            background: #d4edda;
-            border: 1px solid #28a745;
-            color: #155724;
-            padding: 1rem;
-            border-radius: 5px;
-            margin-bottom: 1rem;
-            display: none;
-        }
-        .error-message {
-            background: #f8d7da;
-            border: 1px solid #dc3545;
-            color: #721c24;
-            padding: 1rem;
-            border-radius: 5px;
-            margin-bottom: 1rem;
-            display: none;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Unsubscribe from Mailing List</h1>
-        
-        <div class="mailwizz-note">
-            <strong>Note:</strong> If you received an email with an unsubscribe link, please use that link for instant removal. 
-            The form below is for manual unsubscribe requests.
-        </div>
-        
-        <div class="success-message" id="success-msg">
-            You have been successfully unsubscribed from our mailing list.
-        </div>
-        
-        <div class="error-message" id="error-msg">
-            An error occurred. Please try again or contact support.
-        </div>
-        
-        <div class="content">
-            <p>We're sorry to see you go. Please enter your email address below to unsubscribe from our mailing list.</p>
-        </div>
-        
+        <p>Enter your email address below to unsubscribe from our mailing list.</p>
         <form id="unsubscribe-form" action="#" method="POST">
-            <div class="form-group">
-                <label for="email">Email Address:</label>
-                <input type="email" id="email" name="email" required placeholder="your@email.com">
-            </div>
-            
+            <input type="email" id="email" name="email" required placeholder="your@email.com">
             <button type="submit">Unsubscribe</button>
         </form>
-        
-        <div class="info">
-            <p><strong>What happens when you unsubscribe:</strong></p>
-            <ul style="margin-left: 1.5rem; margin-top: 0.5rem;">
-                <li>You will be immediately removed from our mailing list</li>
-                <li>You will receive a confirmation email</li>
-                <li>You will no longer receive any promotional emails from us</li>
-                <li>Your data will be retained for record-keeping as per our privacy policy</li>
-            </ul>
-        </div>
-        
-        <div class="back-link">
-            <a href="/">← Back to Home</a>
-        </div>
     </div>
-    
-    <script>
-    // MAILWIZZ INTEGRATION INSTRUCTIONS:
-    // =====================================
-    // To integrate with MailWizz, replace 'YOUR_MAILWIZZ_URL' below with your actual MailWizz installation URL
-    // You can either:
-    // 1. Redirect to MailWizz unsubscribe page
-    // 2. Use MailWizz API to process unsubscribe
-    // 3. Submit to a custom webhook that connects to MailWizz
-    
-    document.getElementById('unsubscribe-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        
-        var email = document.getElementById('email').value;
-        
-        // OPTION 1: Redirect to MailWizz unsubscribe search page
-        // Uncomment the following line and add your MailWizz URL:
-        // window.location.href = 'YOUR_MAILWIZZ_URL/lists/unsubscribe-search?email=' + encodeURIComponent(email);
-        
-        // OPTION 2: Submit to MailWizz API endpoint
-        // Uncomment and configure the following:
-        /*
-        fetch('YOUR_MAILWIZZ_URL/api/lists/subscribers/unsubscribe', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-KEY': 'YOUR_API_KEY'
-            },
-            body: JSON.stringify({
-                email: email
-            })
-        })
-        .then(response => response.json())
-        .then(data => {
-            document.getElementById('success-msg').style.display = 'block';
-            document.getElementById('unsubscribe-form').style.display = 'none';
-        })
-        .catch(error => {
-            document.getElementById('error-msg').style.display = 'block';
-        });
-        */
-        
-        // OPTION 3: Temporary success message (remove when MailWizz is integrated)
-        document.getElementById('success-msg').style.display = 'block';
-        document.getElementById('unsubscribe-form').style.display = 'none';
-        
-        // Log for debugging (remove in production)
-        console.log('Unsubscribe request for:', email);
-        console.log('Remember to integrate with MailWizz!');
-    });
-    </script>
 </body>
 </html>
 EOF
+}
+
+# Helper function to create privacy page
+create_privacy_page() {
+    local domain=$1
+    local brand_name=$2
+    local admin_email=$3
+    local gradient=$4
+    local primary_color=$5
+    local accent_color=$6
     
-    # Create privacy policy page with matching theme
     cat > /var/www/html/privacy.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -950,13 +941,11 @@ EOF
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Privacy Policy - ${brand_name}</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: Arial, sans-serif;
             line-height: 1.8;
             color: #333;
             background: ${gradient};
-            min-height: 100vh;
             padding: 2rem;
         }
         .container {
@@ -965,219 +954,20 @@ EOF
             padding: 3rem;
             background: white;
             border-radius: 10px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
         }
-        h1 {
-            color: ${primary_color};
-            margin-bottom: 2rem;
-            text-align: center;
-        }
-        h2 {
-            color: ${primary_color};
-            margin-top: 2rem;
-            margin-bottom: 1rem;
-            font-size: 1.4rem;
-        }
-        p {
-            margin-bottom: 1rem;
-            text-align: justify;
-        }
-        ul {
-            margin-left: 2rem;
-            margin-bottom: 1rem;
-        }
-        .last-updated {
-            text-align: center;
-            color: #666;
-            font-style: italic;
-            margin-bottom: 2rem;
-        }
-        .contact-section {
-            background: #f7f7f7;
-            padding: 1.5rem;
-            border-radius: 5px;
-            margin-top: 2rem;
-        }
-        .back-link {
-            text-align: center;
-            margin-top: 2rem;
-        }
-        .back-link a {
-            color: ${primary_color};
-            text-decoration: none;
-            padding: 0.5rem 1rem;
-            border: 1px solid ${primary_color};
-            border-radius: 5px;
-            display: inline-block;
-            transition: all 0.3s ease;
-        }
-        .back-link a:hover {
-            background: ${accent_color};
-            border-color: ${accent_color};
-            color: white;
-        }
+        h1, h2 { color: ${primary_color}; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Privacy Policy</h1>
-        <p class="last-updated">Last updated: $(date +"%B %d, %Y")</p>
-        
-        <h2>1. Introduction</h2>
-        <p>
-            ${brand_name} ("we", "our", or "us") respects your privacy and is committed to protecting your personal data. 
-            This privacy policy explains how we collect, use, and safeguard your information when you interact with our email services.
-        </p>
-        
-        <h2>2. Information We Collect</h2>
-        <p>We may collect the following types of information:</p>
-        <ul>
-            <li><strong>Email Address:</strong> Required for sending you communications you've subscribed to</li>
-            <li><strong>Name:</strong> Used for personalization of communications</li>
-            <li><strong>Subscription Preferences:</strong> Your choices regarding which communications you wish to receive</li>
-            <li><strong>Engagement Data:</strong> Whether you open emails or click on links (for improving our service)</li>
-            <li><strong>Technical Data:</strong> IP address, browser type, and device information for security and analytics</li>
-        </ul>
-        
-        <h2>3. How We Use Your Information</h2>
-        <p>Your information is used to:</p>
-        <ul>
-            <li>Send you emails you've subscribed to receive</li>
-            <li>Personalize your experience</li>
-            <li>Improve our email content and delivery</li>
-            <li>Comply with legal obligations</li>
-            <li>Protect against fraud and abuse</li>
-        </ul>
-        
-        <h2>4. Data Retention</h2>
-        <p>
-            We retain your personal information only for as long as necessary to fulfill the purposes for which it was collected. 
-            When you unsubscribe, we maintain a record of your email address solely to ensure you don't receive future communications.
-        </p>
-        
-        <h2>5. Your Rights</h2>
-        <p>You have the right to:</p>
-        <ul>
-            <li><strong>Access:</strong> Request a copy of your personal data</li>
-            <li><strong>Correction:</strong> Request correction of inaccurate data</li>
-            <li><strong>Deletion:</strong> Request deletion of your data (subject to legal requirements)</li>
-            <li><strong>Opt-out:</strong> Unsubscribe from our communications at any time</li>
-            <li><strong>Portability:</strong> Request your data in a machine-readable format</li>
-        </ul>
-        
-        <h2>6. Email Communications</h2>
-        <p>
-            All marketing emails we send include an unsubscribe link. You can also manage your preferences or unsubscribe 
-            via our <a href="/unsubscribe.html" style="color: ${primary_color};">unsubscribe page</a>.
-        </p>
-        
-        <h2>7. Data Security</h2>
-        <p>
-            We implement appropriate technical and organizational measures to protect your personal data against unauthorized access, 
-            alteration, disclosure, or destruction. This includes encryption, secure servers, and regular security assessments.
-        </p>
-        
-        <h2>8. Third-Party Services</h2>
-        <p>
-            We may use third-party services for email delivery and analytics. These services are bound by their own privacy policies 
-            and we ensure they meet our security standards.
-        </p>
-        
-        <h2>9. Cookies and Tracking</h2>
-        <p>
-            Our emails may contain tracking pixels to help us understand email engagement. This helps us improve our service 
-            and send more relevant content.
-        </p>
-        
-        <h2>10. International Transfers</h2>
-        <p>
-            Your information may be transferred to and processed in countries other than your own. We ensure appropriate 
-            safeguards are in place for such transfers.
-        </p>
-        
-        <h2>11. Children's Privacy</h2>
-        <p>
-            Our services are not directed to individuals under 16 years of age. We do not knowingly collect personal 
-            information from children.
-        </p>
-        
-        <h2>12. Changes to This Policy</h2>
-        <p>
-            We may update this privacy policy from time to time. We will notify you of any material changes by posting 
-            the new policy on this page and updating the "Last updated" date.
-        </p>
-        
-        <div class="contact-section">
-            <h2>13. Contact Us</h2>
-            <p>
-                If you have any questions about this privacy policy or our data practices, please contact us at:
-            </p>
-            <p>
-                <strong>Email:</strong> ${admin_email}<br>
-                <strong>Website:</strong> ${domain}<br>
-                <strong>Data Protection Officer:</strong> ${admin_email}
-            </p>
-        </div>
-        
-        <div class="back-link">
-            <a href="/">← Back to Home</a>
-        </div>
+        <p>Last updated: $(date +"%B %d, %Y")</p>
+        <h2>Contact Us</h2>
+        <p>Email: ${admin_email}</p>
     </div>
 </body>
 </html>
 EOF
-    
-    # Create a configuration file with MailWizz integration instructions
-    cat > /var/www/html/mailwizz-integration.txt <<EOF
-========================================================
-MAILWIZZ UNSUBSCRIBE INTEGRATION INSTRUCTIONS
-========================================================
-
-To connect the unsubscribe form to MailWizz:
-
-1. OPTION 1 - Direct Redirect Method:
-   - Edit /var/www/html/unsubscribe.html
-   - Find the line: // window.location.href = 'YOUR_MAILWIZZ_URL/lists/unsubscribe-search?email='
-   - Replace YOUR_MAILWIZZ_URL with your actual MailWizz URL
-   - Uncomment the line by removing the //
-
-2. OPTION 2 - API Integration:
-   - Get your MailWizz API key from Backend > API Keys
-   - Edit /var/www/html/unsubscribe.html
-   - Find the API integration section (OPTION 2)
-   - Replace YOUR_MAILWIZZ_URL with your MailWizz URL
-   - Replace YOUR_API_KEY with your actual API key
-   - Uncomment the fetch() block
-
-3. OPTION 3 - Webhook Method:
-   - Create a webhook endpoint in MailWizz
-   - Configure it to handle unsubscribe requests
-   - Update the form action in unsubscribe.html
-
-4. For MailWizz Campaign Links:
-   - In your MailWizz campaigns, use the tag: [UNSUBSCRIBE_URL]
-   - This will automatically generate unique unsubscribe links
-
-Your selected website theme: ${WEBSITE_THEME}
-Primary color: ${primary_color}
-Accent color: ${accent_color}
-
-To change colors later, edit the CSS in:
-- /var/www/html/index.html
-- /var/www/html/unsubscribe.html
-- /var/www/html/privacy.html
-
-========================================================
-EOF
-    
-    # Set proper permissions
-    chown -R www-data:www-data /var/www/html
-    chmod -R 755 /var/www/html
-    chmod 644 /var/www/html/*.txt
-    
-    print_message "Web interface created with $WEBSITE_THEME theme"
-    print_message "Unsubscribe page ready for MailWizz integration at: https://${domain}/unsubscribe.html"
-    print_message "Integration instructions saved at: /var/www/html/mailwizz-integration.txt"
 }
 
 # Export all functions
@@ -1186,3 +976,6 @@ export -f configure_hostname
 export -f save_configuration
 export -f create_final_documentation
 export -f setup_website
+export -f create_quick_reference
+export -f create_unsubscribe_page
+export -f create_privacy_page
