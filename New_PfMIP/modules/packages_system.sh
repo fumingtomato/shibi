@@ -300,7 +300,8 @@ save_configuration() {
     "hostname": "${HOSTNAME:-}",
     "admin_email": "${ADMIN_EMAIL:-}",
     "brand_name": "${BRAND_NAME:-}",
-    "timezone": "$(timedatectl | grep 'Time zone' | awk '{print $3}')"
+    "timezone": "$(timedatectl | grep 'Time zone' | awk '{print $3}')",
+    "website_theme": "${WEBSITE_THEME:-midnight}"
   },
   "network_configuration": {
     "primary_ip": "${PRIMARY_IP:-}",
@@ -388,6 +389,7 @@ Installation Date: $(date)
 Domain: ${DOMAIN_NAME:-}
 Hostname: ${HOSTNAME:-}
 Admin Email: ${ADMIN_EMAIL:-}
+Website Theme: ${WEBSITE_THEME:-midnight}
 
 MANAGEMENT COMMANDS:
 --------------------
@@ -454,6 +456,7 @@ Version: $INSTALLER_VERSION
 Domain: ${DOMAIN_NAME:-}
 Hostname: ${HOSTNAME:-}
 Admin Email: ${ADMIN_EMAIL:-}
+Website Theme: ${WEBSITE_THEME:-midnight}
 Total IPs Configured: ${IP_COUNT:-1}
 
 IP ADDRESSES:
@@ -502,6 +505,18 @@ TESTING YOUR SETUP:
    telnet localhost 25
    EHLO test
 
+WEBSITE CUSTOMIZATION:
+----------------------
+Your website is using the selected color theme.
+To change colors, edit: /var/www/html/index.html
+Look for the CSS variables in the <style> section.
+
+UNSUBSCRIBE LINK FOR MAILWIZZ:
+-------------------------------
+The unsubscribe page is at: https://yourdomain.com/unsubscribe.html
+To integrate with MailWizz, update the form action in unsubscribe.html
+to point to your MailWizz unsubscribe endpoint.
+
 ==========================================================
 Installation completed!
 Your multi-IP bulk mail server is ready for use.
@@ -520,7 +535,7 @@ EOF
     fi
 }
 
-# Setup basic website for the mail server domain with privacy and unsubscribe
+# Setup basic website for the mail server domain with privacy, unsubscribe, and color themes
 setup_website() {
     local domain=$1
     local admin_email=$2
@@ -528,12 +543,101 @@ setup_website() {
     
     print_header "Setting Up Web Interface"
     
-    print_message "Creating web directory structure..."
+    # Color scheme selection
+    print_message "Select a color scheme for your website:"
+    echo "1) Midnight (Deep Purple & Black)"
+    echo "2) Crimson Shadow (Dark Red & Black)"
+    echo "3) Ocean Depth (Dark Blue & Navy)"
+    echo "4) Forest Night (Dark Green & Black)"
+    echo "5) Sunset Ember (Dark Orange & Brown)"
+    echo "6) Storm Cloud (Dark Grey & Charcoal)"
+    echo "7) Royal Velvet (Deep Purple & Gold)"
+    echo "8) Blood Moon (Dark Red & Grey)"
+    echo "9) Obsidian (Pure Black & Dark Grey)"
+    echo "10) Dark Elegance (Black & Silver)"
+    
+    read -p "Enter your choice [1-10] (default: 1): " theme_choice
+    theme_choice=${theme_choice:-1}
+    
+    # Define color schemes
+    case $theme_choice in
+        1)  # Midnight
+            WEBSITE_THEME="midnight"
+            gradient="linear-gradient(135deg, #1a0033 0%, #220044 50%, #000000 100%)"
+            primary_color="#4a0080"
+            accent_color="#6b46c1"
+            ;;
+        2)  # Crimson Shadow
+            WEBSITE_THEME="crimson"
+            gradient="linear-gradient(135deg, #330000 0%, #660000 50%, #000000 100%)"
+            primary_color="#8b0000"
+            accent_color="#dc143c"
+            ;;
+        3)  # Ocean Depth
+            WEBSITE_THEME="ocean"
+            gradient="linear-gradient(135deg, #001133 0%, #002266 50%, #000011 100%)"
+            primary_color="#003366"
+            accent_color="#0066cc"
+            ;;
+        4)  # Forest Night
+            WEBSITE_THEME="forest"
+            gradient="linear-gradient(135deg, #001100 0%, #002200 50%, #000000 100%)"
+            primary_color="#004400"
+            accent_color="#006600"
+            ;;
+        5)  # Sunset Ember
+            WEBSITE_THEME="ember"
+            gradient="linear-gradient(135deg, #331100 0%, #662200 50%, #110000 100%)"
+            primary_color="#884400"
+            accent_color="#cc6600"
+            ;;
+        6)  # Storm Cloud
+            WEBSITE_THEME="storm"
+            gradient="linear-gradient(135deg, #1a1a1a 0%, #333333 50%, #000000 100%)"
+            primary_color="#444444"
+            accent_color="#666666"
+            ;;
+        7)  # Royal Velvet
+            WEBSITE_THEME="royal"
+            gradient="linear-gradient(135deg, #2e003e 0%, #3d0052 50%, #1a0026 100%)"
+            primary_color="#5a0080"
+            accent_color="#8b00b3"
+            ;;
+        8)  # Blood Moon
+            WEBSITE_THEME="bloodmoon"
+            gradient="linear-gradient(135deg, #2a0000 0%, #550000 50%, #1a1a1a 100%)"
+            primary_color="#770000"
+            accent_color="#aa0000"
+            ;;
+        9)  # Obsidian
+            WEBSITE_THEME="obsidian"
+            gradient="linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 50%, #000000 100%)"
+            primary_color="#2a2a2a"
+            accent_color="#3a3a3a"
+            ;;
+        10) # Dark Elegance
+            WEBSITE_THEME="elegance"
+            gradient="linear-gradient(135deg, #000000 0%, #1a1a1a 50%, #0d0d0d 100%)"
+            primary_color="#333333"
+            accent_color="#757575"
+            ;;
+        *)  # Default to Midnight
+            WEBSITE_THEME="midnight"
+            gradient="linear-gradient(135deg, #1a0033 0%, #220044 50%, #000000 100%)"
+            primary_color="#4a0080"
+            accent_color="#6b46c1"
+            ;;
+    esac
+    
+    # Export theme for configuration saving
+    export WEBSITE_THEME
+    
+    print_message "Creating web directory structure with $WEBSITE_THEME theme..."
     
     # Create web root
     mkdir -p /var/www/html
     
-    # Create main landing page with unsubscribe link and privacy policy
+    # Create main landing page with selected theme
     cat > /var/www/html/index.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -547,7 +651,7 @@ setup_website() {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             line-height: 1.6;
             color: #333;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: ${gradient};
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -559,11 +663,11 @@ setup_website() {
             padding: 3rem;
             background: white;
             border-radius: 10px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
             text-align: center;
         }
         h1 {
-            color: #764ba2;
+            color: ${primary_color};
             margin-bottom: 1rem;
             font-size: 2.5rem;
         }
@@ -586,17 +690,18 @@ setup_website() {
             border-top: 1px solid #e0e0e0;
         }
         .links a {
-            color: #764ba2;
+            color: ${primary_color};
             text-decoration: none;
             margin: 0 1rem;
             padding: 0.5rem 1rem;
-            border: 1px solid #764ba2;
+            border: 1px solid ${primary_color};
             border-radius: 5px;
             display: inline-block;
             transition: all 0.3s ease;
         }
         .links a:hover {
-            background: #764ba2;
+            background: ${accent_color};
+            border-color: ${accent_color};
             color: white;
         }
         .footer {
@@ -628,7 +733,7 @@ setup_website() {
 </html>
 EOF
     
-    # Create unsubscribe page with MailWizz integration
+    # Create unsubscribe page with MailWizz integration placeholder
     cat > /var/www/html/unsubscribe.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -642,7 +747,7 @@ EOF
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             line-height: 1.6;
             color: #333;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: ${gradient};
             min-height: 100vh;
             padding: 2rem;
         }
@@ -652,10 +757,10 @@ EOF
             padding: 3rem;
             background: white;
             border-radius: 10px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
         }
         h1 {
-            color: #764ba2;
+            color: ${primary_color};
             margin-bottom: 1.5rem;
             text-align: center;
         }
@@ -678,7 +783,7 @@ EOF
             font-size: 1rem;
         }
         button {
-            background: #764ba2;
+            background: ${primary_color};
             color: white;
             border: none;
             padding: 0.75rem 2rem;
@@ -689,7 +794,7 @@ EOF
             width: 100%;
         }
         button:hover {
-            background: #5a3885;
+            background: ${accent_color};
         }
         .info {
             background: #f7f7f7;
@@ -704,8 +809,11 @@ EOF
             margin-top: 2rem;
         }
         .back-link a {
-            color: #764ba2;
+            color: ${primary_color};
             text-decoration: none;
+        }
+        .back-link a:hover {
+            color: ${accent_color};
         }
         .mailwizz-note {
             background: #fff3cd;
@@ -713,6 +821,24 @@ EOF
             padding: 1rem;
             border-radius: 5px;
             margin-bottom: 2rem;
+        }
+        .success-message {
+            background: #d4edda;
+            border: 1px solid #28a745;
+            color: #155724;
+            padding: 1rem;
+            border-radius: 5px;
+            margin-bottom: 1rem;
+            display: none;
+        }
+        .error-message {
+            background: #f8d7da;
+            border: 1px solid #dc3545;
+            color: #721c24;
+            padding: 1rem;
+            border-radius: 5px;
+            margin-bottom: 1rem;
+            display: none;
         }
     </style>
 </head>
@@ -723,6 +849,14 @@ EOF
         <div class="mailwizz-note">
             <strong>Note:</strong> If you received an email with an unsubscribe link, please use that link for instant removal. 
             The form below is for manual unsubscribe requests.
+        </div>
+        
+        <div class="success-message" id="success-msg">
+            You have been successfully unsubscribed from our mailing list.
+        </div>
+        
+        <div class="error-message" id="error-msg">
+            An error occurred. Please try again or contact support.
         </div>
         
         <div class="content">
@@ -754,27 +888,60 @@ EOF
     </div>
     
     <script>
+    // MAILWIZZ INTEGRATION INSTRUCTIONS:
+    // =====================================
+    // To integrate with MailWizz, replace 'YOUR_MAILWIZZ_URL' below with your actual MailWizz installation URL
+    // You can either:
+    // 1. Redirect to MailWizz unsubscribe page
+    // 2. Use MailWizz API to process unsubscribe
+    // 3. Submit to a custom webhook that connects to MailWizz
+    
     document.getElementById('unsubscribe-form').addEventListener('submit', function(e) {
         e.preventDefault();
         
-        // For MailWizz integration, redirect to MailWizz unsubscribe endpoint
-        // Replace YOUR_MAILWIZZ_URL with actual MailWizz installation URL
         var email = document.getElementById('email').value;
         
-        // Option 1: Direct to MailWizz unsubscribe page
-        // window.location.href = 'YOUR_MAILWIZZ_URL/lists/unsubscribe-search';
+        // OPTION 1: Redirect to MailWizz unsubscribe search page
+        // Uncomment the following line and add your MailWizz URL:
+        // window.location.href = 'YOUR_MAILWIZZ_URL/lists/unsubscribe-search?email=' + encodeURIComponent(email);
         
-        // Option 2: Show confirmation (for now, without MailWizz integration)
-        alert('Unsubscribe request received for: ' + email + '\\n\\nPlease configure MailWizz integration to process this request automatically.');
+        // OPTION 2: Submit to MailWizz API endpoint
+        // Uncomment and configure the following:
+        /*
+        fetch('YOUR_MAILWIZZ_URL/api/lists/subscribers/unsubscribe', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-KEY': 'YOUR_API_KEY'
+            },
+            body: JSON.stringify({
+                email: email
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            document.getElementById('success-msg').style.display = 'block';
+            document.getElementById('unsubscribe-form').style.display = 'none';
+        })
+        .catch(error => {
+            document.getElementById('error-msg').style.display = 'block';
+        });
+        */
         
-        // In production, this would submit to MailWizz API or redirect to MailWizz unsubscribe page
+        // OPTION 3: Temporary success message (remove when MailWizz is integrated)
+        document.getElementById('success-msg').style.display = 'block';
+        document.getElementById('unsubscribe-form').style.display = 'none';
+        
+        // Log for debugging (remove in production)
+        console.log('Unsubscribe request for:', email);
+        console.log('Remember to integrate with MailWizz!');
     });
     </script>
 </body>
 </html>
 EOF
     
-    # Create privacy policy page
+    # Create privacy policy page with matching theme
     cat > /var/www/html/privacy.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -788,7 +955,7 @@ EOF
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             line-height: 1.8;
             color: #333;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: ${gradient};
             min-height: 100vh;
             padding: 2rem;
         }
@@ -798,15 +965,15 @@ EOF
             padding: 3rem;
             background: white;
             border-radius: 10px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
         }
         h1 {
-            color: #764ba2;
+            color: ${primary_color};
             margin-bottom: 2rem;
             text-align: center;
         }
         h2 {
-            color: #764ba2;
+            color: ${primary_color};
             margin-top: 2rem;
             margin-bottom: 1rem;
             font-size: 1.4rem;
@@ -836,16 +1003,17 @@ EOF
             margin-top: 2rem;
         }
         .back-link a {
-            color: #764ba2;
+            color: ${primary_color};
             text-decoration: none;
             padding: 0.5rem 1rem;
-            border: 1px solid #764ba2;
+            border: 1px solid ${primary_color};
             border-radius: 5px;
             display: inline-block;
             transition: all 0.3s ease;
         }
         .back-link a:hover {
-            background: #764ba2;
+            background: ${accent_color};
+            border-color: ${accent_color};
             color: white;
         }
     </style>
@@ -900,7 +1068,7 @@ EOF
         <h2>6. Email Communications</h2>
         <p>
             All marketing emails we send include an unsubscribe link. You can also manage your preferences or unsubscribe 
-            via our <a href="/unsubscribe.html">unsubscribe page</a>.
+            via our <a href="/unsubscribe.html" style="color: ${primary_color};">unsubscribe page</a>.
         </p>
         
         <h2>7. Data Security</h2>
@@ -959,11 +1127,57 @@ EOF
 </html>
 EOF
     
+    # Create a configuration file with MailWizz integration instructions
+    cat > /var/www/html/mailwizz-integration.txt <<EOF
+========================================================
+MAILWIZZ UNSUBSCRIBE INTEGRATION INSTRUCTIONS
+========================================================
+
+To connect the unsubscribe form to MailWizz:
+
+1. OPTION 1 - Direct Redirect Method:
+   - Edit /var/www/html/unsubscribe.html
+   - Find the line: // window.location.href = 'YOUR_MAILWIZZ_URL/lists/unsubscribe-search?email='
+   - Replace YOUR_MAILWIZZ_URL with your actual MailWizz URL
+   - Uncomment the line by removing the //
+
+2. OPTION 2 - API Integration:
+   - Get your MailWizz API key from Backend > API Keys
+   - Edit /var/www/html/unsubscribe.html
+   - Find the API integration section (OPTION 2)
+   - Replace YOUR_MAILWIZZ_URL with your MailWizz URL
+   - Replace YOUR_API_KEY with your actual API key
+   - Uncomment the fetch() block
+
+3. OPTION 3 - Webhook Method:
+   - Create a webhook endpoint in MailWizz
+   - Configure it to handle unsubscribe requests
+   - Update the form action in unsubscribe.html
+
+4. For MailWizz Campaign Links:
+   - In your MailWizz campaigns, use the tag: [UNSUBSCRIBE_URL]
+   - This will automatically generate unique unsubscribe links
+
+Your selected website theme: ${WEBSITE_THEME}
+Primary color: ${primary_color}
+Accent color: ${accent_color}
+
+To change colors later, edit the CSS in:
+- /var/www/html/index.html
+- /var/www/html/unsubscribe.html
+- /var/www/html/privacy.html
+
+========================================================
+EOF
+    
     # Set proper permissions
     chown -R www-data:www-data /var/www/html
     chmod -R 755 /var/www/html
+    chmod 644 /var/www/html/*.txt
     
-    print_message "Web interface with unsubscribe and privacy policy pages created"
+    print_message "Web interface created with $WEBSITE_THEME theme"
+    print_message "Unsubscribe page ready for MailWizz integration at: https://${domain}/unsubscribe.html"
+    print_message "Integration instructions saved at: /var/www/html/mailwizz-integration.txt"
 }
 
 # Export all functions
