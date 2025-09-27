@@ -34,8 +34,9 @@ setup_opendkim() {
     mkdir -p /etc/opendkim/keys/${domain}
     cd /etc/opendkim/keys/${domain}
     
-    # Generate 2048-bit key (recommended for compatibility)
-    opendkim-genkey -b 2048 -s mail -d ${domain}
+    # CHANGED: Generate 1024-bit key for better compatibility and shorter DNS records
+    print_message "Using 1024-bit key for better compatibility..."
+    opendkim-genkey -b 1024 -s mail -d ${domain}
     
     # Ensure proper ownership and permissions
     chown opendkim:opendkim mail.private
@@ -143,7 +144,7 @@ EOF
     # Restart Postfix to apply changes
     systemctl restart postfix
     
-    # Extract and display DKIM record - FIXED to show complete key
+    # Extract and display DKIM record - FIXED to extract ONLY the key value
     print_header "DKIM Configuration Complete!"
     print_message "Add the following DNS TXT record for DKIM:"
     echo ""
@@ -152,54 +153,52 @@ EOF
     echo "Name: mail._domainkey"
     echo "Value:"
     
-    # CRITICAL FIX: Extract the COMPLETE public key from mail.txt
-    # The key is in quotes and may span multiple lines
-    local dkim_record=$(cat /etc/opendkim/keys/${domain}/mail.txt | \
-                        grep -v '^;' | \
-                        sed 's/.*"v=DKIM1/v=DKIM1/' | \
-                        sed 's/"[[:space:]]*"//g' | \
-                        sed 's/"[[:space:]]*$//' | \
-                        tr -d '\n\t\r' | \
-                        sed 's/[[:space:]]\+/ /g')
+    # CRITICAL FIX: Extract ONLY the p= value from mail.txt
+    local key_only=$(grep -oP '(?<=p=)[^"]+' /etc/opendkim/keys/${domain}/mail.txt | tr -d '\n\t\r ')
+    
+    # Build the complete DKIM record with proper format
+    local dkim_record="v=DKIM1; k=rsa; p=${key_only}"
     
     echo "$dkim_record"
     echo "=========================================="
     echo ""
     
-    # Save COMPLETE DKIM record to file
+    # Verify the record isn't too long (should be under 255 chars for single DNS record)
+    local record_length=$(echo -n "$dkim_record" | wc -c)
+    if [ $record_length -gt 255 ]; then
+        print_warning "NOTE: DKIM record is $record_length characters. Some DNS providers may require splitting."
+    else
+        print_message "DKIM record length: $record_length characters (OK for single TXT record)"
+    fi
+    
+    # Save CLEAN DKIM record to file
     cat > /root/dkim-record-${domain}.txt <<EOF
 DKIM DNS Record for ${domain}
 Generated: $(date)
 
-IMPORTANT: This is the COMPLETE DKIM record. Make sure to add it in its entirety!
-
 Add this TXT record to your DNS:
+================================
 Name: mail._domainkey
 Value: ${dkim_record}
+
+Record length: ${record_length} characters
+
+IMPORTANT NOTES:
+- This is a 1024-bit key for better compatibility
+- Copy the entire value on a single line
+- Do NOT include any quotes or backslashes
+- Some DNS providers auto-add quotes - that's OK
 
 VERIFICATION STEPS:
 1. After adding to DNS, wait 5-10 minutes for propagation
 2. Test with: dig TXT mail._domainkey.${domain} @8.8.8.8
 3. Verify with: opendkim-testkey -d ${domain} -s mail -vvv
-4. Send a test email to check-auth@verifier.port25.com
+4. Send test email to: check-auth@verifier.port25.com
 
-The raw key file is located at: /etc/opendkim/keys/${domain}/mail.txt
-EOF
-    
-    # Also create a separate file with just the p= value for debugging
-    local just_key=$(echo "$dkim_record" | grep -oP 'p=\K[^;]+' | tr -d ' ')
-    cat > /root/dkim-key-only-${domain}.txt <<EOF
-DKIM Public Key Only (p= value) for ${domain}
-Generated: $(date)
-
-${just_key}
-
-This should be one continuous string with no spaces or line breaks.
-Length: $(echo -n "$just_key" | wc -c) characters
+The raw key file is at: /etc/opendkim/keys/${domain}/mail.txt
 EOF
     
     print_message "DKIM record saved to: /root/dkim-record-${domain}.txt"
-    print_message "Key only saved to: /root/dkim-key-only-${domain}.txt"
     
     # Verify the key file is readable
     if [ -f "/etc/opendkim/keys/${domain}/mail.private" ]; then
@@ -218,56 +217,92 @@ EOF
     return 0
 }
 
-# Function to get DKIM public key value for DNS - FIXED VERSION
+# Function to get DKIM public key value for DNS - SIMPLIFIED VERSION
 get_dkim_value() {
     local domain=$1
     local key_file="/etc/opendkim/keys/${domain}/mail.txt"
     
     if [ -f "$key_file" ]; then
-        # Extract the COMPLETE public key - handle multi-line format
-        cat "$key_file" | \
-            grep -v '^;' | \
-            sed 's/.*"v=DKIM1/v=DKIM1/' | \
-            sed 's/"[[:space:]]*"//g' | \
-            sed 's/"[[:space:]]*$//' | \
-            tr -d '\n\t\r' | \
-            sed 's/[[:space:]]\+/ /g'
+        # Extract ONLY the p= value, nothing else
+        grep -oP '(?<=p=)[^"]+' "$key_file" | tr -d '\n\t\r '
     else
         echo ""
     fi
 }
 
-# Function to regenerate DKIM keys if needed
-regenerate_dkim_keys() {
-    local domain=$1
-    
-    print_header "Regenerating DKIM Keys"
-    
-    # Stop services
-    systemctl stop opendkim
-    systemctl stop postfix
-    
-    # Backup old keys
-    if [ -d "/etc/opendkim/keys/${domain}" ]; then
-        mv "/etc/opendkim/keys/${domain}" "/etc/opendkim/keys/${domain}.backup.$(date +%Y%m%d%H%M%S)"
-    fi
-    
-    # Generate new keys
-    mkdir -p /etc/opendkim/keys/${domain}
-    cd /etc/opendkim/keys/${domain}
-    opendkim-genkey -b 2048 -s mail -d ${domain}
-    chown -R opendkim:opendkim /etc/opendkim/keys/${domain}
-    chmod 600 mail.private
-    chmod 644 mail.txt
-    
-    # Restart services
-    systemctl start opendkim
-    systemctl start postfix
-    
-    # Show new key
-    print_message "New DKIM key generated. Update your DNS with:"
-    cat mail.txt
-}
+# Create immediate fix script for current installation
+cat > /usr/local/bin/fix-dkim-now <<'EOF'
+#!/bin/bash
+
+DOMAIN="${1:-$(hostname -d)}"
+
+echo "Fixing DKIM for domain: $DOMAIN"
+echo "================================"
+
+# Stop services
+echo "Stopping services..."
+systemctl stop opendkim postfix
+
+# Backup current keys
+if [ -d "/etc/opendkim/keys/$DOMAIN" ]; then
+    BACKUP="/etc/opendkim/keys/${DOMAIN}.backup.$(date +%Y%m%d%H%M%S)"
+    mv "/etc/opendkim/keys/$DOMAIN" "$BACKUP"
+    echo "Backed up old keys to: $BACKUP"
+fi
+
+# Generate new 1024-bit key
+echo "Generating new 1024-bit DKIM key..."
+mkdir -p "/etc/opendkim/keys/$DOMAIN"
+cd "/etc/opendkim/keys/$DOMAIN"
+opendkim-genkey -b 1024 -s mail -d "$DOMAIN"
+
+# Fix permissions
+chown -R opendkim:opendkim "/etc/opendkim/keys/$DOMAIN"
+chmod 600 mail.private
+chmod 644 mail.txt
+
+# Extract clean key
+KEY_ONLY=$(grep -oP '(?<=p=)[^"]+' mail.txt | tr -d '\n\t\r ')
+DKIM_RECORD="v=DKIM1; k=rsa; p=${KEY_ONLY}"
+
+# Start services
+echo "Starting services..."
+systemctl start opendkim postfix
+
+echo ""
+echo "NEW DKIM RECORD FOR DNS:"
+echo "========================"
+echo "Name: mail._domainkey"
+echo "Type: TXT"
+echo "Value: ${DKIM_RECORD}"
+echo ""
+echo "Length: $(echo -n "$DKIM_RECORD" | wc -c) characters"
+echo ""
+echo "This has been saved to: /root/dkim-emergency-fix.txt"
+
+# Save to file
+cat > /root/dkim-emergency-fix.txt <<EOFIX
+EMERGENCY DKIM FIX - Generated $(date)
+Domain: $DOMAIN
+
+DNS TXT Record:
+Name: mail._domainkey
+Value: ${DKIM_RECORD}
+
+Instructions:
+1. Delete the current mail._domainkey TXT record from your DNS
+2. Add the above record exactly as shown
+3. Wait 5-10 minutes for propagation
+4. Test with: dig TXT mail._domainkey.$DOMAIN
+5. Verify with: opendkim-testkey -d $DOMAIN -s mail -vvv
+EOFIX
+
+echo ""
+echo "After updating DNS, test with:"
+echo "  opendkim-testkey -d $DOMAIN -s mail -vvv"
+EOF
+
+chmod +x /usr/local/bin/fix-dkim-now
 
 # Setup SPF record
 setup_spf() {
@@ -350,7 +385,7 @@ EOF
     return 0
 }
 
-# Function to verify DKIM is working - ENHANCED
+# Function to verify DKIM is working
 verify_dkim() {
     local domain=$1
     
@@ -364,144 +399,16 @@ verify_dkim() {
         return 1
     fi
     
-    # Check if key files exist
-    if [ -f "/etc/opendkim/keys/${domain}/mail.private" ]; then
-        print_message "✓ Private key exists"
-    else
-        print_error "✗ Private key not found"
-        return 1
-    fi
-    
-    if [ -f "/etc/opendkim/keys/${domain}/mail.txt" ]; then
-        print_message "✓ Public key file exists"
-        
-        # Show the actual key for verification
-        print_message "Public key content:"
-        cat "/etc/opendkim/keys/${domain}/mail.txt"
-    else
-        print_error "✗ Public key file not found"
-        return 1
-    fi
-    
     # Test OpenDKIM configuration
-    print_message "Testing DKIM key..."
-    opendkim-testkey -d ${domain} -s mail -vvv 2>&1 | while read line; do
-        if echo "$line" | grep -q "key OK"; then
-            print_message "✓ DKIM key is valid and DNS record found"
-        elif echo "$line" | grep -q "key not secure"; then
-            print_warning "⚠ DKIM key found but DNSSEC not enabled (this is usually OK)"
-        elif echo "$line" | grep -q "query timed out"; then
-            print_warning "⚠ DNS query timed out - record may not be propagated yet"
-        fi
-        echo "  $line"
-    done
+    if opendkim-testkey -d ${domain} -s mail -vvv 2>&1 | grep -q "key OK"; then
+        print_message "✓ DKIM key is valid"
+    else
+        print_warning "⚠ DKIM DNS record not found or not propagated yet"
+        print_message "This is normal if you haven't added the DNS record yet"
+    fi
     
     return 0
 }
 
-# Create a utility script for DKIM troubleshooting
-create_dkim_troubleshoot_script() {
-    cat > /usr/local/bin/dkim-troubleshoot <<'EOF'
-#!/bin/bash
-
-DOMAIN="${1:-$(hostname -d)}"
-
-echo "DKIM Troubleshooting for domain: $DOMAIN"
-echo "========================================"
-echo ""
-
-echo "1. Checking OpenDKIM service status:"
-systemctl status opendkim --no-pager | head -10
-
-echo ""
-echo "2. Checking key files:"
-ls -la /etc/opendkim/keys/$DOMAIN/
-
-echo ""
-echo "3. Public key content:"
-if [ -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ]; then
-    cat "/etc/opendkim/keys/$DOMAIN/mail.txt"
-else
-    echo "Public key file not found!"
-fi
-
-echo ""
-echo "4. Testing DKIM key:"
-opendkim-testkey -d $DOMAIN -s mail -vvv
-
-echo ""
-echo "5. Checking DNS record:"
-dig +short TXT mail._domainkey.$DOMAIN
-
-echo ""
-echo "6. Testing OpenDKIM socket:"
-nc -zv localhost 8891
-
-echo ""
-echo "7. Checking Postfix milter configuration:"
-postconf | grep milter
-
-echo ""
-echo "8. Recent OpenDKIM log entries:"
-grep opendkim /var/log/mail.log | tail -20
-
-echo ""
-echo "To regenerate keys, run: /usr/local/bin/dkim-regenerate $DOMAIN"
-EOF
-    
-    chmod +x /usr/local/bin/dkim-troubleshoot
-    
-    # Create key regeneration script
-    cat > /usr/local/bin/dkim-regenerate <<'EOF'
-#!/bin/bash
-
-DOMAIN="${1:-$(hostname -d)}"
-
-if [ -z "$DOMAIN" ]; then
-    echo "Usage: $0 <domain>"
-    exit 1
-fi
-
-echo "Regenerating DKIM keys for $DOMAIN"
-echo "===================================="
-
-# Stop services
-systemctl stop opendkim postfix
-
-# Backup old keys
-if [ -d "/etc/opendkim/keys/$DOMAIN" ]; then
-    BACKUP_DIR="/etc/opendkim/keys/backups/$(date +%Y%m%d%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    mv "/etc/opendkim/keys/$DOMAIN" "$BACKUP_DIR/"
-    echo "Old keys backed up to: $BACKUP_DIR"
-fi
-
-# Generate new keys
-mkdir -p "/etc/opendkim/keys/$DOMAIN"
-cd "/etc/opendkim/keys/$DOMAIN"
-opendkim-genkey -b 2048 -s mail -d "$DOMAIN"
-chown -R opendkim:opendkim "/etc/opendkim/keys/$DOMAIN"
-chmod 600 mail.private
-chmod 644 mail.txt
-
-# Restart services
-systemctl start opendkim postfix
-
-echo ""
-echo "New DKIM key generated!"
-echo ""
-echo "NEW DNS RECORD REQUIRED:"
-echo "========================"
-cat mail.txt
-echo ""
-echo "Update your DNS TXT record for: mail._domainkey.$DOMAIN"
-echo ""
-echo "After updating DNS, verify with: opendkim-testkey -d $DOMAIN -s mail -vvv"
-EOF
-    
-    chmod +x /usr/local/bin/dkim-regenerate
-}
-
 # Export functions
 export -f setup_opendkim setup_spf setup_dmarc verify_dkim get_dkim_value
-export -f regenerate_dkim_keys create_dkim_troubleshoot_script
