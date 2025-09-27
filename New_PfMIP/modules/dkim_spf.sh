@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# DKIM AND SPF CONFIGURATION MODULE
+# DKIM AND SPF CONFIGURATION MODULE - FIXED VERSION
 # Email authentication setup for deliverability
+# Fixed: Moved fix-dkim-now creation to separate function
 # =================================================================
 
 # Setup OpenDKIM for email authentication
@@ -214,7 +215,163 @@ EOF
         print_error "✗ OpenDKIM is not responding on port 8891"
     fi
     
+    # Create the DKIM fix utility (moved to separate function)
+    create_dkim_fix_utility "$domain"
+    
     return 0
+}
+
+# Create DKIM fix utility as a separate function
+create_dkim_fix_utility() {
+    local domain=${1:-$(hostname -d)}
+    
+    print_message "Creating DKIM fix utility..."
+    
+    cat > /usr/local/bin/fix-dkim-now <<'EOF'
+#!/bin/bash
+
+# DKIM Emergency Fix Utility
+# Regenerates DKIM keys with proper 1024-bit configuration
+
+DOMAIN="${1:-$(hostname -d)}"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${GREEN}DKIM Emergency Fix Utility${NC}"
+echo "================================"
+echo "Fixing DKIM for domain: $DOMAIN"
+echo ""
+
+# Check if running as root
+if [ "$(id -u)" != "0" ]; then
+    echo -e "${RED}Error: This script must be run as root${NC}"
+    exit 1
+fi
+
+# Validate domain format
+if [[ ! "$DOMAIN" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+    echo -e "${RED}Error: Invalid domain format: $DOMAIN${NC}"
+    exit 1
+fi
+
+# Stop services
+echo "Stopping services..."
+systemctl stop opendkim postfix
+
+# Backup current keys
+if [ -d "/etc/opendkim/keys/$DOMAIN" ]; then
+    BACKUP="/etc/opendkim/keys/${DOMAIN}.backup.$(date +%Y%m%d%H%M%S)"
+    mv "/etc/opendkim/keys/$DOMAIN" "$BACKUP"
+    echo -e "${YELLOW}Backed up old keys to: $BACKUP${NC}"
+fi
+
+# Generate new 1024-bit key
+echo "Generating new 1024-bit DKIM key..."
+mkdir -p "/etc/opendkim/keys/$DOMAIN"
+cd "/etc/opendkim/keys/$DOMAIN"
+
+# Generate the key
+opendkim-genkey -b 1024 -s mail -d "$DOMAIN"
+
+if [ ! -f "mail.private" ]; then
+    echo -e "${RED}Error: Failed to generate DKIM key${NC}"
+    exit 1
+fi
+
+# Fix permissions
+chown -R opendkim:opendkim "/etc/opendkim/keys/$DOMAIN"
+chmod 600 mail.private
+chmod 644 mail.txt
+
+# Update KeyTable
+echo "mail._domainkey.${DOMAIN} ${DOMAIN}:mail:/etc/opendkim/keys/${DOMAIN}/mail.private" > /etc/opendkim/KeyTable
+
+# Update SigningTable
+cat > /etc/opendkim/SigningTable <<EOSL
+*@${DOMAIN} mail._domainkey.${DOMAIN}
+*@*.${DOMAIN} mail._domainkey.${DOMAIN}
+EOSL
+
+# Update TrustedHosts if domain not present
+if ! grep -q "^${DOMAIN}$" /etc/opendkim/TrustedHosts 2>/dev/null; then
+    echo "${DOMAIN}" >> /etc/opendkim/TrustedHosts
+    echo "*.${DOMAIN}" >> /etc/opendkim/TrustedHosts
+fi
+
+# Set proper permissions
+chown opendkim:opendkim /etc/opendkim/KeyTable /etc/opendkim/SigningTable /etc/opendkim/TrustedHosts
+chmod 644 /etc/opendkim/KeyTable /etc/opendkim/SigningTable /etc/opendkim/TrustedHosts
+
+# Extract clean key
+KEY_ONLY=$(grep -oP '(?<=p=)[^"]+' mail.txt | tr -d '\n\t\r ')
+DKIM_RECORD="v=DKIM1; k=rsa; p=${KEY_ONLY}"
+
+# Calculate record length
+RECORD_LENGTH=$(echo -n "$DKIM_RECORD" | wc -c)
+
+# Start services
+echo "Starting services..."
+systemctl start opendkim
+sleep 2
+systemctl start postfix
+
+# Test OpenDKIM
+echo ""
+echo "Testing OpenDKIM..."
+if nc -zv localhost 8891 2>&1 | grep -q succeeded; then
+    echo -e "${GREEN}✓ OpenDKIM is listening on port 8891${NC}"
+else
+    echo -e "${RED}✗ OpenDKIM is not responding on port 8891${NC}"
+fi
+
+echo ""
+echo -e "${GREEN}NEW DKIM RECORD FOR DNS:${NC}"
+echo "========================"
+echo "Name: mail._domainkey"
+echo "Type: TXT"
+echo "Value: ${DKIM_RECORD}"
+echo ""
+echo "Length: ${RECORD_LENGTH} characters"
+
+if [ $RECORD_LENGTH -gt 255 ]; then
+    echo -e "${YELLOW}Warning: Record exceeds 255 characters. DNS provider may require splitting.${NC}"
+fi
+
+echo ""
+echo "This has been saved to: /root/dkim-emergency-fix.txt"
+
+# Save to file
+cat > /root/dkim-emergency-fix.txt <<EOFIX
+EMERGENCY DKIM FIX - Generated $(date)
+Domain: $DOMAIN
+
+DNS TXT Record:
+Name: mail._domainkey
+Value: ${DKIM_RECORD}
+
+Record Length: ${RECORD_LENGTH} characters
+
+Instructions:
+1. Delete the current mail._domainkey TXT record from your DNS
+2. Add the above record exactly as shown
+3. Wait 5-10 minutes for propagation
+4. Test with: dig TXT mail._domainkey.$DOMAIN
+5. Verify with: opendkim-testkey -d $DOMAIN -s mail -vvv
+EOFIX
+
+echo ""
+echo "After updating DNS, test with:"
+echo "  opendkim-testkey -d $DOMAIN -s mail -vvv"
+echo ""
+echo -e "${GREEN}DKIM fix completed successfully!${NC}"
+EOF
+    
+    chmod +x /usr/local/bin/fix-dkim-now
+    print_message "DKIM fix utility created at /usr/local/bin/fix-dkim-now"
 }
 
 # Function to get DKIM public key value for DNS - SIMPLIFIED VERSION
@@ -229,80 +386,6 @@ get_dkim_value() {
         echo ""
     fi
 }
-
-# Create immediate fix script for current installation
-cat > /usr/local/bin/fix-dkim-now <<'EOF'
-#!/bin/bash
-
-DOMAIN="${1:-$(hostname -d)}"
-
-echo "Fixing DKIM for domain: $DOMAIN"
-echo "================================"
-
-# Stop services
-echo "Stopping services..."
-systemctl stop opendkim postfix
-
-# Backup current keys
-if [ -d "/etc/opendkim/keys/$DOMAIN" ]; then
-    BACKUP="/etc/opendkim/keys/${DOMAIN}.backup.$(date +%Y%m%d%H%M%S)"
-    mv "/etc/opendkim/keys/$DOMAIN" "$BACKUP"
-    echo "Backed up old keys to: $BACKUP"
-fi
-
-# Generate new 1024-bit key
-echo "Generating new 1024-bit DKIM key..."
-mkdir -p "/etc/opendkim/keys/$DOMAIN"
-cd "/etc/opendkim/keys/$DOMAIN"
-opendkim-genkey -b 1024 -s mail -d "$DOMAIN"
-
-# Fix permissions
-chown -R opendkim:opendkim "/etc/opendkim/keys/$DOMAIN"
-chmod 600 mail.private
-chmod 644 mail.txt
-
-# Extract clean key
-KEY_ONLY=$(grep -oP '(?<=p=)[^"]+' mail.txt | tr -d '\n\t\r ')
-DKIM_RECORD="v=DKIM1; k=rsa; p=${KEY_ONLY}"
-
-# Start services
-echo "Starting services..."
-systemctl start opendkim postfix
-
-echo ""
-echo "NEW DKIM RECORD FOR DNS:"
-echo "========================"
-echo "Name: mail._domainkey"
-echo "Type: TXT"
-echo "Value: ${DKIM_RECORD}"
-echo ""
-echo "Length: $(echo -n "$DKIM_RECORD" | wc -c) characters"
-echo ""
-echo "This has been saved to: /root/dkim-emergency-fix.txt"
-
-# Save to file
-cat > /root/dkim-emergency-fix.txt <<EOFIX
-EMERGENCY DKIM FIX - Generated $(date)
-Domain: $DOMAIN
-
-DNS TXT Record:
-Name: mail._domainkey
-Value: ${DKIM_RECORD}
-
-Instructions:
-1. Delete the current mail._domainkey TXT record from your DNS
-2. Add the above record exactly as shown
-3. Wait 5-10 minutes for propagation
-4. Test with: dig TXT mail._domainkey.$DOMAIN
-5. Verify with: opendkim-testkey -d $DOMAIN -s mail -vvv
-EOFIX
-
-echo ""
-echo "After updating DNS, test with:"
-echo "  opendkim-testkey -d $DOMAIN -s mail -vvv"
-EOF
-
-chmod +x /usr/local/bin/fix-dkim-now
 
 # Setup SPF record - ENHANCED to include hostname for SPF_HELO_NONE fix
 setup_spf() {
@@ -366,7 +449,22 @@ Value: v=spf1 a -all
 
 This second record ensures your mail server's HELO hostname has SPF configured,
 which prevents the SPF_HELO_NONE warning in SpamAssassin.
+
+Additional hostname SPF records for numbered subdomains:
 EOF
+    
+    # Add SPF records for numbered subdomains if using multi-IP
+    if [ ! -z "${SUBDOMAIN}" ] && [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+        for ((i=2; i<=${#IP_ADDRESSES[@]}; i++)); do
+            local suffix=$(printf "%03d" $((i-1)))
+            local numbered_hostname="${SUBDOMAIN}${suffix}.${domain}"
+            cat >> /root/spf-record-${domain}.txt <<EOF
+
+Name: ${numbered_hostname}
+Value: v=spf1 a -all
+EOF
+        done
+    fi
     
     print_message "SPF records saved to: /root/spf-record-${domain}.txt"
     
@@ -380,7 +478,8 @@ setup_dmarc() {
     
     print_header "DMARC Configuration"
     
-    local dmarc_record="v=DMARC1; p=quarantine; rua=mailto:${email}; ruf=mailto:${email}; fo=1; adkim=r; aspf=r; pct=100; rf=afrf; ri=86400"
+    # Start with a monitoring-only policy for initial setup
+    local dmarc_record="v=DMARC1; p=none; rua=mailto:${email}; ruf=mailto:${email}; fo=1; adkim=r; aspf=r; pct=100; rf=afrf; ri=86400"
     
     print_message "Add the following DNS TXT record for DMARC:"
     echo ""
@@ -390,15 +489,59 @@ setup_dmarc() {
     echo "Value: ${dmarc_record}"
     echo "=========================================="
     echo ""
+    echo "NOTE: This DMARC policy is set to 'none' (monitoring only) for initial setup."
+    echo "After monitoring for a few days and confirming legitimate emails pass,"
+    echo "you can change 'p=none' to 'p=quarantine' or 'p=reject' for stronger protection."
+    echo ""
     
-    # Save DMARC record to file
+    # Save DMARC record to file with additional guidance
     cat > /root/dmarc-record-${domain}.txt <<EOF
 DMARC DNS Record for ${domain}
 Generated: $(date)
 
+INITIAL MONITORING POLICY:
+==========================
 Add this TXT record to your DNS:
 Name: _dmarc
 Value: ${dmarc_record}
+
+DMARC POLICY PROGRESSION:
+=========================
+1. Start with p=none (monitoring only) - CURRENT SETTING
+   Monitor reports for 1-2 weeks to understand your email flow
+
+2. Move to p=quarantine (quarantine failing emails)
+   v=DMARC1; p=quarantine; rua=mailto:${email}; ruf=mailto:${email}; fo=1; adkim=r; aspf=r; pct=50; rf=afrf; ri=86400
+   Start with pct=50 (50% of failing emails quarantined)
+
+3. Finally move to p=reject (reject failing emails)
+   v=DMARC1; p=reject; rua=mailto:${email}; ruf=mailto:${email}; fo=1; adkim=r; aspf=r; pct=100; rf=afrf; ri=86400
+   This provides maximum protection but requires proper SPF/DKIM setup
+
+FIELD EXPLANATIONS:
+===================
+- p=none/quarantine/reject: Policy for handling failures
+- rua=mailto:${email}: Aggregate reports destination
+- ruf=mailto:${email}: Forensic reports destination
+- fo=1: Generate forensic report on any failure
+- adkim=r: Relaxed DKIM alignment
+- aspf=r: Relaxed SPF alignment
+- pct=100: Percentage of messages to apply policy to
+- rf=afrf: Report format
+- ri=86400: Report interval (seconds)
+
+MONITORING DMARC:
+=================
+Consider using a DMARC monitoring service like:
+- dmarcian.com
+- valimail.com
+- agari.com
+- Or parse reports manually
+
+TESTING:
+========
+After adding the record, verify with:
+dig TXT _dmarc.${domain}
 EOF
     
     print_message "DMARC record saved to: /root/dmarc-record-${domain}.txt"
@@ -417,19 +560,106 @@ verify_dkim() {
         print_message "✓ OpenDKIM service is running"
     else
         print_error "✗ OpenDKIM service is not running"
+        systemctl start opendkim || return 1
+    fi
+    
+    # Check if key files exist
+    if [ -f "/etc/opendkim/keys/${domain}/mail.private" ]; then
+        print_message "✓ DKIM private key exists"
+    else
+        print_error "✗ DKIM private key not found"
+        return 1
+    fi
+    
+    # Test OpenDKIM socket
+    if nc -zv localhost 8891 2>&1 | grep -q succeeded; then
+        print_message "✓ OpenDKIM socket is listening"
+    else
+        print_error "✗ OpenDKIM socket not responding"
         return 1
     fi
     
     # Test OpenDKIM configuration
-    if opendkim-testkey -d ${domain} -s mail -vvv 2>&1 | grep -q "key OK"; then
-        print_message "✓ DKIM key is valid"
+    print_message "Testing DKIM key validity..."
+    opendkim-testkey -d ${domain} -s mail -vvv 2>&1 | while read line; do
+        if echo "$line" | grep -q "key OK"; then
+            print_message "✓ DKIM key is valid and DNS record is correct"
+        elif echo "$line" | grep -q "key not found"; then
+            print_warning "⚠ DKIM DNS record not found or not propagated yet"
+            print_message "This is normal if you haven't added the DNS record yet"
+        fi
+    done
+    
+    # Check Postfix integration
+    if postconf -h smtpd_milters | grep -q "8891"; then
+        print_message "✓ Postfix is configured to use OpenDKIM"
     else
-        print_warning "⚠ DKIM DNS record not found or not propagated yet"
-        print_message "This is normal if you haven't added the DNS record yet"
+        print_warning "⚠ Postfix may not be using OpenDKIM"
     fi
     
     return 0
 }
 
+# Create comprehensive DKIM testing script
+create_dkim_test_script() {
+    cat > /usr/local/bin/test-dkim <<'EOF'
+#!/bin/bash
+
+# Comprehensive DKIM Testing Script
+
+DOMAIN="${1:-$(hostname -d)}"
+
+echo "DKIM Configuration Test for $DOMAIN"
+echo "====================================="
+
+# Test 1: OpenDKIM Service
+echo -n "1. OpenDKIM service status: "
+if systemctl is-active --quiet opendkim; then
+    echo "✓ Running"
+else
+    echo "✗ Not running"
+fi
+
+# Test 2: Key files
+echo -n "2. DKIM key files: "
+if [ -f "/etc/opendkim/keys/$DOMAIN/mail.private" ]; then
+    echo "✓ Present"
+else
+    echo "✗ Missing"
+fi
+
+# Test 3: Socket connectivity
+echo -n "3. OpenDKIM socket (port 8891): "
+if nc -zv localhost 8891 2>&1 | grep -q succeeded; then
+    echo "✓ Listening"
+else
+    echo "✗ Not responding"
+fi
+
+# Test 4: DNS record
+echo "4. DNS TXT record check:"
+DNS_RESULT=$(dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 2>/dev/null)
+if [ ! -z "$DNS_RESULT" ]; then
+    echo "   ✓ DNS record found"
+    echo "   Record: $DNS_RESULT"
+else
+    echo "   ✗ DNS record not found"
+fi
+
+# Test 5: OpenDKIM key test
+echo "5. OpenDKIM key validation:"
+opendkim-testkey -d $DOMAIN -s mail -vvv 2>&1 | grep -E "key (OK|not found|bad)"
+
+# Test 6: Send test email
+echo ""
+echo "To complete testing, send an email to: check-auth@verifier.port25.com"
+echo "You will receive a report showing DKIM signature status."
+EOF
+    
+    chmod +x /usr/local/bin/test-dkim
+    print_message "DKIM test script created at /usr/local/bin/test-dkim"
+}
+
 # Export functions
 export -f setup_opendkim setup_spf setup_dmarc verify_dkim get_dkim_value
+export -f create_dkim_fix_utility create_dkim_test_script
