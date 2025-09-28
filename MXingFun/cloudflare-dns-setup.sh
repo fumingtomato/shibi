@@ -2,8 +2,9 @@
 
 # =================================================================
 # CLOUDFLARE DNS AUTOMATIC SETUP FOR MAIL SERVER
-# Version: 1.1
+# Version: 1.2
 # Automatically adds all required DNS records to Cloudflare
+# Works with API Token (no email needed) or Global API Key (email required)
 # =================================================================
 
 # Colors
@@ -80,43 +81,41 @@ echo "  Hostname: $HOSTNAME"
 echo "  Primary IP: $PRIMARY_IP"
 echo ""
 
-# Get Cloudflare credentials - PROPER INPUT HANDLING
+# Get Cloudflare credentials - SIMPLIFIED!
 print_header "Cloudflare API Credentials"
-echo ""
-echo "You need your Cloudflare API credentials to proceed."
-echo "Get them from: https://dash.cloudflare.com/profile/api-tokens"
 echo ""
 
 # Check for saved credentials
 CREDS_FILE="/root/.cloudflare_credentials"
-CF_EMAIL=""
 CF_API_KEY=""
 
 if [ -f "$CREDS_FILE" ]; then
     source "$CREDS_FILE"
-    if [ ! -z "$SAVED_CF_EMAIL" ] && [ ! -z "$SAVED_CF_API_KEY" ]; then
-        echo "Found saved credentials for: $SAVED_CF_EMAIL"
+    if [ ! -z "$SAVED_CF_API_KEY" ]; then
+        echo "Found saved API credentials"
         read -p "Use saved credentials? (y/n) [y]: " USE_SAVED
         USE_SAVED=${USE_SAVED:-y}
         if [[ "${USE_SAVED,,}" == "y" ]]; then
-            CF_EMAIL="$SAVED_CF_EMAIL"
             CF_API_KEY="$SAVED_CF_API_KEY"
         fi
     fi
 fi
 
-# Get email if not set
-if [ -z "$CF_EMAIL" ]; then
-    read -p "Enter Cloudflare email: " CF_EMAIL
-    while [ -z "$CF_EMAIL" ]; do
-        print_error "Email cannot be empty!"
-        read -p "Enter Cloudflare email: " CF_EMAIL
-    done
-fi
-
-# Get API key if not set - THIS IS THE FIX FOR YOUR ISSUE
+# Get API key if not set
 if [ -z "$CF_API_KEY" ]; then
-    echo "Enter Cloudflare API Key (Global API Key or API Token):"
+    echo "You need a Cloudflare API Token or Global API Key"
+    echo ""
+    echo "RECOMMENDED: Create a scoped API Token:"
+    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
+    echo "2. Click 'Create Token'"
+    echo "3. Use template 'Edit zone DNS' or create custom token with:"
+    echo "   - Zone:DNS:Edit permissions"
+    echo "   - Include your specific zone"
+    echo ""
+    echo "OR use your Global API Key (less secure, requires email)"
+    echo ""
+    
+    echo "Enter Cloudflare API Token or Global API Key:"
     echo "(Input will be hidden for security)"
     read -s CF_API_KEY
     echo ""
@@ -124,15 +123,14 @@ if [ -z "$CF_API_KEY" ]; then
     # Make sure key was entered
     while [ -z "$CF_API_KEY" ]; do
         print_error "API Key cannot be empty!"
-        echo "Enter Cloudflare API Key:"
+        echo "Enter Cloudflare API Token or Global API Key:"
         read -s CF_API_KEY
         echo ""
     done
 fi
 
-# Save credentials for future use
+# Save credentials for future use (just the key)
 cat > "$CREDS_FILE" <<EOF
-SAVED_CF_EMAIL="$CF_EMAIL"
 SAVED_CF_API_KEY="$CF_API_KEY"
 EOF
 chmod 600 "$CREDS_FILE"
@@ -141,36 +139,55 @@ chmod 600 "$CREDS_FILE"
 print_header "Connecting to Cloudflare"
 
 echo -n "Getting Zone ID for $DOMAIN_NAME... "
+
+# Try API Token authentication first (no email needed)
 ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
-    -H "X-Auth-Email: $CF_EMAIL" \
-    -H "X-Auth-Key: $CF_API_KEY" \
+    -H "Authorization: Bearer $CF_API_KEY" \
     -H "Content-Type: application/json")
 
-# Check if response is valid JSON first
+# Check if response is valid
 if ! echo "$ZONE_RESPONSE" | jq empty 2>/dev/null; then
     print_error "✗ Invalid response from Cloudflare API"
     echo "Response: $ZONE_RESPONSE"
     exit 1
 fi
 
-# Check for authentication errors
 SUCCESS=$(echo "$ZONE_RESPONSE" | jq -r '.success')
+
+# If token auth failed, it might be a Global API Key
 if [ "$SUCCESS" == "false" ]; then
+    ERROR_CODE=$(echo "$ZONE_RESPONSE" | jq -r '.errors[0].code')
+    
+    if [ "$ERROR_CODE" == "9109" ] || [ "$ERROR_CODE" == "6003" ]; then
+        # Likely a Global API Key, needs email
+        echo ""
+        print_warning "This appears to be a Global API Key, email required"
+        read -p "Enter Cloudflare account email: " CF_EMAIL
+        
+        # Try again with email
+        ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_API_KEY" \
+            -H "Content-Type: application/json")
+        
+        SUCCESS=$(echo "$ZONE_RESPONSE" | jq -r '.success')
+        
+        if [ "$SUCCESS" == "true" ]; then
+            # Save email for future use with Global Key
+            echo "SAVED_CF_EMAIL=\"$CF_EMAIL\"" >> "$CREDS_FILE"
+            AUTH_METHOD="global"
+        fi
+    fi
+else
+    AUTH_METHOD="token"
+fi
+
+if [ "$SUCCESS" != "true" ]; then
     ERROR_MSG=$(echo "$ZONE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')
     print_error "✗ API Authentication Failed"
     echo "Error: $ERROR_MSG"
     echo ""
-    echo "Please check:"
-    echo "1. Your email address is correct: $CF_EMAIL"
-    echo "2. Your API key is a valid Global API Key from Cloudflare"
-    echo "3. Copy the entire API key without spaces"
-    echo ""
-    echo "To get your Global API Key:"
-    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
-    echo "2. Click 'View' next to Global API Key"
-    echo "3. Enter your password and copy the key"
-    
-    # Clear saved bad credentials
+    echo "Please check your API credentials"
     rm -f "$CREDS_FILE"
     exit 1
 fi
@@ -178,21 +195,16 @@ fi
 ZONE_ID=$(echo "$ZONE_RESPONSE" | jq -r '.result[0].id // empty')
 
 if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" == "null" ]; then
-    print_error "✗ Failed to get Zone ID"
-    echo ""
-    echo "The domain $DOMAIN_NAME was not found in your Cloudflare account."
-    echo ""
-    echo "Please check:"
-    echo "1. The domain is added to your Cloudflare account"
-    echo "2. The domain name is spelled correctly: $DOMAIN_NAME"
-    echo "3. You're using the correct Cloudflare account"
+    print_error "✗ Domain not found in Cloudflare account"
+    echo "Please ensure $DOMAIN_NAME is added to your Cloudflare account"
     exit 1
 fi
 
 print_message "✓ Found Zone ID: $ZONE_ID"
+echo "✓ Authentication method: ${AUTH_METHOD:-token}"
 echo ""
 
-# Function to create DNS record
+# Function to create DNS record (works with both auth methods)
 create_dns_record() {
     local TYPE=$1
     local NAME=$2
@@ -220,11 +232,19 @@ create_dns_record() {
             '{type: $type, name: $name, content: $content, proxied: $proxied}')
     fi
     
-    RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-        -H "X-Auth-Email: $CF_EMAIL" \
-        -H "X-Auth-Key: $CF_API_KEY" \
-        -H "Content-Type: application/json" \
-        --data "$JSON_DATA")
+    # Use appropriate auth headers
+    if [ "$AUTH_METHOD" == "global" ]; then
+        RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$JSON_DATA")
+    else
+        RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+            -H "Authorization: Bearer $CF_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$JSON_DATA")
+    fi
     
     SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
     
@@ -238,23 +258,33 @@ create_dns_record() {
             
             # Try to update instead
             echo -n "  Updating existing record... "
-            RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=$TYPE&name=$NAME" \
-                -H "X-Auth-Email: $CF_EMAIL" \
-                -H "X-Auth-Key: $CF_API_KEY" \
-                -H "Content-Type: application/json" | jq -r '.result[0].id')
             
-            if [ "$RECORD_ID" != "null" ] && [ ! -z "$RECORD_ID" ]; then
+            if [ "$AUTH_METHOD" == "global" ]; then
+                RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=$TYPE&name=$NAME" \
+                    -H "X-Auth-Email: $CF_EMAIL" \
+                    -H "X-Auth-Key: $CF_API_KEY" \
+                    -H "Content-Type: application/json" | jq -r '.result[0].id')
+                    
                 UPDATE_RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
                     -H "X-Auth-Email: $CF_EMAIL" \
                     -H "X-Auth-Key: $CF_API_KEY" \
                     -H "Content-Type: application/json" \
                     --data "$JSON_DATA")
-                
-                if [ "$(echo "$UPDATE_RESPONSE" | jq -r '.success')" == "true" ]; then
-                    print_message "✓ Updated"
-                else
-                    print_error "✗ Failed to update"
-                fi
+            else
+                RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=$TYPE&name=$NAME" \
+                    -H "Authorization: Bearer $CF_API_KEY" \
+                    -H "Content-Type: application/json" | jq -r '.result[0].id')
+                    
+                UPDATE_RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                    -H "Authorization: Bearer $CF_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    --data "$JSON_DATA")
+            fi
+            
+            if [ "$(echo "$UPDATE_RESPONSE" | jq -r '.success')" == "true" ]; then
+                print_message "✓ Updated"
+            else
+                print_error "✗ Failed to update"
             fi
         else
             print_error "✗ Failed: $ERROR"
@@ -270,7 +300,7 @@ if [ -f "$DKIM_FILE" ]; then
     DKIM_KEY=$(cat "$DKIM_FILE" | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
     echo "Found DKIM key in $DKIM_FILE"
 else
-    print_warning "DKIM key not found. Run the mail installer first."
+    print_warning "DKIM key not found. It will be created during installation."
 fi
 
 # Start creating DNS records
@@ -291,7 +321,7 @@ if [ ! -z "$DKIM_KEY" ]; then
     DKIM_RECORD="v=DKIM1; k=rsa; p=$DKIM_KEY"
     create_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD" "" "false"
 else
-    print_warning "⚠ Skipping DKIM record (no key found)"
+    print_warning "⚠ Skipping DKIM record (will be added after key generation)"
 fi
 
 # 5. DMARC Record
@@ -320,6 +350,7 @@ Generated: $(date)
 Domain: $DOMAIN_NAME
 Zone ID: $ZONE_ID
 Primary IP: $PRIMARY_IP
+Auth Method: ${AUTH_METHOD:-token}
 
 DNS Records Created:
 1. A record: mail.$DOMAIN_NAME -> $PRIMARY_IP
@@ -327,17 +358,15 @@ DNS Records Created:
 3. SPF record: $DOMAIN_NAME -> "$SPF_RECORD"
 4. DKIM record: mail._domainkey.$DOMAIN_NAME
 5. DMARC record: _dmarc.$DOMAIN_NAME -> "$DMARC_RECORD"
+6. Autodiscover/Autoconfig records
 
 To verify DNS propagation:
   dig A mail.$DOMAIN_NAME
   dig MX $DOMAIN_NAME
   dig TXT $DOMAIN_NAME
-  dig TXT mail._domainkey.$DOMAIN_NAME
-  dig TXT _dmarc.$DOMAIN_NAME
 
 Or use online tools:
   https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
-  https://www.mail-tester.com/
 
 ================================================================================
 EOF
@@ -354,12 +383,6 @@ echo "IMPORTANT:"
 echo "1. DNS propagation may take 5-30 minutes"
 echo "2. PTR (Reverse DNS) must be set with your hosting provider"
 echo "3. Test your setup with: test-email check-auth@verifier.port25.com"
-echo ""
-echo "To check DNS propagation:"
-echo "  check-dns $DOMAIN_NAME"
-echo ""
-echo "To verify in Cloudflare dashboard:"
-echo "  https://dash.cloudflare.com/$ZONE_ID/dns"
 echo ""
 
 print_message "Cloudflare DNS setup completed successfully!"
