@@ -2,10 +2,10 @@
 
 # =================================================================
 # DATABASE SETUP FOR MAIL SERVER
-# Version: 16.1.1
+# Version: 17.0.0
 # Sets up MySQL/MariaDB with virtual users for Postfix/Dovecot
 # Creates first email account during installation
-# FIXED: More robust database handling
+# FIXED: Robust database connectivity for all MySQL/MariaDB versions
 # =================================================================
 
 # Colors
@@ -59,7 +59,8 @@ if [ -z "$DOMAIN_NAME" ]; then
         exit 1
     fi
 else
-    HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+    # Use configured hostname with subdomain
+    HOSTNAME=${HOSTNAME:-"$MAIL_SUBDOMAIN.$DOMAIN_NAME"}
 fi
 
 echo "Domain: $DOMAIN_NAME"
@@ -70,17 +71,51 @@ fi
 echo ""
 
 # ===================================================================
+# IMPROVED DATABASE CONNECTION FUNCTION
+# ===================================================================
+
+get_mysql_command() {
+    # Test various connection methods
+    local test_commands=(
+        "mysql"
+        "sudo mysql"
+        "mysql -u root"
+        "mariadb"
+        "sudo mariadb"
+        "mariadb -u root"
+    )
+    
+    for cmd in "${test_commands[@]}"; do
+        if $cmd -e "SELECT 1" >/dev/null 2>&1; then
+            echo "$cmd"
+            return 0
+        fi
+    done
+    
+    # Try debian maintenance user
+    if [ -f /etc/mysql/debian.cnf ]; then
+        if mysql --defaults-file=/etc/mysql/debian.cnf -e "SELECT 1" >/dev/null 2>&1; then
+            echo "mysql --defaults-file=/etc/mysql/debian.cnf"
+            return 0
+        fi
+    fi
+    
+    # No working connection found
+    return 1
+}
+
+# ===================================================================
 # 1. INSTALL AND START DATABASE
 # ===================================================================
 
 echo "Checking database installation..."
 
-# Check if MySQL or MariaDB is installed
+# Determine which database service to use
 DB_SERVICE=""
-if systemctl list-units --all | grep -q "mysql.service"; then
-    DB_SERVICE="mysql"
-elif systemctl list-units --all | grep -q "mariadb.service"; then
+if systemctl list-units --all | grep -q "mariadb.service"; then
     DB_SERVICE="mariadb"
+elif systemctl list-units --all | grep -q "mysql.service"; then
+    DB_SERVICE="mysql"
 else
     echo "Installing MariaDB..."
     apt-get update > /dev/null 2>&1
@@ -89,37 +124,71 @@ else
 fi
 
 # Start and enable database service
+echo "Starting $DB_SERVICE service..."
+systemctl stop $DB_SERVICE 2>/dev/null
+sleep 2
 systemctl start $DB_SERVICE 2>/dev/null
 systemctl enable $DB_SERVICE 2>/dev/null
 
 # Wait for database to be ready
-sleep 3
+echo "Waiting for database to be ready..."
+for i in {1..30}; do
+    if systemctl is-active --quiet $DB_SERVICE; then
+        break
+    fi
+    sleep 1
+done
 
-# Check if database is actually running
 if ! systemctl is-active --quiet $DB_SERVICE; then
     print_error "Database service failed to start"
-    echo "Attempting to fix..."
     
     # Try to fix common issues
+    echo "Attempting to fix database issues..."
+    
+    # Create required directories
+    mkdir -p /var/run/mysqld
     if [ "$DB_SERVICE" == "mysql" ]; then
-        # MySQL specific fixes
-        mkdir -p /var/run/mysqld
         chown mysql:mysql /var/run/mysqld
-        systemctl restart mysql
     else
-        # MariaDB specific fixes
-        systemctl restart mariadb
+        chown mysql:mysql /var/run/mysqld 2>/dev/null || true
     fi
     
+    # Try starting again
+    systemctl start $DB_SERVICE
     sleep 3
     
     if ! systemctl is-active --quiet $DB_SERVICE; then
         print_error "Unable to start database service"
+        print_error "Check: journalctl -xe -u $DB_SERVICE"
         exit 1
     fi
 fi
 
 print_message "✓ Database service ($DB_SERVICE) is running"
+
+# Get working MySQL command
+echo "Establishing database connection..."
+MYSQL_CMD=$(get_mysql_command)
+
+if [ -z "$MYSQL_CMD" ]; then
+    print_error "Cannot connect to database"
+    echo "Attempting to reset root access..."
+    
+    # Try to reset root access for MariaDB/MySQL
+    if [ "$DB_SERVICE" == "mariadb" ]; then
+        mysql_install_db --user=mysql --ldata=/var/lib/mysql 2>/dev/null || true
+        systemctl restart mariadb
+        sleep 3
+    fi
+    
+    MYSQL_CMD=$(get_mysql_command)
+    if [ -z "$MYSQL_CMD" ]; then
+        print_error "Failed to establish database connection"
+        exit 1
+    fi
+fi
+
+print_message "✓ Database connection established using: $MYSQL_CMD"
 
 # ===================================================================
 # 2. GENERATE DATABASE PASSWORD
@@ -145,48 +214,39 @@ fi
 
 echo "Creating mail server database..."
 
-# First, try to connect without password (for fresh installations)
-MYSQL_CMD="mysql"
-if ! mysql -e "SELECT 1" >/dev/null 2>&1; then
-    # If that fails, try with sudo
-    if ! sudo mysql -e "SELECT 1" >/dev/null 2>&1; then
-        # If both fail, there might be a root password set
-        print_warning "Cannot connect to database. You may need to set root password."
-        MYSQL_CMD="mysql -u root"
-    else
-        MYSQL_CMD="sudo mysql"
-    fi
-fi
-
-# Create database and user with error handling
-echo "Creating database structure..."
-
+# Create database and user
 $MYSQL_CMD <<EOF 2>/dev/null || true
--- Drop user if exists (to avoid conflicts)
-DROP USER IF EXISTS 'mailuser'@'localhost';
-DROP USER IF EXISTS 'mailuser'@'%';
-
 -- Create database
 CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- Create user with proper privileges
+-- Drop existing user to avoid conflicts
+DROP USER IF EXISTS 'mailuser'@'localhost';
+DROP USER IF EXISTS 'mailuser'@'127.0.0.1';
+DROP USER IF EXISTS 'mailuser'@'::1';
+
+-- Create new user
 CREATE USER 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASS';
+CREATE USER 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';
+
+-- Grant privileges
 GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost';
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'127.0.0.1';
 FLUSH PRIVILEGES;
 EOF
 
-# Check if database was created
+# Verify database was created
 if $MYSQL_CMD -e "USE mailserver" 2>/dev/null; then
     print_message "✓ Database created successfully"
 else
     print_error "✗ Failed to create database"
     
-    # Try alternative method for MariaDB/MySQL compatibility
+    # Try alternative creation method
     echo "Trying alternative database creation method..."
     
     $MYSQL_CMD <<EOF
 CREATE DATABASE IF NOT EXISTS mailserver;
 GRANT ALL ON mailserver.* TO 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL ON mailserver.* TO 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';
 FLUSH PRIVILEGES;
 EOF
     
@@ -196,10 +256,28 @@ EOF
     fi
 fi
 
-# Now create tables using the mailuser
+# Create tables using mailuser
 echo "Creating database tables..."
 
-mysql -u mailuser -p"$DB_PASS" mailserver <<'EOF' 2>/dev/null || true
+# Test mailuser connection
+if ! mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SELECT 1" >/dev/null 2>&1; then
+    # Try with 127.0.0.1
+    if ! mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "SELECT 1" >/dev/null 2>&1; then
+        print_error "Cannot connect as mailuser"
+        echo "Attempting to fix permissions..."
+        
+        $MYSQL_CMD <<EOF
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASS' WITH GRANT OPTION;
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_PASS' WITH GRANT OPTION;
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'%' IDENTIFIED BY '$DB_PASS' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOF
+    fi
+fi
+
+# Create tables
+mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'EOF' 2>/dev/null || \
+mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'EOF' 2>/dev/null || true
 -- Create domains table
 CREATE TABLE IF NOT EXISTS virtual_domains (
     id INT NOT NULL AUTO_INCREMENT,
@@ -236,13 +314,29 @@ CREATE TABLE IF NOT EXISTS virtual_aliases (
     FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Create IP rotation tracking table (NEW)
+CREATE TABLE IF NOT EXISTS ip_rotation_log (
+    id INT NOT NULL AUTO_INCREMENT,
+    sender_email VARCHAR(255) NOT NULL,
+    assigned_ip VARCHAR(45) NOT NULL,
+    transport_id INT NOT NULL,
+    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    message_count INT DEFAULT 1,
+    PRIMARY KEY (id),
+    UNIQUE KEY sender_unique (sender_email),
+    INDEX idx_last_used (last_used)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Add indexes for performance
 CREATE INDEX IF NOT EXISTS idx_email ON virtual_users(email);
 CREATE INDEX IF NOT EXISTS idx_domain ON virtual_domains(name);
+CREATE INDEX IF NOT EXISTS idx_sender ON ip_rotation_log(sender_email);
 EOF
 
 # Verify tables were created
-TABLE_COUNT=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SHOW TABLES" 2>/dev/null | wc -l)
+TABLE_COUNT=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SHOW TABLES" 2>/dev/null | wc -l || \
+              mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "SHOW TABLES" 2>/dev/null | wc -l)
+
 if [ $TABLE_COUNT -ge 3 ]; then
     print_message "✓ Database tables created"
 else
@@ -255,7 +349,8 @@ fi
 
 echo "Adding primary domain: $DOMAIN_NAME"
 
-mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null || true
+mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<EOF 2>/dev/null || \
+mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<EOF 2>/dev/null || true
 INSERT INTO virtual_domains (name) VALUES ('$DOMAIN_NAME')
 ON DUPLICATE KEY UPDATE name = name;
 EOF
@@ -283,9 +378,14 @@ if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
     
     # Hash the password using doveadm
     if command -v doveadm &> /dev/null; then
+        # Try SHA512-CRYPT first
         PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$FIRST_PASS" 2>/dev/null)
         if [ -z "$PASS_HASH" ]; then
-            # Fallback to plain password if doveadm fails
+            # Fallback to SSHA512
+            PASS_HASH=$(doveadm pw -s SSHA512 -p "$FIRST_PASS" 2>/dev/null)
+        fi
+        if [ -z "$PASS_HASH" ]; then
+            # Last resort - plain password
             PASS_HASH="{PLAIN}$FIRST_PASS"
             print_warning "Using plain password (will be hashed later)"
         fi
@@ -296,7 +396,8 @@ if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
     fi
     
     # Add user to database
-    mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null || true
+    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<EOF 2>/dev/null || \
+    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<EOF 2>/dev/null || true
 -- Get domain ID
 SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN_NAME');
 
@@ -310,9 +411,10 @@ FROM virtual_domains WHERE name = '$DOMAIN_NAME';
 EOF
     
     # Check if user was created
-    USER_EXISTS=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_users WHERE email='$FIRST_EMAIL'" 2>/dev/null | tail -1)
+    USER_EXISTS=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SELECT COUNT(*) FROM virtual_users WHERE email='$FIRST_EMAIL'" 2>/dev/null | tail -1 || \
+                  mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "SELECT COUNT(*) FROM virtual_users WHERE email='$FIRST_EMAIL'" 2>/dev/null | tail -1)
     
-    if [ "$USER_EXISTS" -ge 1 ]; then
+    if [ "$USER_EXISTS" -ge 1 ] 2>/dev/null; then
         print_message "✓ Email account created: $FIRST_EMAIL"
         
         # Create mail directory
@@ -371,6 +473,17 @@ dbname = mailserver
 query = SELECT destination FROM virtual_aliases WHERE source='%s' AND active = 1
 EOF
 
+# Virtual email to transport lookup (for IP rotation)
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    cat > /etc/postfix/mysql/sender_transport.cf <<EOF
+user = mailuser
+password = $DB_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT CONCAT('smtp-ip', transport_id, ':') FROM ip_rotation_log WHERE sender_email='%s'
+EOF
+fi
+
 # Set permissions
 chmod 640 /etc/postfix/mysql/*.cf
 chown root:postfix /etc/postfix/mysql/*.cf
@@ -387,6 +500,11 @@ postconf -e "smtpd_sasl_type = dovecot"
 postconf -e "smtpd_sasl_path = private/auth"
 postconf -e "smtpd_sasl_auth_enable = yes"
 postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated,permit_mynetworks,reject_unauth_destination"
+
+# If multiple IPs, add sender transport lookup
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    postconf -e "sender_dependent_default_transport_maps = mysql:/etc/postfix/mysql/sender_transport.cf"
+fi
 
 print_message "✓ Postfix configured for virtual users"
 
@@ -530,10 +648,16 @@ else
     exit 1
 fi
 
+# Try localhost first, then 127.0.0.1
+MYSQL_CMD="mysql -u mailuser -p$DB_PASS -h localhost mailserver"
+if ! $MYSQL_CMD -e "SELECT 1" >/dev/null 2>&1; then
+    MYSQL_CMD="mysql -u mailuser -p$DB_PASS -h 127.0.0.1 mailserver"
+fi
+
 case "$1" in
     stats)
         echo "Mail Database Statistics:"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "
+        $MYSQL_CMD -e "
         SELECT 
             (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
             (SELECT COUNT(*) FROM virtual_users) as 'Users',
@@ -543,7 +667,7 @@ case "$1" in
         
     users)
         echo "Email Users:"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "
+        $MYSQL_CMD -e "
         SELECT email as 'Email', 
                CASE active WHEN 1 THEN 'Active' ELSE 'Disabled' END as 'Status',
                created_at as 'Created'
@@ -552,28 +676,43 @@ case "$1" in
         
     domains)
         echo "Mail Domains:"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "
+        $MYSQL_CMD -e "
         SELECT name as 'Domain', 
                (SELECT COUNT(*) FROM virtual_users WHERE domain_id = virtual_domains.id) as 'Users',
                created_at as 'Created'
         FROM virtual_domains ORDER BY name;"
         ;;
         
+    ip-stats)
+        echo "IP Rotation Statistics:"
+        $MYSQL_CMD -e "
+        SELECT 
+            assigned_ip as 'IP Address',
+            COUNT(*) as 'Senders',
+            SUM(message_count) as 'Total Messages',
+            MAX(last_used) as 'Last Used'
+        FROM ip_rotation_log 
+        GROUP BY assigned_ip
+        ORDER BY assigned_ip;"
+        ;;
+        
     backup)
         BACKUP_FILE="/root/maildb-$(date +%Y%m%d-%H%M%S).sql"
-        mysqldump -u mailuser -p"$DB_PASS" mailserver > "$BACKUP_FILE"
+        mysqldump -u mailuser -p"$DB_PASS" -h localhost mailserver > "$BACKUP_FILE" 2>/dev/null || \
+        mysqldump -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver > "$BACKUP_FILE"
         echo "Database backed up to: $BACKUP_FILE"
         ;;
         
     *)
         echo "Mail Database Manager"
-        echo "Usage: maildb {stats|users|domains|backup}"
+        echo "Usage: maildb {stats|users|domains|ip-stats|backup}"
         echo ""
         echo "Commands:"
-        echo "  stats   - Show database statistics"
-        echo "  users   - List all email users"
-        echo "  domains - List all domains"
-        echo "  backup  - Backup database"
+        echo "  stats    - Show database statistics"
+        echo "  users    - List all email users"
+        echo "  domains  - List all domains"
+        echo "  ip-stats - Show IP rotation statistics"
+        echo "  backup   - Backup database"
         ;;
 esac
 EOF
@@ -600,7 +739,8 @@ echo ""
 echo "Testing database connection..."
 
 # Test connection
-if mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT 1" > /dev/null 2>&1; then
+if mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SELECT 1" > /dev/null 2>&1 || \
+   mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "SELECT 1" > /dev/null 2>&1; then
     print_message "✓ Database connection successful"
 else
     print_warning "⚠ Database connection test failed (may still be initializing)"
@@ -609,11 +749,17 @@ fi
 # Show statistics
 echo ""
 echo "Database Statistics:"
-mysql -u mailuser -p"$DB_PASS" mailserver -e "
+mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
 SELECT 
     (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
     (SELECT COUNT(*) FROM virtual_users) as 'Users',
-    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null || echo "No statistics available yet"
+    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null || \
+mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
+SELECT 
+    (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
+    (SELECT COUNT(*) FROM virtual_users) as 'Users',
+    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null || \
+echo "No statistics available yet"
 
 # ===================================================================
 # COMPLETION
@@ -629,12 +775,18 @@ echo "✓ Password saved in: /root/.mail_db_password"
 if [ ! -z "$FIRST_EMAIL" ]; then
     echo "✓ First account: $FIRST_EMAIL"
 fi
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "✓ IP rotation tracking table created"
+fi
 echo ""
 echo "Database management commands:"
-echo "  maildb stats   - Show statistics"
-echo "  maildb users   - List users"
-echo "  maildb domains - List domains"
-echo "  maildb backup  - Backup database"
+echo "  maildb stats    - Show statistics"
+echo "  maildb users    - List users"
+echo "  maildb domains  - List domains"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "  maildb ip-stats - Show IP rotation statistics"
+fi
+echo "  maildb backup   - Backup database"
 echo ""
 echo "Email account management:"
 echo "  mail-account add user@domain.com password"
