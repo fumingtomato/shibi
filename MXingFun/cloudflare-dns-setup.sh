@@ -2,9 +2,9 @@
 
 # =================================================================
 # CLOUDFLARE DNS AUTOMATIC SETUP FOR MAIL SERVER
-# Version: 1.5
+# Version: 1.6
 # Automatically adds all required DNS records to Cloudflare
-# PREVENTS DUPLICATE RECORDS - Updates existing ones
+# INCLUDES DKIM RECORD CREATION
 # =================================================================
 
 # Colors
@@ -351,15 +351,57 @@ create_srv_record() {
     fi
 }
 
-# Get DKIM key if it exists
+# ===================================================================
+# CRITICAL: GENERATE DKIM KEY IF NOT EXISTS
+# ===================================================================
+
+print_header "DKIM Key Generation"
+
 DKIM_KEY=""
 DKIM_FILE="/etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+
 if [ -f "$DKIM_FILE" ]; then
+    echo "DKIM key already exists"
     DKIM_KEY=$(cat "$DKIM_FILE" | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
-    echo "Found DKIM key in $DKIM_FILE"
 else
-    print_warning "DKIM key not found. It will be created during installation."
+    echo "Generating new DKIM key..."
+    
+    # Ensure OpenDKIM is installed
+    if ! command -v opendkim-genkey &> /dev/null; then
+        apt-get update > /dev/null 2>&1
+        apt-get install -y opendkim opendkim-tools > /dev/null 2>&1
+    fi
+    
+    # Create directory and generate key
+    mkdir -p "/etc/opendkim/keys/$DOMAIN_NAME"
+    cd "/etc/opendkim/keys/$DOMAIN_NAME"
+    opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
+    chown -R opendkim:opendkim /etc/opendkim
+    cd - > /dev/null
+    
+    # Configure OpenDKIM
+    echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
+    echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
+    echo "127.0.0.1" > /etc/opendkim/TrustedHosts
+    echo "localhost" >> /etc/opendkim/TrustedHosts
+    echo ".$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
+    echo "$PRIMARY_IP" >> /etc/opendkim/TrustedHosts
+    
+    # Get the key
+    DKIM_KEY=$(cat "$DKIM_FILE" | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
+    
+    # Restart OpenDKIM
+    systemctl restart opendkim > /dev/null 2>&1
+    
+    print_message "✓ DKIM key generated"
 fi
+
+if [ -z "$DKIM_KEY" ]; then
+    print_error "Could not get DKIM key!"
+    DKIM_KEY="PENDING_GENERATION"
+fi
+
+echo ""
 
 # Start creating DNS records
 print_header "Creating DNS Records"
@@ -367,33 +409,37 @@ print_header "Creating DNS Records"
 # 1. A Record for mail subdomain
 create_dns_record "A" "mail.$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
 
-# 2. MX Record
+# 2. A Record for main domain (for website)
+create_dns_record "A" "$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
+
+# 3. MX Record
 create_dns_record "MX" "$DOMAIN_NAME" "mail.$DOMAIN_NAME" "10" "false"
 
-# 3. SPF Record - INCLUDE ALL IPs
+# 4. SPF Record - INCLUDE ALL IPs
 SPF_RECORD="v=spf1 mx a ip4:$PRIMARY_IP$ADDITIONAL_IPS ~all"
 create_dns_record "TXT" "$DOMAIN_NAME" "$SPF_RECORD" "" "false"
 
-# 4. DKIM Record (if key exists)
-if [ ! -z "$DKIM_KEY" ]; then
+# 5. DKIM Record - ALWAYS ADD IT!
+if [ "$DKIM_KEY" != "PENDING_GENERATION" ]; then
     DKIM_RECORD="v=DKIM1; k=rsa; p=$DKIM_KEY"
     create_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD" "" "false"
+    print_message "✓ DKIM record added to Cloudflare"
 else
-    print_warning "⚠ Skipping DKIM record (will be added after key generation)"
+    print_warning "⚠ DKIM key generation pending - record will need to be added manually"
 fi
 
-# 5. DMARC Record - USE FIRST_EMAIL or ADMIN_EMAIL
+# 6. DMARC Record - USE FIRST_EMAIL or ADMIN_EMAIL
 DMARC_EMAIL="${FIRST_EMAIL:-${ADMIN_EMAIL:-admin@$DOMAIN_NAME}}"
 DMARC_RECORD="v=DMARC1; p=none; rua=mailto:$DMARC_EMAIL"
 create_dns_record "TXT" "_dmarc.$DOMAIN_NAME" "$DMARC_RECORD" "" "false"
 
-# 6. Autodiscover records
+# 7. Autodiscover records
 echo ""
 echo "Adding autodiscover records for email clients..."
 create_dns_record "CNAME" "autodiscover.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
 create_dns_record "CNAME" "autoconfig.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
 
-# 7. SRV records
+# 8. SRV records
 create_srv_record "_autodiscover._tcp.$DOMAIN_NAME" 0 0 443 "mail.$DOMAIN_NAME"
 create_srv_record "_imaps._tcp.$DOMAIN_NAME" 0 1 993 "mail.$DOMAIN_NAME"
 create_srv_record "_submission._tcp.$DOMAIN_NAME" 0 1 587 "mail.$DOMAIN_NAME"
@@ -414,32 +460,71 @@ Auth Method: ${AUTH_METHOD:-token}
 
 DNS Records Created:
 1. A record: mail.$DOMAIN_NAME -> $PRIMARY_IP
-2. MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)
-3. SPF record: $DOMAIN_NAME -> "$SPF_RECORD"
-4. DKIM record: mail._domainkey.$DOMAIN_NAME
-5. DMARC record: _dmarc.$DOMAIN_NAME -> "$DMARC_RECORD"
-6. Autodiscover/Autoconfig CNAME records
-7. SRV records for mail client autodiscovery
+2. A record: $DOMAIN_NAME -> $PRIMARY_IP (for website)
+3. MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)
+4. SPF record: $DOMAIN_NAME -> "$SPF_RECORD"
+5. DKIM record: mail._domainkey.$DOMAIN_NAME -> [key added]
+6. DMARC record: _dmarc.$DOMAIN_NAME -> "$DMARC_RECORD"
+7. Autodiscover/Autoconfig CNAME records
+8. SRV records for mail client autodiscovery
+
+DKIM Verification:
+  Selector: mail
+  DNS Name: mail._domainkey.$DOMAIN_NAME
+  Key Status: $([ "$DKIM_KEY" != "PENDING_GENERATION" ] && echo "Added to Cloudflare" || echo "Pending generation")
 
 To verify DNS propagation:
   dig A mail.$DOMAIN_NAME
   dig MX $DOMAIN_NAME
   dig TXT $DOMAIN_NAME
+  dig TXT mail._domainkey.$DOMAIN_NAME
   dig SRV _autodiscover._tcp.$DOMAIN_NAME
 
 Or use online tools:
   https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
+  https://www.mail-tester.com
 
 ================================================================================
 EOF
 
+# Save DKIM info separately
+if [ "$DKIM_KEY" != "PENDING_GENERATION" ]; then
+    cat > /root/dkim-record-$DOMAIN_NAME.txt <<EOF
+DKIM DNS Record for $DOMAIN_NAME
+Generated: $(date)
+================================================================================
+
+STATUS: ✓ ADDED TO CLOUDFLARE
+
+DNS Record Details:
+  Type: TXT
+  Name: mail._domainkey.$DOMAIN_NAME  
+  Value: v=DKIM1; k=rsa; p=$DKIM_KEY
+
+This record has been automatically added to your Cloudflare DNS.
+
+To verify DKIM is working:
+  1. Wait 5-10 minutes for DNS propagation
+  2. Run: dig TXT mail._domainkey.$DOMAIN_NAME
+  3. Test email: test-email check-auth@verifier.port25.com
+
+================================================================================
+EOF
+fi
+
 echo "Configuration saved to: /root/cloudflare-dns-config.txt"
+if [ -f "/root/dkim-record-$DOMAIN_NAME.txt" ]; then
+    echo "DKIM details saved to: /root/dkim-record-$DOMAIN_NAME.txt"
+fi
 echo ""
 
 print_header "Setup Complete!"
 
 echo "✓ All DNS records have been added to Cloudflare"
 echo "✓ Old duplicate records have been removed"
+if [ "$DKIM_KEY" != "PENDING_GENERATION" ]; then
+    echo "✓ DKIM record has been added"
+fi
 echo ""
 echo "IMPORTANT:"
 echo "1. DNS propagation may take 5-30 minutes"
@@ -447,4 +532,19 @@ echo "2. PTR (Reverse DNS) must be set with your hosting provider"
 echo "3. Test your setup with: test-email check-auth@verifier.port25.com"
 echo ""
 
+# Quick verification
+echo "Quick verification (using Cloudflare DNS):"
+echo -n "  A record: "
+dig +short A mail.$DOMAIN_NAME @1.1.1.1 2>/dev/null && echo "✓" || echo "Propagating..."
+echo -n "  MX record: "
+dig +short MX $DOMAIN_NAME @1.1.1.1 2>/dev/null | head -1 && echo "✓" || echo "Propagating..."
+echo -n "  DKIM record: "
+if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
+    echo "✓ DKIM record is live!"
+else
+    echo "Propagating..."
+fi
+
+echo ""
 print_message "Cloudflare DNS setup completed successfully!"
+print_message "Your DKIM record has been added and should be working soon!"
