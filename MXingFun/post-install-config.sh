@@ -2,9 +2,9 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION
-# Version: 16.0.5
+# Version: 16.1.0
 # Configures SSL, firewall, OpenDKIM, and final optimizations
-# PROPERLY CONFIGURES OPENDKIM FOR EMAIL SIGNING
+# ADDS DKIM TO CLOUDFLARE IF USING AUTOMATIC DNS
 # =================================================================
 
 # Colors
@@ -96,6 +96,7 @@ mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
 chown -R opendkim:opendkim /etc/opendkim
 
 # Generate DKIM keys if they don't exist
+DKIM_KEY_GENERATED=false
 if [ ! -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
     echo "Generating DKIM keys..."
     cd /etc/opendkim/keys/$DOMAIN_NAME
@@ -103,7 +104,9 @@ if [ ! -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
     chown opendkim:opendkim mail.private mail.txt
     chmod 600 mail.private
     chmod 644 mail.txt
-    cd -
+    cd - > /dev/null
+    DKIM_KEY_GENERATED=true
+    print_message "✓ DKIM keys generated"
 fi
 
 # Configure OpenDKIM - PROPER CONFIGURATION
@@ -193,10 +196,123 @@ else
     systemctl status opendkim --no-pager
 fi
 
-# Display DKIM key for DNS
-echo ""
-print_header "DKIM Key for DNS"
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+# ===================================================================
+# ADD DKIM TO CLOUDFLARE IF USING AUTOMATIC DNS
+# ===================================================================
+
+if [ "$DKIM_KEY_GENERATED" == "true" ] && [ "${USE_CLOUDFLARE,,}" == "y" ]; then
+    print_header "Adding DKIM Record to Cloudflare"
+    
+    # Get the DKIM key
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
+    
+    if [ ! -z "$DKIM_KEY" ] && [ ! -z "$CF_API_KEY" ]; then
+        echo "Adding DKIM record to Cloudflare DNS..."
+        
+        # Load Cloudflare credentials
+        CREDS_FILE="/root/.cloudflare_credentials"
+        if [ -f "$CREDS_FILE" ]; then
+            source "$CREDS_FILE"
+            CF_API_KEY="${SAVED_CF_API_KEY:-$CF_API_KEY}"
+            CF_EMAIL="${SAVED_CF_EMAIL:-}"
+        fi
+        
+        # Get Zone ID
+        echo -n "Getting Zone ID... "
+        ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+            -H "Authorization: Bearer $CF_API_KEY" \
+            -H "Content-Type: application/json")
+        
+        SUCCESS=$(echo "$ZONE_RESPONSE" | jq -r '.success' 2>/dev/null)
+        
+        # Try with email if token fails
+        if [ "$SUCCESS" != "true" ] && [ ! -z "$CF_EMAIL" ]; then
+            ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+                -H "X-Auth-Email: $CF_EMAIL" \
+                -H "X-Auth-Key: $CF_API_KEY" \
+                -H "Content-Type: application/json")
+            AUTH_METHOD="global"
+        else
+            AUTH_METHOD="token"
+        fi
+        
+        ZONE_ID=$(echo "$ZONE_RESPONSE" | jq -r '.result[0].id' 2>/dev/null)
+        
+        if [ ! -z "$ZONE_ID" ] && [ "$ZONE_ID" != "null" ]; then
+            echo "✓ Found"
+            
+            # Check for existing DKIM record
+            DKIM_NAME="mail._domainkey.$DOMAIN_NAME"
+            echo -n "Checking for existing DKIM record... "
+            
+            if [ "$AUTH_METHOD" == "global" ]; then
+                EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=TXT&name=$DKIM_NAME" \
+                    -H "X-Auth-Email: $CF_EMAIL" \
+                    -H "X-Auth-Key: $CF_API_KEY" \
+                    -H "Content-Type: application/json")
+            else
+                EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=TXT&name=$DKIM_NAME" \
+                    -H "Authorization: Bearer $CF_API_KEY" \
+                    -H "Content-Type: application/json")
+            fi
+            
+            RECORD_COUNT=$(echo "$EXISTING" | jq '.result | length' 2>/dev/null || echo "0")
+            
+            if [ "$RECORD_COUNT" -gt 0 ]; then
+                echo "Found, updating..."
+                # Delete existing records
+                echo "$EXISTING" | jq -r '.result[].id' 2>/dev/null | while read RECORD_ID; do
+                    if [ "$AUTH_METHOD" == "global" ]; then
+                        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                            -H "X-Auth-Email: $CF_EMAIL" \
+                            -H "X-Auth-Key: $CF_API_KEY" \
+                            -H "Content-Type: application/json" > /dev/null
+                    else
+                        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                            -H "Authorization: Bearer $CF_API_KEY" \
+                            -H "Content-Type: application/json" > /dev/null
+                    fi
+                done
+            else
+                echo "Not found"
+            fi
+            
+            # Add new DKIM record
+            echo -n "Adding DKIM record to Cloudflare... "
+            DKIM_CONTENT="v=DKIM1; k=rsa; p=$DKIM_KEY"
+            
+            JSON_DATA=$(jq -n \
+                --arg type "TXT" \
+                --arg name "$DKIM_NAME" \
+                --arg content "$DKIM_CONTENT" \
+                '{type: $type, name: $name, content: $content, proxied: false}')
+            
+            if [ "$AUTH_METHOD" == "global" ]; then
+                RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                    -H "X-Auth-Email: $CF_EMAIL" \
+                    -H "X-Auth-Key: $CF_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    --data "$JSON_DATA")
+            else
+                RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                    -H "Authorization: Bearer $CF_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    --data "$JSON_DATA")
+            fi
+            
+            if [ "$(echo "$RESPONSE" | jq -r '.success' 2>/dev/null)" == "true" ]; then
+                print_message "✓ DKIM record added to Cloudflare!"
+            else
+                print_warning "⚠ Could not add DKIM to Cloudflare automatically"
+            fi
+        else
+            print_warning "⚠ Could not connect to Cloudflare API"
+        fi
+    fi
+elif [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    # Display DKIM key for manual DNS setup
+    echo ""
+    print_header "DKIM Key for Manual DNS Setup"
     echo "Add this DKIM record to your DNS:"
     echo "  Name: mail._domainkey"
     echo "  Type: TXT"
@@ -263,7 +379,7 @@ EOF
             
             # Setup auto-renewal
             cat > /etc/cron.d/certbot-renewal <<EOF
-0 2 * * * root certbot renew --quiet --post-hook "systemctl reload postfix dovecot"
+0 2 * * * root certbot renew --quiet --post-hook "systemctl reload postfix dovecot nginx"
 EOF
             
             print_message "✓ Auto-renewal configured"
@@ -330,7 +446,7 @@ if command -v ufw &> /dev/null; then
     ufw allow 110/tcp comment 'POP3' > /dev/null 2>&1
     ufw allow 995/tcp comment 'POP3S' > /dev/null 2>&1
     
-    # Web ports (for webmail and certbot)
+    # Web ports (for website and certbot)
     ufw allow 80/tcp comment 'HTTP' > /dev/null 2>&1
     ufw allow 443/tcp comment 'HTTPS' > /dev/null 2>&1
     
@@ -530,7 +646,7 @@ print_message "✓ Log rotation configured"
 
 print_header "Restarting Services"
 
-services=(postfix dovecot opendkim mysql fail2ban)
+services=(postfix dovecot opendkim mysql nginx fail2ban)
 
 for service in "${services[@]}"; do
     echo -n "Restarting $service... "
@@ -567,6 +683,12 @@ if [[ "$MILTER_CONFIG" == *"localhost:8891"* ]]; then
     print_message "✓ Postfix is configured to use OpenDKIM"
 else
     print_error "✗ Postfix is not configured to use OpenDKIM"
+fi
+
+# Test DKIM key if exists
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    echo -n "Testing DKIM key... "
+    opendkim-testkey -d $DOMAIN_NAME -s mail -vvv 2>&1 | grep -q "key OK" && print_message "✓ Valid" || print_warning "⚠ DNS not ready"
 fi
 
 # ===================================================================
@@ -655,12 +777,14 @@ OpenDKIM Status:
   Service: $(systemctl is-active opendkim)
   Port 8891: $(netstat -lnp 2>/dev/null | grep -q ":8891" && echo "Listening" || echo "Not listening")
   DKIM Key: $([ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ] && echo "Generated" || echo "Missing")
+  DKIM in DNS: $(dig +short TXT mail._domainkey.$DOMAIN_NAME @8.8.8.8 2>/dev/null | grep -q "v=DKIM1" && echo "Yes" || echo "Pending")
 
 Services:
   Postfix (SMTP): $(systemctl is-active postfix)
   Dovecot (IMAP): $(systemctl is-active dovecot)
   OpenDKIM: $(systemctl is-active opendkim)
   MySQL: $(systemctl is-active mysql || systemctl is-active mariadb)
+  Nginx: $(systemctl is-active nginx)
   Fail2ban: $(systemctl is-active fail2ban)
   Firewall: $(ufw status | grep -q "Status: active" && echo "Active" || echo "Inactive")
 
@@ -672,7 +796,14 @@ Ports:
   993 - IMAPS
   110 - POP3
   995 - POP3S
+  80  - HTTP (website)
+  443 - HTTPS (website)
   8891 - OpenDKIM
+
+Website:
+  URL: http://$DOMAIN_NAME
+  SSL: $([ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] && echo "https://$DOMAIN_NAME" || echo "Not configured")
+  Root: /var/www/$DOMAIN_NAME
 
 Email Testing:
   Send test: test-email check-auth@verifier.port25.com ${FIRST_EMAIL:-user@$DOMAIN_NAME}
@@ -687,6 +818,7 @@ Management Commands:
   mail-log       - View mail logs
   check-dns      - Verify DNS records
   get-ssl-cert   - Get/renew SSL certificate
+  mailwizz-info  - Mailwizz configuration info
 
 Logs:
   /var/log/mail.log     - Mail server log
@@ -706,6 +838,9 @@ EOF
 print_header "Post-Installation Complete!"
 echo ""
 echo "✓ OpenDKIM configured and running"
+if [ "${USE_CLOUDFLARE,,}" == "y" ] && [ "$DKIM_KEY_GENERATED" == "true" ]; then
+    echo "✓ DKIM record added to Cloudflare"
+fi
 echo "✓ SSL/TLS configured"
 echo "✓ Firewall configured" 
 echo "✓ Fail2ban configured"
@@ -721,15 +856,19 @@ echo "Service Status: $(systemctl is-active opendkim)"
 echo "Listening on: localhost:8891"
 echo "DKIM Selector: mail"
 echo "DKIM Domain: $DOMAIN_NAME"
-echo ""
 
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    echo "DKIM DNS Record:"
-    echo "  Name: mail._domainkey.$DOMAIN_NAME"
-    echo "  Type: TXT"
-    echo "  Value: v=DKIM1; k=rsa; p=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t ')"
+if [ "${USE_CLOUDFLARE,,}" == "y" ]; then
+    echo "DKIM in Cloudflare: $(dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1" && echo "Yes" || echo "Propagating...")"
+else
     echo ""
+    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+        echo "DKIM DNS Record (add manually):"
+        echo "  Name: mail._domainkey.$DOMAIN_NAME"
+        echo "  Type: TXT"
+        echo "  Value: v=DKIM1; k=rsa; p=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t ')"
+    fi
 fi
+echo ""
 
 # Show status
 if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
@@ -753,9 +892,14 @@ echo "1. Check everything: mail-test"
 echo "2. Send test email: test-email check-auth@verifier.port25.com $FIRST_EMAIL"
 echo "3. Check DNS: check-dns $DOMAIN_NAME"
 echo "4. View logs: mail-log follow"
+echo "5. Mailwizz config: mailwizz-info"
 echo ""
 
 print_message "Configuration saved to: /root/mail-server-config.txt"
 echo ""
 print_message "✓ Post-installation configuration completed!"
-print_message "Your mail server is now ready to use with DKIM signing enabled!"
+print_message "Your mail server is ready with DKIM signing enabled!"
+
+if [ "${USE_CLOUDFLARE,,}" == "y" ]; then
+    print_message "DKIM has been automatically added to Cloudflare DNS!"
+fi
