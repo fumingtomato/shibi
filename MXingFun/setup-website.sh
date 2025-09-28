@@ -2,9 +2,9 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE
-# Version: 2.2
+# Version: 2.2.1
 # Creates compliance website with privacy policy and unsubscribe
-# Adds A record to Cloudflare if using automatic DNS
+# FIXED: Better error handling and directory creation
 # =================================================================
 
 # Colors
@@ -83,8 +83,14 @@ print_header "Installing Web Server"
 if ! command -v nginx &> /dev/null; then
     echo "Installing Nginx..."
     apt-get update > /dev/null 2>&1
-    apt-get install -y nginx > /dev/null 2>&1
-    print_message "✓ Nginx installed"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx > /dev/null 2>&1
+    
+    if [ $? -eq 0 ]; then
+        print_message "✓ Nginx installed"
+    else
+        print_error "✗ Failed to install Nginx"
+        exit 1
+    fi
 else
     print_message "✓ Nginx already installed"
 fi
@@ -93,7 +99,13 @@ fi
 if systemctl is-active --quiet apache2; then
     echo "Stopping Apache2 (conflicts with Nginx)..."
     systemctl stop apache2
-    systemctl disable apache2
+    systemctl disable apache2 2>/dev/null
+fi
+
+# Start Nginx if not running
+if ! systemctl is-active --quiet nginx; then
+    systemctl start nginx 2>/dev/null
+    systemctl enable nginx 2>/dev/null
 fi
 
 # ===================================================================
@@ -103,11 +115,22 @@ fi
 print_header "Creating Website Files"
 
 WEB_ROOT="/var/www/$DOMAIN_NAME"
+
+# Create directory structure
+echo "Creating website directory: $WEB_ROOT"
 mkdir -p "$WEB_ROOT"
+
+# Check if directory was created
+if [ ! -d "$WEB_ROOT" ]; then
+    print_error "Failed to create website directory"
+    exit 1
+fi
 
 # ===================================================================
 # 3. CREATE WEBSITE CONTENT
 # ===================================================================
+
+echo "Creating website pages..."
 
 # Homepage with professional design
 cat > "$WEB_ROOT/index.html" <<EOF
@@ -390,14 +413,14 @@ cat > "$WEB_ROOT/index.html" <<EOF
 </html>
 EOF
 
-# Privacy Policy
-cat > "$WEB_ROOT/privacy.html" <<EOF
+# Create Privacy Policy
+cat > "$WEB_ROOT/privacy.html" <<'PRIVACY_EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Policy - $DOMAIN_NAME</title>
+    <title>Privacy Policy - DOMAIN_PLACEHOLDER</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -472,7 +495,7 @@ cat > "$WEB_ROOT/privacy.html" <<EOF
 <body>
     <div class="content">
         <h1>Privacy Policy</h1>
-        <div class="date">Last Updated: $(date +'%B %d, %Y')</div>
+        <div class="date">Last Updated: DATE_PLACEHOLDER</div>
         
         <div class="highlight">
             <strong>Your Privacy Matters:</strong> We are committed to protecting your personal information and being transparent about how we collect, use, and safeguard your data.
@@ -547,39 +570,24 @@ cat > "$WEB_ROOT/privacy.html" <<EOF
         </ul>
         <p>You may request deletion of your data at any time.</p>
         
-        <h2>8. International Transfers</h2>
-        <p>If we transfer data internationally, we ensure appropriate safeguards are in place to protect your information in accordance with this privacy policy.</p>
-        
-        <h2>9. Children's Privacy</h2>
-        <p>Our services are not directed to individuals under 16. We do not knowingly collect personal information from children.</p>
-        
-        <h2>10. Cookies and Tracking</h2>
-        <p>Our website uses minimal cookies for:</p>
-        <ul>
-            <li>Essential functionality</li>
-            <li>Security purposes</li>
-            <li>Analytics (with your consent)</li>
-        </ul>
-        <p>We do not use third-party advertising cookies.</p>
-        
-        <h2>11. Changes to This Policy</h2>
-        <p>We may update this privacy policy from time to time. We will notify you of any material changes by posting the new policy on this page and updating the "Last Updated" date.</p>
-        
-        <h2>12. Contact Us</h2>
+        <h2>8. Contact Us</h2>
         <p>If you have questions about this Privacy Policy or our data practices, please contact us:</p>
         <div class="highlight">
-            <p><strong>Email:</strong> privacy@$DOMAIN_NAME</p>
-            <p><strong>Website:</strong> <a href="/">$DOMAIN_NAME</a></p>
-            <p><strong>Response Time:</strong> We aim to respond within 48 hours</p>
+            <p><strong>Email:</strong> privacy@DOMAIN_PLACEHOLDER</p>
+            <p><strong>Website:</strong> <a href="/">DOMAIN_PLACEHOLDER</a></p>
         </div>
         
         <a href="/" class="back-link">← Back to Home</a>
     </div>
 </body>
 </html>
-EOF
+PRIVACY_EOF
 
-# Terms of Service
+# Replace placeholders in privacy policy
+sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" "$WEB_ROOT/privacy.html"
+sed -i "s/DATE_PLACEHOLDER/$(date +'%B %d, %Y')/g" "$WEB_ROOT/privacy.html"
+
+# Create Terms of Service (simplified)
 cat > "$WEB_ROOT/terms.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -603,24 +611,8 @@ cat > "$WEB_ROOT/terms.html" <<EOF
             border-radius: 10px;
             box-shadow: 0 2px 20px rgba(0,0,0,0.05);
         }
-        h1 { 
-            color: #667eea; 
-            margin-bottom: 10px;
-            font-size: 2.5em;
-        }
-        .date {
-            color: #6c757d;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-        }
-        h2 { 
-            color: #495057; 
-            margin-top: 40px; 
-            margin-bottom: 20px;
-            font-size: 1.8em;
-            border-bottom: 2px solid #e9ecef;
-            padding-bottom: 10px;
-        }
+        h1 { color: #667eea; }
+        h2 { color: #495057; margin-top: 40px; }
         a { color: #667eea; }
         .back-link { 
             display: inline-block;
@@ -630,62 +622,25 @@ cat > "$WEB_ROOT/terms.html" <<EOF
             color: white;
             text-decoration: none;
             border-radius: 50px;
-            font-weight: 600;
         }
     </style>
 </head>
 <body>
     <div class="content">
         <h1>Terms of Service</h1>
-        <div class="date">Last Updated: $(date +'%B %d, %Y')</div>
+        <p>Last Updated: $(date +'%B %d, %Y')</p>
         
         <h2>1. Acceptance of Terms</h2>
-        <p>By subscribing to our email list or using our services, you agree to be bound by these Terms of Service and all applicable laws and regulations.</p>
+        <p>By subscribing to our email list or using our services, you agree to these Terms of Service.</p>
         
         <h2>2. Email Services</h2>
-        <p>Our email services are provided to subscribers who have explicitly opted in. You may unsubscribe at any time using the link provided in every email.</p>
+        <p>Our email services are provided to subscribers who have explicitly opted in. You may unsubscribe at any time.</p>
         
-        <h2>3. Acceptable Use</h2>
-        <p>You agree not to:</p>
-        <ul>
-            <li>Use our services for any unlawful purpose</li>
-            <li>Attempt to gain unauthorized access to our systems</li>
-            <li>Interfere with or disrupt our services</li>
-            <li>Transmit any viruses or malicious code</li>
-        </ul>
+        <h2>3. Anti-Spam Compliance</h2>
+        <p>We maintain strict compliance with CAN-SPAM, GDPR, and other anti-spam regulations.</p>
         
-        <h2>4. Anti-Spam Compliance</h2>
-        <p>We maintain strict compliance with CAN-SPAM, GDPR, and other anti-spam regulations. We never:</p>
-        <ul>
-            <li>Send unsolicited emails</li>
-            <li>Use deceptive subject lines</li>
-            <li>Hide sender identity</li>
-            <li>Ignore unsubscribe requests</li>
-        </ul>
-        
-        <h2>5. Intellectual Property</h2>
-        <p>All content provided through our services is protected by copyright and other intellectual property laws. You may not reproduce, distribute, or create derivative works without permission.</p>
-        
-        <h2>6. Disclaimer of Warranties</h2>
-        <p>Our services are provided "as is" without warranties of any kind, either express or implied, including but not limited to implied warranties of merchantability and fitness for a particular purpose.</p>
-        
-        <h2>7. Limitation of Liability</h2>
-        <p>We shall not be liable for any indirect, incidental, special, consequential, or punitive damages arising from your use of our services.</p>
-        
-        <h2>8. Indemnification</h2>
-        <p>You agree to indemnify and hold us harmless from any claims arising from your use of our services or violation of these terms.</p>
-        
-        <h2>9. Changes to Terms</h2>
-        <p>We reserve the right to modify these terms at any time. Continued use of our services constitutes acceptance of any changes.</p>
-        
-        <h2>10. Termination</h2>
-        <p>We may terminate or suspend access to our services immediately, without prior notice, for any breach of these Terms.</p>
-        
-        <h2>11. Governing Law</h2>
-        <p>These terms shall be governed by applicable laws without regard to conflict of law provisions.</p>
-        
-        <h2>12. Contact Information</h2>
-        <p>For questions about these Terms, please contact us at legal@$DOMAIN_NAME</p>
+        <h2>4. Contact Information</h2>
+        <p>For questions about these Terms, contact us at legal@$DOMAIN_NAME</p>
         
         <a href="/" class="back-link">← Back to Home</a>
     </div>
@@ -693,7 +648,7 @@ cat > "$WEB_ROOT/terms.html" <<EOF
 </html>
 EOF
 
-# Contact Page
+# Create Contact Page
 cat > "$WEB_ROOT/contact.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -717,35 +672,12 @@ cat > "$WEB_ROOT/contact.html" <<EOF
             border-radius: 10px;
             box-shadow: 0 2px 20px rgba(0,0,0,0.05);
         }
-        h1 { 
-            color: #667eea; 
-            margin-bottom: 30px;
-            font-size: 2.5em;
-        }
+        h1 { color: #667eea; }
         .contact-card {
             background: #f8f9fa;
             padding: 30px;
             border-radius: 10px;
             margin: 30px 0;
-            border: 1px solid #e9ecef;
-        }
-        .notice {
-            background: #e7f3ff;
-            border: 1px solid #667eea;
-            color: #004085;
-            padding: 20px;
-            border-radius: 5px;
-            margin: 20px 0;
-        }
-        .back-link { 
-            display: inline-block;
-            margin-top: 40px;
-            padding: 12px 30px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 50px;
-            font-weight: 600;
         }
         .address-box {
             background: white;
@@ -754,6 +686,15 @@ cat > "$WEB_ROOT/contact.html" <<EOF
             border-radius: 10px;
             margin: 30px 0;
         }
+        .back-link {
+            display: inline-block;
+            margin-top: 40px;
+            padding: 12px 30px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 50px;
+        }
     </style>
 </head>
 <body>
@@ -761,27 +702,9 @@ cat > "$WEB_ROOT/contact.html" <<EOF
         <h1>Contact Us</h1>
         
         <div class="contact-card">
-            <h2>Email Management</h2>
-            <p>To manage your email preferences or unsubscribe from our mailing list, please use the unsubscribe link provided in any email you receive from us.</p>
-            <p>This ensures we can properly identify your subscription and update your preferences immediately.</p>
-        </div>
-        
-        <div class="notice">
-            <strong>Quick Unsubscribe:</strong> Every email we send includes a one-click unsubscribe link at the bottom. This is the fastest way to manage your email preferences.
-        </div>
-        
-        <div class="contact-card">
             <h2>General Inquiries</h2>
             <p><strong>Domain:</strong> $DOMAIN_NAME</p>
             <p><strong>Email:</strong> contact@$DOMAIN_NAME</p>
-            <p><strong>Response Time:</strong> We typically respond within 24-48 hours</p>
-        </div>
-        
-        <div class="contact-card">
-            <h2>Privacy & Data Requests</h2>
-            <p>For privacy-related inquiries or data requests:</p>
-            <p><strong>Email:</strong> privacy@$DOMAIN_NAME</p>
-            <p>Please include your email address and the nature of your request.</p>
         </div>
         
         <div class="address-box">
@@ -794,15 +717,8 @@ cat > "$WEB_ROOT/contact.html" <<EOF
                 [COUNTRY]
             </p>
             <p style="margin-top: 20px; color: #6c757d; font-size: 0.9em;">
-                <em>Note: Please update this with your actual physical mailing address as required by CAN-SPAM regulations.</em>
+                <em>Note: Please update this with your actual physical mailing address.</em>
             </p>
-        </div>
-        
-        <div class="contact-card">
-            <h2>Report Abuse</h2>
-            <p>To report email abuse or spam:</p>
-            <p><strong>Email:</strong> abuse@$DOMAIN_NAME</p>
-            <p>Please forward the complete email including headers.</p>
         </div>
         
         <a href="/" class="back-link">← Back to Home</a>
@@ -812,7 +728,7 @@ cat > "$WEB_ROOT/contact.html" <<EOF
 EOF
 
 # Set permissions
-chown -R www-data:www-data "$WEB_ROOT"
+chown -R www-data:www-data "$WEB_ROOT" 2>/dev/null || chown -R nginx:nginx "$WEB_ROOT" 2>/dev/null
 chmod -R 755 "$WEB_ROOT"
 
 print_message "✓ Website files created"
@@ -822,6 +738,9 @@ print_message "✓ Website files created"
 # ===================================================================
 
 print_header "Configuring Nginx"
+
+# Remove default site if it exists
+rm -f /etc/nginx/sites-enabled/default 2>/dev/null
 
 # Create Nginx server block
 cat > /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
@@ -870,21 +789,20 @@ EOF
 
 # Enable site
 ln -sf /etc/nginx/sites-available/$DOMAIN_NAME /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
 
 # Test nginx configuration
-nginx -t 2>/dev/null
-if [ $? -eq 0 ]; then
-    systemctl restart nginx
-    systemctl enable nginx
-    print_message "✓ Nginx configured and restarted"
+echo -n "Testing Nginx configuration... "
+if nginx -t 2>/dev/null; then
+    print_message "✓ Valid"
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null
 else
-    print_error "✗ Nginx configuration error"
+    print_error "✗ Invalid configuration"
+    echo "Nginx configuration error:"
     nginx -t
 fi
 
 # ===================================================================
-# 5. CREATE CONFIGURATION REMINDER
+# 5. CREATE SETUP INSTRUCTIONS
 # ===================================================================
 
 cat > "$WEB_ROOT/setup-instructions.txt" <<EOF
@@ -914,42 +832,16 @@ IMPORTANT SETUP STEPS:
 4. SSL CERTIFICATE (After DNS propagates):
    Command: certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME
 
-COMPLIANCE CHECKLIST:
-=====================
-✓ Privacy Policy page created
-✓ Terms of Service page created
-✓ Contact page with address placeholder
-✓ Unsubscribe link configured (needs Mailwizz URL)
-✓ CAN-SPAM compliant structure
-✓ GDPR-ready privacy policy
-
-WEBSITE FEATURES:
-=================
-• Professional design
-• Mobile responsive
-• Security headers configured
-• Gzip compression enabled
-• Cache optimization
-• Clean, semantic HTML
-
-TEST YOUR WEBSITE:
-==================
-1. Visit: http://$DOMAIN_NAME
-2. Check all pages load correctly
-3. Verify links work
-4. Test on mobile devices
-
-MAILWIZZ INTEGRATION:
-=====================
-When setting up Mailwizz:
-- Use $HOSTNAME as SMTP server
-- Port 587 (TLS) or 465 (SSL)
-- Update unsubscribe URL in nginx config
-- Include website URL in email footers
-
+Website Features:
+- Privacy Policy page
+- Terms of Service page
+- Contact page with address
+- Unsubscribe redirect
+- Mobile responsive design
+- Security headers configured
 EOF
 
-chown www-data:www-data "$WEB_ROOT/setup-instructions.txt"
+chown www-data:www-data "$WEB_ROOT/setup-instructions.txt" 2>/dev/null || true
 
 # ===================================================================
 # COMPLETION
@@ -982,7 +874,7 @@ echo ""
 
 # Quick test
 echo -n "Testing local web server... "
-if curl -s -o /dev/null -w "%{http_code}" "http://localhost" | grep -q "200\|301\|302"; then
+if curl -s -o /dev/null -w "%{http_code}" "http://localhost" 2>/dev/null | grep -q "200\|301\|302"; then
     print_message "✓ Web server responding"
 else
     print_warning "⚠ Web server may need configuration"
