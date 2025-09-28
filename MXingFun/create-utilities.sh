@@ -2,8 +2,9 @@
 
 # =================================================================
 # MAIL SERVER UTILITY SCRIPTS CREATOR
-# Version: 16.0.2
+# Version: 16.0.3
 # Creates helpful management scripts for the mail server
+# With improved email sending utilities and clear instructions
 # =================================================================
 
 # This script creates various utility commands for managing the mail server
@@ -30,6 +31,13 @@ print_header "Creating Mail Server Utilities"
 
 # Create directory for utilities
 mkdir -p /usr/local/bin
+
+# Load configuration if available
+if [ -f "$(pwd)/install.conf" ]; then
+    source "$(pwd)/install.conf"
+elif [ -f "/root/mail-installer/install.conf" ]; then
+    source "/root/mail-installer/install.conf"
+fi
 
 # ===================================================================
 # 1. EMAIL ACCOUNT MANAGER
@@ -74,7 +82,18 @@ ON DUPLICATE KEY UPDATE password='$HASH';
 SQL
         
         if [ $? -eq 0 ]; then
+            # Create mail directory
+            MAIL_USER="${EMAIL%@*}"
+            MAIL_DOMAIN="${EMAIL#*@}"
+            MAIL_DIR="/var/vmail/$MAIL_DOMAIN/$MAIL_USER"
+            mkdir -p "$MAIL_DIR"
+            chown -R vmail:vmail /var/vmail/
+            
             echo "✓ Account created: $EMAIL"
+            echo "  Mail directory: $MAIL_DIR"
+            echo ""
+            echo "Test this account with:"
+            echo "  test-email recipient@example.com $EMAIL"
         else
             echo "✗ Failed to create account"
         fi
@@ -99,7 +118,7 @@ SQL
         
     list)
         echo "Email accounts:"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT email FROM virtual_users;" 2>/dev/null | tail -n +2
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT email, active, created_at FROM virtual_users ORDER BY email;" 2>/dev/null
         ;;
         
     *)
@@ -110,6 +129,11 @@ SQL
         echo "  add email@domain.com password  - Add new account"
         echo "  delete email@domain.com        - Delete account"
         echo "  list                           - List all accounts"
+        echo ""
+        echo "Examples:"
+        echo "  mail-account add user@example.com MyPassword123"
+        echo "  mail-account delete user@example.com"
+        echo "  mail-account list"
         ;;
 esac
 EOF
@@ -180,49 +204,199 @@ EOF
 chmod +x /usr/local/bin/mail-queue
 
 # ===================================================================
-# 3. TEST EMAIL SENDER
+# 3. TEST EMAIL SENDER - IMPROVED VERSION
 # ===================================================================
 
-print_message "Creating test email sender..."
+print_message "Creating improved test email sender..."
 
 cat > /usr/local/bin/test-email << 'EOF'
 #!/bin/bash
 
-# Test Email Sender
+# Advanced Test Email Sender with clear instructions
 
-TO="${1:-check-auth@verifier.port25.com}"
-FROM="${2:-test@$(hostname -d)}"
-SUBJECT="Test Email - $(date)"
+# Get default domain from postfix
+DEFAULT_DOMAIN=$(postconf -h mydomain 2>/dev/null || hostname -d)
 
-# Create test email
+# Check for parameters
+TO="${1}"
+FROM="${2}"
+
+# If no recipient provided, show usage
+if [ -z "$TO" ]; then
+    echo "TEST EMAIL SENDER"
+    echo "================="
+    echo ""
+    echo "Usage: test-email <recipient> [from-address]"
+    echo ""
+    echo "Examples:"
+    echo "  test-email admin@example.com"
+    echo "  test-email check-auth@verifier.port25.com newsletter@yourdomain.com"
+    echo "  test-email test@mail-tester.com user@yourdomain.com"
+    echo ""
+    echo "Popular test services:"
+    echo "  • check-auth@verifier.port25.com - Tests authentication (SPF, DKIM, DMARC)"
+    echo "  • Go to https://www.mail-tester.com to get a unique test address"
+    echo ""
+    echo "Your configured email accounts:"
+    if [ -f /root/.mail_db_password ]; then
+        DB_PASS=$(cat /root/.mail_db_password)
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT email FROM virtual_users WHERE active=1;" 2>/dev/null | tail -n +2
+    fi
+    exit 1
+fi
+
+# If no FROM address, try to find one
+if [ -z "$FROM" ]; then
+    # Try to get first email account from database
+    if [ -f /root/.mail_db_password ]; then
+        DB_PASS=$(cat /root/.mail_db_password)
+        FIRST_ACCOUNT=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT email FROM virtual_users WHERE active=1 LIMIT 1;" 2>/dev/null | tail -1)
+        if [ ! -z "$FIRST_ACCOUNT" ] && [ "$FIRST_ACCOUNT" != "email" ]; then
+            FROM="$FIRST_ACCOUNT"
+            echo "Using sender: $FROM"
+        else
+            FROM="test@$DEFAULT_DOMAIN"
+            echo "No email accounts found. Using: $FROM"
+            echo "Create an account first with: mail-account add user@$DEFAULT_DOMAIN password"
+        fi
+    else
+        FROM="test@$DEFAULT_DOMAIN"
+    fi
+fi
+
+SUBJECT="Test Email from $FROM - $(date)"
+
+# Create comprehensive test email
 cat <<MESSAGE | sendmail -f "$FROM" "$TO"
 From: $FROM
 To: $TO
 Subject: $SUBJECT
 Date: $(date -R)
+Message-ID: <$(date +%s).$(openssl rand -hex 8)@$(hostname -f)>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
 
 This is a test email from your mail server.
 
-Server: $(hostname -f)
-IP: $(hostname -I | awk '{print $1}')
-Time: $(date)
+========================================
+SERVER INFORMATION
+========================================
+Timestamp: $(date)
+Hostname: $(hostname -f)
+Domain: $DEFAULT_DOMAIN
+Server IP: $(hostname -I | awk '{print $1}')
+From Address: $FROM
+To Address: $TO
 
-This email was sent to verify that your mail server is working correctly.
+========================================
+AUTHENTICATION TEST
+========================================
+This email tests the following:
+✓ SMTP delivery
+✓ SPF authentication
+✓ DKIM signature
+✓ DMARC policy
+
+========================================
+CONFIGURATION STATUS
+========================================
+$(systemctl is-active postfix >/dev/null && echo "✓ Postfix: Running" || echo "✗ Postfix: Not running")
+$(systemctl is-active dovecot >/dev/null && echo "✓ Dovecot: Running" || echo "✗ Dovecot: Not running")
+$(systemctl is-active opendkim >/dev/null && echo "✓ OpenDKIM: Running" || echo "✗ OpenDKIM: Not running")
+
+========================================
+
+This email was generated automatically by the mail server testing utility.
+If you received this message, your mail server is working!
+
+For authentication results, send test emails to:
+• check-auth@verifier.port25.com
+• https://www.mail-tester.com
+
 MESSAGE
 
 if [ $? -eq 0 ]; then
-    echo "✓ Test email sent"
+    echo "✓ Test email sent successfully!"
+    echo ""
+    echo "Details:"
     echo "  From: $FROM"
     echo "  To: $TO"
+    echo "  Subject: $SUBJECT"
     echo ""
-    echo "Check the mail log for delivery status:"
-    echo "  tail -f /var/log/mail.log"
+    echo "Check delivery status with:"
+    echo "  mail-log sent | grep '$TO'"
+    echo ""
+    echo "Or follow the mail log:"
+    echo "  mail-log follow"
+    echo ""
+    if [[ "$TO" == *"verifier.port25.com"* ]]; then
+        echo "Port25 will reply with authentication results to: $FROM"
+        echo "Check results in a few minutes."
+    fi
+    if [[ "$TO" == *"mail-tester.com"* ]]; then
+        echo "Check your score at: https://www.mail-tester.com"
+    fi
 else
     echo "✗ Failed to send test email"
+    echo ""
+    echo "Troubleshooting:"
+    echo "1. Check if services are running: mail-status"
+    echo "2. Check logs: mail-log errors"
+    echo "3. Verify account exists: mail-account list"
+    echo "4. Check DNS: check-dns"
 fi
 EOF
 
 chmod +x /usr/local/bin/test-email
+
+# ===================================================================
+# 3B. SIMPLE EMAIL SENDER
+# ===================================================================
+
+print_message "Creating simple email sender..."
+
+cat > /usr/local/bin/send-email << 'EOF'
+#!/bin/bash
+
+# Simple Email Sender
+
+if [ $# -lt 3 ]; then
+    echo "SIMPLE EMAIL SENDER"
+    echo "==================="
+    echo ""
+    echo "Usage: send-email <to> <subject> <message> [from]"
+    echo ""
+    echo "Examples:"
+    echo "  send-email admin@example.com \"Hello\" \"This is a test message\""
+    echo "  send-email user@example.com \"Subject\" \"Message body\" sender@yourdomain.com"
+    echo ""
+    echo "For testing, use: test-email"
+    exit 1
+fi
+
+TO="$1"
+SUBJECT="$2"
+MESSAGE="$3"
+FROM="${4:-$(whoami)@$(hostname -d)}"
+
+# Send the email
+(
+echo "From: $FROM"
+echo "To: $TO"
+echo "Subject: $SUBJECT"
+echo "Date: $(date -R)"
+echo ""
+echo "$MESSAGE"
+) | sendmail -f "$FROM" "$TO"
+
+if [ $? -eq 0 ]; then
+    echo "✓ Email sent to $TO"
+else
+    echo "✗ Failed to send email"
+fi
+EOF
+
+chmod +x /usr/local/bin/send-email
 
 # ===================================================================
 # 4. MAIL SERVER STATUS
@@ -252,6 +426,17 @@ done
 
 echo ""
 
+# Email accounts
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+    ACCOUNT_COUNT=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_users WHERE active=1;" 2>/dev/null | tail -1)
+    DOMAIN_COUNT=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_domains;" 2>/dev/null | tail -1)
+    echo "Email Configuration:"
+    echo "  Domains: $DOMAIN_COUNT"
+    echo "  Accounts: $ACCOUNT_COUNT"
+    echo ""
+fi
+
 # Ports
 echo "Listening Ports:"
 netstat -tlnp 2>/dev/null | grep -E ":(25|110|143|465|587|993|995)\s" | while read line; do
@@ -278,6 +463,13 @@ echo ""
 # Recent logs
 echo "Recent Activity (last 5 entries):"
 tail -5 /var/log/mail.log 2>/dev/null | sed 's/^/  /'
+
+echo ""
+echo "Quick Commands:"
+echo "  test-email <recipient>  - Send a test email"
+echo "  mail-account list       - List email accounts"
+echo "  mail-queue show        - Show mail queue"
+echo "  mail-log follow        - Follow mail log"
 EOF
 
 chmod +x /usr/local/bin/mail-status
@@ -302,31 +494,67 @@ echo ""
 
 # A Record
 echo -n "A record (mail.$DOMAIN): "
-dig +short A mail.$DOMAIN @8.8.8.8 || echo "NOT FOUND"
+A_RECORD=$(dig +short A mail.$DOMAIN @8.8.8.8)
+if [ ! -z "$A_RECORD" ]; then
+    echo "✓ $A_RECORD"
+else
+    echo "✗ NOT FOUND"
+fi
 
 # MX Record
 echo -n "MX record ($DOMAIN): "
-dig +short MX $DOMAIN @8.8.8.8 || echo "NOT FOUND"
+MX_RECORD=$(dig +short MX $DOMAIN @8.8.8.8)
+if [ ! -z "$MX_RECORD" ]; then
+    echo "✓ $MX_RECORD"
+else
+    echo "✗ NOT FOUND"
+fi
 
 # SPF Record
 echo -n "SPF record ($DOMAIN): "
-dig +short TXT $DOMAIN @8.8.8.8 | grep "v=spf1" || echo "NOT FOUND"
+SPF_RECORD=$(dig +short TXT $DOMAIN @8.8.8.8 | grep "v=spf1")
+if [ ! -z "$SPF_RECORD" ]; then
+    echo "✓ Found"
+    echo "  $SPF_RECORD"
+else
+    echo "✗ NOT FOUND"
+fi
 
 # DKIM Record
 echo -n "DKIM record (mail._domainkey.$DOMAIN): "
-dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 | head -1 || echo "NOT FOUND"
+DKIM_RECORD=$(dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 | head -1)
+if [ ! -z "$DKIM_RECORD" ]; then
+    echo "✓ Found (key present)"
+else
+    echo "✗ NOT FOUND"
+fi
 
 # DMARC Record
 echo -n "DMARC record (_dmarc.$DOMAIN): "
-dig +short TXT _dmarc.$DOMAIN @8.8.8.8 || echo "NOT FOUND"
+DMARC_RECORD=$(dig +short TXT _dmarc.$DOMAIN @8.8.8.8)
+if [ ! -z "$DMARC_RECORD" ]; then
+    echo "✓ $DMARC_RECORD"
+else
+    echo "✗ NOT FOUND"
+fi
 
 # PTR Record
 IP=$(dig +short A mail.$DOMAIN @8.8.8.8 | head -1)
 if [ ! -z "$IP" ]; then
     echo -n "PTR record ($IP): "
-    dig +short -x $IP @8.8.8.8 || echo "NOT FOUND"
+    PTR=$(dig +short -x $IP @8.8.8.8)
+    if [ ! -z "$PTR" ]; then
+        echo "✓ $PTR"
+    else
+        echo "✗ NOT SET (contact your hosting provider)"
+    fi
 fi
 
+echo ""
+echo "Test your configuration:"
+echo "  • Send test to: check-auth@verifier.port25.com"
+echo "  • Check score at: https://www.mail-tester.com"
+echo "  • MX Toolbox: https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN"
 echo ""
 echo "Note: DNS propagation can take up to 48 hours"
 EOF
@@ -361,6 +589,7 @@ tar czf "$BACKUP_FILE" \
     /var/vmail \
     /root/.mail_db_password \
     /root/dns-records-*.txt \
+    /root/cloudflare-dns-config.txt \
     2>/dev/null
 
 if [ $? -eq 0 ]; then
@@ -369,6 +598,16 @@ if [ $? -eq 0 ]; then
     
     # Keep only last 7 backups
     ls -t $BACKUP_DIR/mailserver-*.tar.gz | tail -n +8 | xargs -r rm
+    
+    # Show backup contents
+    echo ""
+    echo "Backup includes:"
+    echo "  • Postfix configuration"
+    echo "  • Dovecot configuration"
+    echo "  • OpenDKIM keys and config"
+    echo "  • All mailboxes (/var/vmail)"
+    echo "  • Database password"
+    echo "  • DNS configuration"
 else
     echo "✗ Backup failed"
 fi
@@ -393,15 +632,23 @@ case "$1" in
         ;;
         
     errors)
+        echo "Recent errors and warnings:"
         grep -i "error\|warning\|fatal\|panic" /var/log/mail.log | tail -20
         ;;
         
     sent)
+        echo "Recently sent emails:"
         grep "status=sent" /var/log/mail.log | tail -20
         ;;
         
     bounced)
+        echo "Recently bounced emails:"
         grep "status=bounced" /var/log/mail.log | tail -20
+        ;;
+        
+    today)
+        echo "Today's activity:"
+        grep "$(date +'%b %e')" /var/log/mail.log | tail -50
         ;;
         
     search)
@@ -409,24 +656,141 @@ case "$1" in
             echo "Usage: mail-log search <pattern>"
             exit 1
         fi
+        echo "Searching for: $2"
         grep -i "$2" /var/log/mail.log | tail -20
         ;;
         
     *)
         echo "Mail Log Viewer"
-        echo "Usage: mail-log {follow|errors|sent|bounced|search <pattern>}"
+        echo "Usage: mail-log {follow|errors|sent|bounced|today|search <pattern>}"
         echo ""
         echo "Commands:"
         echo "  follow         - Follow log in real-time"
         echo "  errors         - Show recent errors"
         echo "  sent           - Show recently sent mail"
         echo "  bounced        - Show recently bounced mail"
+        echo "  today          - Show today's activity"
         echo "  search <text>  - Search for pattern"
+        echo ""
+        echo "Examples:"
+        echo "  mail-log follow"
+        echo "  mail-log sent"
+        echo "  mail-log search gmail.com"
         ;;
 esac
 EOF
 
 chmod +x /usr/local/bin/mail-log
+
+# ===================================================================
+# 8. QUICK MAIL TEST
+# ===================================================================
+
+print_message "Creating quick mail test utility..."
+
+cat > /usr/local/bin/mail-test << 'EOF'
+#!/bin/bash
+
+echo "QUICK MAIL SERVER TEST"
+echo "======================"
+echo ""
+
+# Get domain info
+DOMAIN=$(postconf -h mydomain 2>/dev/null || hostname -d)
+HOSTNAME=$(postconf -h myhostname 2>/dev/null || hostname -f)
+
+# 1. Service check
+echo "1. Service Status:"
+SERVICES_OK=0
+for service in postfix dovecot opendkim; do
+    printf "   %-10s: " "$service"
+    if systemctl is-active --quiet $service; then
+        echo "✓ Running"
+        SERVICES_OK=$((SERVICES_OK + 1))
+    else
+        echo "✗ Not running"
+        echo "     Fix with: systemctl start $service"
+    fi
+done
+echo ""
+
+# 2. Port check
+echo "2. Port Status:"
+PORTS_OK=0
+for port in 25 587 993; do
+    printf "   Port %-5s: " "$port"
+    if netstat -tln 2>/dev/null | grep -q ":$port "; then
+        echo "✓ Open"
+        PORTS_OK=$((PORTS_OK + 1))
+    else
+        echo "✗ Closed"
+    fi
+done
+echo ""
+
+# 3. Email accounts
+echo "3. Email Accounts:"
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+    ACCOUNTS=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT email FROM virtual_users WHERE active=1;" 2>/dev/null | tail -n +2)
+    if [ ! -z "$ACCOUNTS" ]; then
+        echo "$ACCOUNTS" | while read account; do
+            echo "   • $account"
+        done
+    else
+        echo "   ✗ No email accounts found"
+        echo "   Create one with: mail-account add user@$DOMAIN password"
+    fi
+else
+    echo "   ✗ Database not configured"
+fi
+echo ""
+
+# 4. DNS check
+echo "4. DNS Quick Check:"
+printf "   MX Record : "
+if dig +short MX $DOMAIN @8.8.8.8 | grep -q mail.$DOMAIN; then
+    echo "✓ Configured"
+else
+    echo "✗ Not found or incorrect"
+fi
+printf "   A Record  : "
+if [ ! -z "$(dig +short A mail.$DOMAIN @8.8.8.8)" ]; then
+    echo "✓ Configured"
+else
+    echo "✗ Not found"
+fi
+echo ""
+
+# 5. SSL Certificate
+echo "5. SSL Certificate:"
+if [ -f "/etc/letsencrypt/live/mail.$DOMAIN/fullchain.pem" ]; then
+    echo "   ✓ Let's Encrypt certificate installed"
+    EXPIRY=$(openssl x509 -in /etc/letsencrypt/live/mail.$DOMAIN/fullchain.pem -noout -enddate 2>/dev/null | cut -d= -f2)
+    echo "   Expires: $EXPIRY"
+else
+    echo "   ✗ No Let's Encrypt certificate"
+    echo "   Get one with: certbot certonly --standalone -d mail.$DOMAIN"
+fi
+echo ""
+
+# Summary
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ $SERVICES_OK -eq 3 ] && [ $PORTS_OK -eq 3 ]; then
+    echo "✓ Server appears to be working!"
+    echo ""
+    echo "Next steps:"
+    echo "1. Send a test email: test-email check-auth@verifier.port25.com"
+    echo "2. Check your score: https://www.mail-tester.com"
+    echo "3. Monitor logs: mail-log follow"
+else
+    echo "⚠ Some issues detected. Please fix them before sending emails."
+    echo ""
+    echo "For detailed diagnosis run: troubleshoot"
+fi
+EOF
+
+chmod +x /usr/local/bin/mail-test
 
 # ===================================================================
 # COMPLETION
@@ -436,18 +800,38 @@ print_header "Utilities Created Successfully!"
 echo ""
 echo "Available commands:"
 echo ""
-echo "  mail-account  - Manage email accounts"
-echo "  mail-queue    - Manage mail queue"
-echo "  mail-status   - Check server status"
-echo "  mail-backup   - Backup mail server"
-echo "  mail-log      - View mail logs"
-echo "  test-email    - Send test email"
-echo "  check-dns     - Check DNS records"
+echo "ESSENTIAL COMMANDS:"
+echo "  test-email     - Send test email (with instructions!)"
+echo "  mail-account   - Manage email accounts"
+echo "  mail-status    - Check server status"
+echo "  check-dns      - Verify DNS records"
 echo ""
-echo "Examples:"
-echo "  mail-account add user@domain.com password123"
-echo "  mail-queue show"
-echo "  test-email recipient@example.com"
-echo "  check-dns yourdomain.com"
+echo "MANAGEMENT COMMANDS:"
+echo "  send-email     - Send simple email"
+echo "  mail-queue     - Manage mail queue"
+echo "  mail-backup    - Backup mail server"
+echo "  mail-log       - View mail logs"
+echo "  mail-test      - Quick server test"
+echo "  maildb         - Database management"
+echo ""
+echo "QUICK EXAMPLES:"
+
+# Show domain-specific examples if available
+if [ ! -z "$DOMAIN_NAME" ]; then
+    if [ ! -z "$FIRST_EMAIL" ]; then
+        echo "  test-email recipient@example.com $FIRST_EMAIL"
+    else
+        echo "  mail-account add user@$DOMAIN_NAME password123"
+        echo "  test-email recipient@example.com user@$DOMAIN_NAME"
+    fi
+    echo "  check-dns $DOMAIN_NAME"
+else
+    echo "  mail-account add user@yourdomain.com password123"
+    echo "  test-email check-auth@verifier.port25.com"
+    echo "  check-dns yourdomain.com"
+fi
+
+echo "  mail-status"
+echo "  mail-log follow"
 echo ""
 echo "✓ All utilities have been created in /usr/local/bin/"
