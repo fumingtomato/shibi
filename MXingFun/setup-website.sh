@@ -2,7 +2,7 @@
 
 # =================================================================
 # SIMPLE WEBSITE SETUP FOR BULK EMAIL DOMAIN REPUTATION
-# Version: 2.0
+# Version: 2.1
 # Creates basic website with privacy policy and placeholder for Mailwizz
 # No database, no tracking - Mailwizz handles everything
 # =================================================================
@@ -48,6 +48,26 @@ elif [ -f "/root/mail-installer/install.conf" ]; then
     source "/root/mail-installer/install.conf"
 fi
 
+# Get domain from system if not in config
+if [ -z "$DOMAIN_NAME" ]; then
+    if [ -f /etc/postfix/main.cf ]; then
+        DOMAIN_NAME=$(postconf -h mydomain 2>/dev/null)
+    fi
+    
+    if [ -z "$DOMAIN_NAME" ]; then
+        read -p "Enter your domain name: " DOMAIN_NAME
+    fi
+fi
+
+# Get primary IP if not in config
+if [ -z "$PRIMARY_IP" ]; then
+    PRIMARY_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
+fi
+
+echo "Domain: $DOMAIN_NAME"
+echo "Primary IP: $PRIMARY_IP"
+echo ""
+
 # ===================================================================
 # 1. INSTALL NGINX (LIGHTWEIGHT, NO PHP NEEDED)
 # ===================================================================
@@ -61,7 +81,101 @@ apt-get install -y nginx > /dev/null 2>&1
 print_message "✓ Nginx installed"
 
 # ===================================================================
-# 2. CONFIGURE NGINX
+# 2. ADD DNS A RECORD FOR DOMAIN (IF USING CLOUDFLARE)
+# ===================================================================
+
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]] && [ ! -z "$CF_API_KEY" ]; then
+    print_header "Adding Website DNS Record"
+    
+    echo "Adding A record for $DOMAIN_NAME to Cloudflare..."
+    
+    # Load Cloudflare credentials
+    CREDS_FILE="/root/.cloudflare_credentials"
+    if [ -f "$CREDS_FILE" ]; then
+        source "$CREDS_FILE"
+        CF_API_KEY="${SAVED_CF_API_KEY:-$CF_API_KEY}"
+        CF_EMAIL="${SAVED_CF_EMAIL:-}"
+    fi
+    
+    # Get Zone ID
+    echo -n "Getting Zone ID... "
+    ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+        -H "Authorization: Bearer $CF_API_KEY" \
+        -H "Content-Type: application/json")
+    
+    SUCCESS=$(echo "$ZONE_RESPONSE" | jq -r '.success' 2>/dev/null)
+    
+    # Try with email if token fails
+    if [ "$SUCCESS" != "true" ] && [ ! -z "$CF_EMAIL" ]; then
+        ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_API_KEY" \
+            -H "Content-Type: application/json")
+        AUTH_METHOD="global"
+    else
+        AUTH_METHOD="token"
+    fi
+    
+    ZONE_ID=$(echo "$ZONE_RESPONSE" | jq -r '.result[0].id' 2>/dev/null)
+    
+    if [ ! -z "$ZONE_ID" ] && [ "$ZONE_ID" != "null" ]; then
+        echo "✓ Found"
+        
+        # Check for existing A record for domain
+        echo -n "Checking for existing A record for $DOMAIN_NAME... "
+        
+        if [ "$AUTH_METHOD" == "global" ]; then
+            EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN_NAME" \
+                -H "X-Auth-Email: $CF_EMAIL" \
+                -H "X-Auth-Key: $CF_API_KEY" \
+                -H "Content-Type: application/json")
+        else
+            EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN_NAME" \
+                -H "Authorization: Bearer $CF_API_KEY" \
+                -H "Content-Type: application/json")
+        fi
+        
+        RECORD_COUNT=$(echo "$EXISTING" | jq '.result | length' 2>/dev/null || echo "0")
+        
+        if [ "$RECORD_COUNT" -eq 0 ]; then
+            echo "Not found"
+            
+            # Add A record for website
+            echo -n "Adding A record for website... "
+            
+            JSON_DATA=$(jq -n \
+                --arg type "A" \
+                --arg name "$DOMAIN_NAME" \
+                --arg content "$PRIMARY_IP" \
+                '{type: $type, name: $name, content: $content, proxied: false}')
+            
+            if [ "$AUTH_METHOD" == "global" ]; then
+                RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                    -H "X-Auth-Email: $CF_EMAIL" \
+                    -H "X-Auth-Key: $CF_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    --data "$JSON_DATA")
+            else
+                RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                    -H "Authorization: Bearer $CF_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    --data "$JSON_DATA")
+            fi
+            
+            if [ "$(echo "$RESPONSE" | jq -r '.success' 2>/dev/null)" == "true" ]; then
+                print_message "✓ A record added for website!"
+            else
+                print_warning "⚠ Could not add A record"
+            fi
+        else
+            print_message "✓ A record already exists"
+        fi
+    fi
+    echo ""
+fi
+
+# ===================================================================
+# 3. CONFIGURE NGINX
 # ===================================================================
 
 print_header "Configuring Nginx"
@@ -108,7 +222,7 @@ rm -f /etc/nginx/sites-enabled/default
 print_message "✓ Nginx configured"
 
 # ===================================================================
-# 3. CREATE SIMPLE STATIC WEBSITE
+# 4. CREATE SIMPLE STATIC WEBSITE
 # ===================================================================
 
 print_header "Creating Website Files"
@@ -575,7 +689,7 @@ chown -R www-data:www-data "$WEB_ROOT"
 chmod -R 755 "$WEB_ROOT"
 
 # ===================================================================
-# 4. SSL CERTIFICATE FOR WEBSITE
+# 5. SSL CERTIFICATE FOR WEBSITE
 # ===================================================================
 
 print_header "Configuring SSL for Website"
@@ -586,18 +700,22 @@ if command -v certbot &> /dev/null; then
     if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
         echo "Attempting to get Let's Encrypt certificate..."
         
-        certbot certonly --webroot \
-            -w "$WEB_ROOT" \
-            -d "$DOMAIN_NAME" \
-            -d "www.$DOMAIN_NAME" \
-            --non-interactive \
-            --agree-tos \
-            --email "$ADMIN_EMAIL" \
-            --no-eff-email 2>/dev/null
-        
-        if [ $? -eq 0 ]; then
-            # Add SSL configuration to Nginx
-            cat >> /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
+        # Check if certificate already exists
+        if [ -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
+            print_message "✓ SSL certificate already exists for $DOMAIN_NAME"
+        else
+            certbot certonly --webroot \
+                -w "$WEB_ROOT" \
+                -d "$DOMAIN_NAME" \
+                -d "www.$DOMAIN_NAME" \
+                --non-interactive \
+                --agree-tos \
+                --email "$ADMIN_EMAIL" \
+                --no-eff-email 2>/dev/null
+            
+            if [ $? -eq 0 ]; then
+                # Add SSL configuration to Nginx
+                cat >> /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
 
 server {
     listen 443 ssl http2;
@@ -634,9 +752,10 @@ server {
     return 301 https://\$server_name\$request_uri;
 }
 EOF
-            print_message "✓ SSL certificate obtained"
-        else
-            print_warning "Could not get SSL certificate (DNS might not be ready)"
+                print_message "✓ SSL certificate obtained"
+            else
+                print_warning "Could not get SSL certificate (DNS might not be ready)"
+            fi
         fi
     else
         print_warning "DNS not resolving yet for website"
@@ -644,7 +763,7 @@ EOF
 fi
 
 # ===================================================================
-# 5. RESTART SERVICES
+# 6. RESTART SERVICES
 # ===================================================================
 
 print_header "Starting Web Services"
@@ -678,6 +797,14 @@ echo "  • Homepage: http://$DOMAIN_NAME/"
 echo "  • Privacy Policy: http://$DOMAIN_NAME/privacy.html"
 echo "  • Terms of Service: http://$DOMAIN_NAME/terms.html"
 echo "  • Contact: http://$DOMAIN_NAME/contact.html"
+echo ""
+
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    echo "DNS Status:"
+    echo -n "  A record for $DOMAIN_NAME: "
+    dig +short A $DOMAIN_NAME @1.1.1.1 2>/dev/null && echo "✓ Active" || echo "Propagating..."
+fi
+
 echo ""
 print_warning "IMPORTANT NEXT STEPS:"
 echo ""
