@@ -2,7 +2,7 @@
 
 # =================================================================
 # MAIL SERVER DATABASE SETUP
-# Version: 16.0.2
+# Version: 16.0.3
 # Creates and configures MySQL database for virtual mail hosting
 # =================================================================
 
@@ -34,6 +34,13 @@ echo ""
 if [[ $EUID -ne 0 ]]; then
     print_error "This script must be run as root"
     exit 1
+fi
+
+# Load configuration from installer
+if [ -f "$(pwd)/install.conf" ]; then
+    source "$(pwd)/install.conf"
+elif [ -f "/root/mail-installer/install.conf" ]; then
+    source "/root/mail-installer/install.conf"
 fi
 
 # Check if MySQL/MariaDB is installed
@@ -375,17 +382,19 @@ echo ""
 echo "Management command: maildb"
 echo ""
 
-# Optional: Add default domain
-read -p "Would you like to add a default domain now? (y/n): " ADD_DOMAIN
-if [[ "${ADD_DOMAIN,,}" == "y" ]]; then
-    read -p "Enter domain name: " DOMAIN
+# AUTOMATICALLY ADD THE DOMAIN FROM INSTALLER - NO QUESTIONS!
+if [ ! -z "$DOMAIN_NAME" ]; then
+    echo "Adding domain $DOMAIN_NAME to database..."
     mysql -u mailuser -p"$DB_PASSWORD" mailserver <<SQL 2>/dev/null
-INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN');
+INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN_NAME');
 SQL
-    echo "✓ Domain added: $DOMAIN"
+    echo "✓ Domain added: $DOMAIN_NAME"
     echo ""
     echo "You can now add email accounts with:"
-    echo "  mail-account add user@$DOMAIN password"
+    echo "  mail-account add user@$DOMAIN_NAME password"
+else
+    echo "Note: No domain configured yet. Add domains with:"
+    echo "  maildb add-domain yourdomain.com"
 fi
 
 echo ""
