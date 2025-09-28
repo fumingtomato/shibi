@@ -2,7 +2,7 @@
 
 # =================================================================
 # CLOUDFLARE DNS AUTOMATIC SETUP FOR MAIL SERVER
-# Version: 1.0
+# Version: 1.1
 # Automatically adds all required DNS records to Cloudflare
 # =================================================================
 
@@ -49,24 +49,38 @@ if ! command -v jq &> /dev/null; then
     apt-get update && apt-get install -y jq
 fi
 
-# Get configuration from existing setup
-if [ -f /etc/postfix/main.cf ]; then
-    HOSTNAME=$(postconf -h myhostname 2>/dev/null)
-    DOMAIN=$(postconf -h mydomain 2>/dev/null)
-else
-    read -p "Enter your domain name (e.g., example.com): " DOMAIN
-    HOSTNAME="mail.$DOMAIN"
+# Load configuration from installer (REUSE EXISTING CONFIG!)
+if [ -f "$(pwd)/install.conf" ]; then
+    source "$(pwd)/install.conf"
+elif [ -f "/root/mail-installer/install.conf" ]; then
+    source "/root/mail-installer/install.conf"
 fi
 
-PRIMARY_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
+# If DOMAIN_NAME is not set from installer config, get from postfix
+if [ -z "$DOMAIN_NAME" ]; then
+    if [ -f /etc/postfix/main.cf ]; then
+        HOSTNAME=$(postconf -h myhostname 2>/dev/null)
+        DOMAIN_NAME=$(postconf -h mydomain 2>/dev/null)
+    else
+        print_error "Domain configuration not found!"
+        exit 1
+    fi
+else
+    HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+fi
+
+# Use PRIMARY_IP from installer config or detect it
+if [ -z "$PRIMARY_IP" ]; then
+    PRIMARY_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
+fi
 
 echo "Configuration detected:"
-echo "  Domain: $DOMAIN"
+echo "  Domain: $DOMAIN_NAME"
 echo "  Hostname: $HOSTNAME"
 echo "  Primary IP: $PRIMARY_IP"
 echo ""
 
-# Get Cloudflare credentials
+# Get Cloudflare credentials - PROPER INPUT HANDLING
 print_header "Cloudflare API Credentials"
 echo ""
 echo "You need your Cloudflare API credentials to proceed."
@@ -75,27 +89,45 @@ echo ""
 
 # Check for saved credentials
 CREDS_FILE="/root/.cloudflare_credentials"
+CF_EMAIL=""
+CF_API_KEY=""
+
 if [ -f "$CREDS_FILE" ]; then
     source "$CREDS_FILE"
-    echo "Found saved credentials"
-    read -p "Use saved credentials? (y/n) [y]: " USE_SAVED
-    if [[ "${USE_SAVED,,}" != "n" ]]; then
-        CF_EMAIL="$SAVED_CF_EMAIL"
-        CF_API_KEY="$SAVED_CF_API_KEY"
-    else
-        CF_EMAIL=""
-        CF_API_KEY=""
+    if [ ! -z "$SAVED_CF_EMAIL" ] && [ ! -z "$SAVED_CF_API_KEY" ]; then
+        echo "Found saved credentials for: $SAVED_CF_EMAIL"
+        read -p "Use saved credentials? (y/n) [y]: " USE_SAVED
+        USE_SAVED=${USE_SAVED:-y}
+        if [[ "${USE_SAVED,,}" == "y" ]]; then
+            CF_EMAIL="$SAVED_CF_EMAIL"
+            CF_API_KEY="$SAVED_CF_API_KEY"
+        fi
     fi
 fi
 
+# Get email if not set
 if [ -z "$CF_EMAIL" ]; then
     read -p "Enter Cloudflare email: " CF_EMAIL
+    while [ -z "$CF_EMAIL" ]; do
+        print_error "Email cannot be empty!"
+        read -p "Enter Cloudflare email: " CF_EMAIL
+    done
 fi
 
+# Get API key if not set - THIS IS THE FIX FOR YOUR ISSUE
 if [ -z "$CF_API_KEY" ]; then
     echo "Enter Cloudflare API Key (Global API Key or API Token):"
+    echo "(Input will be hidden for security)"
     read -s CF_API_KEY
     echo ""
+    
+    # Make sure key was entered
+    while [ -z "$CF_API_KEY" ]; do
+        print_error "API Key cannot be empty!"
+        echo "Enter Cloudflare API Key:"
+        read -s CF_API_KEY
+        echo ""
+    done
 fi
 
 # Save credentials for future use
@@ -108,21 +140,52 @@ chmod 600 "$CREDS_FILE"
 # Test API credentials and get Zone ID
 print_header "Connecting to Cloudflare"
 
-echo -n "Getting Zone ID for $DOMAIN... "
-ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
+echo -n "Getting Zone ID for $DOMAIN_NAME... "
+ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
     -H "X-Auth-Email: $CF_EMAIL" \
     -H "X-Auth-Key: $CF_API_KEY" \
     -H "Content-Type: application/json")
 
-ZONE_ID=$(echo "$ZONE_RESPONSE" | jq -r '.result[0].id')
-
-if [ "$ZONE_ID" == "null" ] || [ -z "$ZONE_ID" ]; then
-    print_error "✗ Failed to get Zone ID"
+# Check if response is valid JSON first
+if ! echo "$ZONE_RESPONSE" | jq empty 2>/dev/null; then
+    print_error "✗ Invalid response from Cloudflare API"
     echo "Response: $ZONE_RESPONSE"
+    exit 1
+fi
+
+# Check for authentication errors
+SUCCESS=$(echo "$ZONE_RESPONSE" | jq -r '.success')
+if [ "$SUCCESS" == "false" ]; then
+    ERROR_MSG=$(echo "$ZONE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')
+    print_error "✗ API Authentication Failed"
+    echo "Error: $ERROR_MSG"
     echo ""
     echo "Please check:"
-    echo "1. Your API credentials are correct"
-    echo "2. The domain $DOMAIN exists in your Cloudflare account"
+    echo "1. Your email address is correct: $CF_EMAIL"
+    echo "2. Your API key is a valid Global API Key from Cloudflare"
+    echo "3. Copy the entire API key without spaces"
+    echo ""
+    echo "To get your Global API Key:"
+    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
+    echo "2. Click 'View' next to Global API Key"
+    echo "3. Enter your password and copy the key"
+    
+    # Clear saved bad credentials
+    rm -f "$CREDS_FILE"
+    exit 1
+fi
+
+ZONE_ID=$(echo "$ZONE_RESPONSE" | jq -r '.result[0].id // empty')
+
+if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" == "null" ]; then
+    print_error "✗ Failed to get Zone ID"
+    echo ""
+    echo "The domain $DOMAIN_NAME was not found in your Cloudflare account."
+    echo ""
+    echo "Please check:"
+    echo "1. The domain is added to your Cloudflare account"
+    echo "2. The domain name is spelled correctly: $DOMAIN_NAME"
+    echo "3. You're using the correct Cloudflare account"
     exit 1
 fi
 
@@ -202,7 +265,7 @@ create_dns_record() {
 
 # Get DKIM key if it exists
 DKIM_KEY=""
-DKIM_FILE="/etc/opendkim/keys/$DOMAIN/mail.txt"
+DKIM_FILE="/etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
 if [ -f "$DKIM_FILE" ]; then
     DKIM_KEY=$(cat "$DKIM_FILE" | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
     echo "Found DKIM key in $DKIM_FILE"
@@ -214,52 +277,37 @@ fi
 print_header "Creating DNS Records"
 
 # 1. A Record for mail subdomain
-create_dns_record "A" "mail.$DOMAIN" "$PRIMARY_IP" "" "false"
+create_dns_record "A" "mail.$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
 
 # 2. MX Record
-create_dns_record "MX" "$DOMAIN" "mail.$DOMAIN" "10" "false"
+create_dns_record "MX" "$DOMAIN_NAME" "mail.$DOMAIN_NAME" "10" "false"
 
 # 3. SPF Record
 SPF_RECORD="v=spf1 mx a ip4:$PRIMARY_IP ~all"
-create_dns_record "TXT" "$DOMAIN" "$SPF_RECORD" "" "false"
+create_dns_record "TXT" "$DOMAIN_NAME" "$SPF_RECORD" "" "false"
 
 # 4. DKIM Record (if key exists)
 if [ ! -z "$DKIM_KEY" ]; then
     DKIM_RECORD="v=DKIM1; k=rsa; p=$DKIM_KEY"
-    create_dns_record "TXT" "mail._domainkey.$DOMAIN" "$DKIM_RECORD" "" "false"
+    create_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD" "" "false"
 else
     print_warning "⚠ Skipping DKIM record (no key found)"
 fi
 
 # 5. DMARC Record
-DMARC_RECORD="v=DMARC1; p=none; rua=mailto:admin@$DOMAIN"
-create_dns_record "TXT" "_dmarc.$DOMAIN" "$DMARC_RECORD" "" "false"
+DMARC_RECORD="v=DMARC1; p=none; rua=mailto:admin@$DOMAIN_NAME"
+create_dns_record "TXT" "_dmarc.$DOMAIN_NAME" "$DMARC_RECORD" "" "false"
 
-# 6. Autodiscover records (optional but useful)
+# 6. Autodiscover records - AUTO YES, NO MORE QUESTIONS!
 echo ""
-read -p "Add autodiscover records for email clients? (y/n) [y]: " ADD_AUTO
-if [[ "${ADD_AUTO,,}" != "n" ]]; then
-    create_dns_record "CNAME" "autodiscover.$DOMAIN" "mail.$DOMAIN" "" "false"
-    create_dns_record "CNAME" "autoconfig.$DOMAIN" "mail.$DOMAIN" "" "false"
-    
-    # SRV records for autodiscovery
-    create_dns_record "SRV" "_autodiscover._tcp.$DOMAIN" "0 0 443 mail.$DOMAIN" "" "false"
-    create_dns_record "SRV" "_imaps._tcp.$DOMAIN" "0 1 993 mail.$DOMAIN" "" "false"
-    create_dns_record "SRV" "_submission._tcp.$DOMAIN" "0 1 587 mail.$DOMAIN" "" "false"
-fi
+echo "Adding autodiscover records for email clients..."
+create_dns_record "CNAME" "autodiscover.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
+create_dns_record "CNAME" "autoconfig.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
 
-# List all DNS records
-print_header "Verifying DNS Records"
-
-echo "Fetching all DNS records for $DOMAIN..."
-ALL_RECORDS=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?per_page=100" \
-    -H "X-Auth-Email: $CF_EMAIL" \
-    -H "X-Auth-Key: $CF_API_KEY" \
-    -H "Content-Type: application/json")
-
-echo ""
-echo "Mail-related DNS records:"
-echo "$ALL_RECORDS" | jq -r '.result[] | select(.name | contains("mail") or contains("_dmarc") or contains("_domainkey") or .type == "MX" or (.type == "TXT" and .content | contains("spf1"))) | "\(.type)\t\(.name)\t\(.content[0:60])"' | column -t
+# SRV records for autodiscovery
+create_dns_record "SRV" "_autodiscover._tcp.$DOMAIN_NAME" "0 0 443 mail.$DOMAIN_NAME" "" "false"
+create_dns_record "SRV" "_imaps._tcp.$DOMAIN_NAME" "0 1 993 mail.$DOMAIN_NAME" "" "false"
+create_dns_record "SRV" "_submission._tcp.$DOMAIN_NAME" "0 1 587 mail.$DOMAIN_NAME" "" "false"
 
 # Save configuration
 print_header "Saving Configuration"
@@ -269,26 +317,26 @@ Cloudflare DNS Configuration
 Generated: $(date)
 ================================================================================
 
-Domain: $DOMAIN
+Domain: $DOMAIN_NAME
 Zone ID: $ZONE_ID
 Primary IP: $PRIMARY_IP
 
 DNS Records Created:
-1. A record: mail.$DOMAIN -> $PRIMARY_IP
-2. MX record: $DOMAIN -> mail.$DOMAIN (priority 10)
-3. SPF record: $DOMAIN -> "$SPF_RECORD"
-4. DKIM record: mail._domainkey.$DOMAIN
-5. DMARC record: _dmarc.$DOMAIN -> "$DMARC_RECORD"
+1. A record: mail.$DOMAIN_NAME -> $PRIMARY_IP
+2. MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)
+3. SPF record: $DOMAIN_NAME -> "$SPF_RECORD"
+4. DKIM record: mail._domainkey.$DOMAIN_NAME
+5. DMARC record: _dmarc.$DOMAIN_NAME -> "$DMARC_RECORD"
 
 To verify DNS propagation:
-  dig A mail.$DOMAIN
-  dig MX $DOMAIN
-  dig TXT $DOMAIN
-  dig TXT mail._domainkey.$DOMAIN
-  dig TXT _dmarc.$DOMAIN
+  dig A mail.$DOMAIN_NAME
+  dig MX $DOMAIN_NAME
+  dig TXT $DOMAIN_NAME
+  dig TXT mail._domainkey.$DOMAIN_NAME
+  dig TXT _dmarc.$DOMAIN_NAME
 
 Or use online tools:
-  https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN
+  https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
   https://www.mail-tester.com/
 
 ================================================================================
@@ -308,7 +356,7 @@ echo "2. PTR (Reverse DNS) must be set with your hosting provider"
 echo "3. Test your setup with: test-email check-auth@verifier.port25.com"
 echo ""
 echo "To check DNS propagation:"
-echo "  check-dns $DOMAIN"
+echo "  check-dns $DOMAIN_NAME"
 echo ""
 echo "To verify in Cloudflare dashboard:"
 echo "  https://dash.cloudflare.com/$ZONE_ID/dns"
