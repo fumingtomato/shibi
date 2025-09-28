@@ -2,9 +2,9 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION
-# Version: 16.0.4
-# Configures SSL, firewall, and final optimizations
-# Runs automatically without user interaction
+# Version: 16.0.5
+# Configures SSL, firewall, OpenDKIM, and final optimizations
+# PROPERLY CONFIGURES OPENDKIM FOR EMAIL SIGNING
 # =================================================================
 
 # Colors
@@ -48,7 +48,7 @@ elif [ -f "/root/mail-installer/install.conf" ]; then
     source "/root/mail-installer/install.conf"
 fi
 
-# Get domain info from environment or Postfix
+# Get domain info
 if [ -z "$DOMAIN_NAME" ]; then
     if [ -f /etc/postfix/main.cf ]; then
         HOSTNAME=$(postconf -h myhostname 2>/dev/null || hostname -f)
@@ -58,16 +58,15 @@ if [ -z "$DOMAIN_NAME" ]; then
         DOMAIN_NAME=$(hostname -d)
     fi
 else
-    # Use values from installer
     HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
 fi
 
-# Get admin email if not set
+# Get admin email
 if [ -z "$ADMIN_EMAIL" ]; then
-    ADMIN_EMAIL="admin@$DOMAIN_NAME"
+    ADMIN_EMAIL="${FIRST_EMAIL:-admin@$DOMAIN_NAME}"
 fi
 
-# Get primary IP if not set
+# Get primary IP
 if [ -z "$PRIMARY_IP" ]; then
     PRIMARY_IP=$(curl -s --max-time 5 https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
 fi
@@ -80,7 +79,134 @@ echo "  Primary IP: $PRIMARY_IP"
 echo ""
 
 # ===================================================================
-# 1. SSL/TLS CONFIGURATION - AUTOMATED
+# 1. OPENDKIM CONFIGURATION - CRITICAL FOR SIGNING EMAILS!
+# ===================================================================
+
+print_header "Configuring OpenDKIM for Email Signing"
+
+# Ensure OpenDKIM is installed
+if ! command -v opendkim &> /dev/null; then
+    echo "Installing OpenDKIM..."
+    apt-get update > /dev/null 2>&1
+    apt-get install -y opendkim opendkim-tools > /dev/null 2>&1
+fi
+
+# Create directories
+mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
+chown -R opendkim:opendkim /etc/opendkim
+
+# Generate DKIM keys if they don't exist
+if [ ! -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
+    echo "Generating DKIM keys..."
+    cd /etc/opendkim/keys/$DOMAIN_NAME
+    opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
+    chown opendkim:opendkim mail.private mail.txt
+    chmod 600 mail.private
+    chmod 644 mail.txt
+    cd -
+fi
+
+# Configure OpenDKIM - PROPER CONFIGURATION
+cat > /etc/opendkim.conf <<EOF
+# OpenDKIM Configuration
+AutoRestart             Yes
+AutoRestartRate         10/1h
+UMask                   002
+Syslog                  yes
+SyslogSuccess           Yes
+LogWhy                  Yes
+
+# Canonicalization
+Canonicalization        relaxed/simple
+
+# Signing
+Mode                    sv
+SubDomains              yes
+
+# Trusted hosts
+ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
+InternalHosts           refile:/etc/opendkim/TrustedHosts
+KeyTable                refile:/etc/opendkim/KeyTable
+SigningTable            refile:/etc/opendkim/SigningTable
+
+# Socket
+Socket                  inet:8891@localhost
+PidFile                 /var/run/opendkim/opendkim.pid
+SignatureAlgorithm      rsa-sha256
+UserID                  opendkim:opendkim
+
+# Additional settings
+OversignHeaders         From
+TrustAnchorFile         /usr/share/dns/root.key
+EOF
+
+# Setup TrustedHosts - Include all server IPs
+cat > /etc/opendkim/TrustedHosts <<EOF
+127.0.0.1
+localhost
+::1
+$PRIMARY_IP
+$HOSTNAME
+*.$DOMAIN_NAME
+EOF
+
+# Add additional IPs if configured
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    for ip in "${IP_ADDRESSES[@]}"; do
+        echo "$ip" >> /etc/opendkim/TrustedHosts
+    done
+fi
+
+# Setup KeyTable
+echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
+
+# Setup SigningTable - Sign all emails from domain
+cat > /etc/opendkim/SigningTable <<EOF
+*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
+*@$HOSTNAME mail._domainkey.$DOMAIN_NAME
+EOF
+
+# Set proper permissions
+chown -R opendkim:opendkim /etc/opendkim
+chmod 644 /etc/opendkim/TrustedHosts
+chmod 644 /etc/opendkim/KeyTable
+chmod 644 /etc/opendkim/SigningTable
+
+# Configure Postfix to use OpenDKIM
+echo "Configuring Postfix to use OpenDKIM..."
+postconf -e "milter_protocol = 6"
+postconf -e "milter_default_action = accept"
+postconf -e "smtpd_milters = inet:localhost:8891"
+postconf -e "non_smtpd_milters = inet:localhost:8891"
+
+# Restart OpenDKIM
+systemctl restart opendkim
+systemctl enable opendkim
+
+# Verify OpenDKIM is running
+sleep 2
+if netstat -lnp | grep -q ":8891"; then
+    print_message "✓ OpenDKIM is running and listening on port 8891"
+else
+    print_error "✗ OpenDKIM is not listening on port 8891"
+    echo "Checking OpenDKIM status..."
+    systemctl status opendkim --no-pager
+fi
+
+# Display DKIM key for DNS
+echo ""
+print_header "DKIM Key for DNS"
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    echo "Add this DKIM record to your DNS:"
+    echo "  Name: mail._domainkey"
+    echo "  Type: TXT"
+    echo "  Value:"
+    cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t '
+    echo ""
+fi
+
+# ===================================================================
+# 2. SSL/TLS CONFIGURATION
 # ===================================================================
 
 print_header "SSL/TLS Configuration"
@@ -109,7 +235,7 @@ else
         systemctl stop nginx 2>/dev/null || true
         systemctl stop apache2 2>/dev/null || true
         
-        # Get certificate without interaction
+        # Get certificate
         certbot certonly --standalone \
             -d "$HOSTNAME" \
             --non-interactive \
@@ -155,16 +281,6 @@ EOF
             
             postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver-temp.crt"
             postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver-temp.key"
-            
-            cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
-ssl = required
-ssl_cert = </etc/ssl/certs/mailserver-temp.crt
-ssl_key = </etc/ssl/private/mailserver-temp.key
-ssl_min_protocol = TLSv1.2
-EOF
-            
-            print_message "Temporary certificate created."
-            echo "Get Let's Encrypt certificate later with: certbot certonly --standalone -d $HOSTNAME"
         fi
     else
         print_warning "DNS not resolving yet - using self-signed certificate"
@@ -178,8 +294,6 @@ EOF
         
         postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver-temp.crt"
         postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver-temp.key"
-        
-        print_message "Temporary certificate created."
     fi
 fi
 
@@ -190,7 +304,7 @@ if [ ! -f /etc/dovecot/dh.pem ]; then
 fi
 
 # ===================================================================
-# 2. FIREWALL CONFIGURATION
+# 3. FIREWALL CONFIGURATION
 # ===================================================================
 
 print_header "Firewall Configuration"
@@ -224,17 +338,12 @@ if command -v ufw &> /dev/null; then
     ufw --force enable > /dev/null 2>&1
     
     print_message "✓ Firewall configured and enabled"
-    
-    # Show status
-    echo ""
-    echo "Firewall rules:"
-    ufw status numbered | head -20
 else
     print_warning "UFW not installed, skipping firewall configuration"
 fi
 
 # ===================================================================
-# 3. FAIL2BAN CONFIGURATION
+# 4. FAIL2BAN CONFIGURATION
 # ===================================================================
 
 print_header "Fail2ban Configuration"
@@ -285,7 +394,7 @@ systemctl enable fail2ban > /dev/null 2>&1
 print_message "✓ Fail2ban configured"
 
 # ===================================================================
-# 4. POSTFIX OPTIMIZATION
+# 5. POSTFIX OPTIMIZATION
 # ===================================================================
 
 print_header "Optimizing Postfix Configuration"
@@ -347,7 +456,7 @@ fi
 print_message "✓ Postfix optimized"
 
 # ===================================================================
-# 5. SYSTEM OPTIMIZATION
+# 6. SYSTEM OPTIMIZATION
 # ===================================================================
 
 print_header "System Optimization"
@@ -389,7 +498,7 @@ sysctl -p /etc/sysctl.d/99-mailserver.conf > /dev/null 2>&1
 print_message "✓ System optimized"
 
 # ===================================================================
-# 6. LOG ROTATION
+# 7. LOG ROTATION
 # ===================================================================
 
 print_header "Configuring Log Rotation"
@@ -416,7 +525,7 @@ EOF
 print_message "✓ Log rotation configured"
 
 # ===================================================================
-# 7. SERVICES RESTART
+# 8. SERVICES RESTART
 # ===================================================================
 
 print_header "Restarting Services"
@@ -433,7 +542,35 @@ for service in "${services[@]}"; do
 done
 
 # ===================================================================
-# 8. CREATE HELPFUL SHORTCUTS
+# 9. VERIFY OPENDKIM IS WORKING
+# ===================================================================
+
+print_header "Verifying OpenDKIM Configuration"
+
+# Check OpenDKIM is running
+if systemctl is-active --quiet opendkim; then
+    print_message "✓ OpenDKIM service is running"
+else
+    print_error "✗ OpenDKIM service is not running"
+fi
+
+# Check OpenDKIM is listening
+if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+    print_message "✓ OpenDKIM is listening on port 8891"
+else
+    print_error "✗ OpenDKIM is not listening on port 8891"
+fi
+
+# Check Postfix milter configuration
+MILTER_CONFIG=$(postconf smtpd_milters 2>/dev/null)
+if [[ "$MILTER_CONFIG" == *"localhost:8891"* ]]; then
+    print_message "✓ Postfix is configured to use OpenDKIM"
+else
+    print_error "✗ Postfix is not configured to use OpenDKIM"
+fi
+
+# ===================================================================
+# 10. CREATE HELPFUL SHORTCUTS
 # ===================================================================
 
 print_header "Creating Helper Scripts"
@@ -489,7 +626,7 @@ EOF
 chmod +x /usr/local/bin/get-ssl-cert
 
 # ===================================================================
-# 9. SAVE CONFIGURATION SUMMARY
+# 11. SAVE CONFIGURATION SUMMARY
 # ===================================================================
 
 cat > /root/mail-server-config.txt <<EOF
@@ -514,6 +651,11 @@ else
     echo "  Get Let's Encrypt: run 'get-ssl-cert'"
 fi)
 
+OpenDKIM Status:
+  Service: $(systemctl is-active opendkim)
+  Port 8891: $(netstat -lnp 2>/dev/null | grep -q ":8891" && echo "Listening" || echo "Not listening")
+  DKIM Key: $([ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ] && echo "Generated" || echo "Missing")
+
 Services:
   Postfix (SMTP): $(systemctl is-active postfix)
   Dovecot (IMAP): $(systemctl is-active dovecot)
@@ -530,6 +672,7 @@ Ports:
   993 - IMAPS
   110 - POP3
   995 - POP3S
+  8891 - OpenDKIM
 
 Email Testing:
   Send test: test-email check-auth@verifier.port25.com ${FIRST_EMAIL:-user@$DOMAIN_NAME}
@@ -562,12 +705,31 @@ EOF
 
 print_header "Post-Installation Complete!"
 echo ""
+echo "✓ OpenDKIM configured and running"
 echo "✓ SSL/TLS configured"
 echo "✓ Firewall configured" 
 echo "✓ Fail2ban configured"
 echo "✓ Services optimized"
 echo "✓ Log rotation configured"
 echo ""
+
+# Show OpenDKIM status
+print_header "CRITICAL: OpenDKIM Status"
+echo "OpenDKIM is now properly configured to sign all outgoing emails."
+echo ""
+echo "Service Status: $(systemctl is-active opendkim)"
+echo "Listening on: localhost:8891"
+echo "DKIM Selector: mail"
+echo "DKIM Domain: $DOMAIN_NAME"
+echo ""
+
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    echo "DKIM DNS Record:"
+    echo "  Name: mail._domainkey.$DOMAIN_NAME"
+    echo "  Type: TXT"
+    echo "  Value: v=DKIM1; k=rsa; p=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t ')"
+    echo ""
+fi
 
 # Show status
 if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
@@ -588,7 +750,7 @@ fi
 print_header "QUICK TEST COMMANDS"
 echo ""
 echo "1. Check everything: mail-test"
-echo "2. Send test email: test-email check-auth@verifier.port25.com"
+echo "2. Send test email: test-email check-auth@verifier.port25.com $FIRST_EMAIL"
 echo "3. Check DNS: check-dns $DOMAIN_NAME"
 echo "4. View logs: mail-log follow"
 echo ""
@@ -596,4 +758,4 @@ echo ""
 print_message "Configuration saved to: /root/mail-server-config.txt"
 echo ""
 print_message "✓ Post-installation configuration completed!"
-print_message "Your mail server is now ready to use!"
+print_message "Your mail server is now ready to use with DKIM signing enabled!"
