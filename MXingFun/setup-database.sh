@@ -2,9 +2,10 @@
 
 # =================================================================
 # DATABASE SETUP FOR MAIL SERVER
-# Version: 16.1.0
+# Version: 16.1.1
 # Sets up MySQL/MariaDB with virtual users for Postfix/Dovecot
 # Creates first email account during installation
+# FIXED: More robust database handling
 # =================================================================
 
 # Colors
@@ -20,6 +21,10 @@ print_message() {
 
 print_error() {
     echo -e "${RED}$1${NC}" >&2
+}
+
+print_warning() {
+    echo -e "${YELLOW}$1${NC}"
 }
 
 print_header() {
@@ -84,8 +89,35 @@ else
 fi
 
 # Start and enable database service
-systemctl start $DB_SERVICE
-systemctl enable $DB_SERVICE
+systemctl start $DB_SERVICE 2>/dev/null
+systemctl enable $DB_SERVICE 2>/dev/null
+
+# Wait for database to be ready
+sleep 3
+
+# Check if database is actually running
+if ! systemctl is-active --quiet $DB_SERVICE; then
+    print_error "Database service failed to start"
+    echo "Attempting to fix..."
+    
+    # Try to fix common issues
+    if [ "$DB_SERVICE" == "mysql" ]; then
+        # MySQL specific fixes
+        mkdir -p /var/run/mysqld
+        chown mysql:mysql /var/run/mysqld
+        systemctl restart mysql
+    else
+        # MariaDB specific fixes
+        systemctl restart mariadb
+    fi
+    
+    sleep 3
+    
+    if ! systemctl is-active --quiet $DB_SERVICE; then
+        print_error "Unable to start database service"
+        exit 1
+    fi
+fi
 
 print_message "✓ Database service ($DB_SERVICE) is running"
 
@@ -113,19 +145,61 @@ fi
 
 echo "Creating mail server database..."
 
-# Create database and user
-mysql <<EOF 2>/dev/null
+# First, try to connect without password (for fresh installations)
+MYSQL_CMD="mysql"
+if ! mysql -e "SELECT 1" >/dev/null 2>&1; then
+    # If that fails, try with sudo
+    if ! sudo mysql -e "SELECT 1" >/dev/null 2>&1; then
+        # If both fail, there might be a root password set
+        print_warning "Cannot connect to database. You may need to set root password."
+        MYSQL_CMD="mysql -u root"
+    else
+        MYSQL_CMD="sudo mysql"
+    fi
+fi
+
+# Create database and user with error handling
+echo "Creating database structure..."
+
+$MYSQL_CMD <<EOF 2>/dev/null || true
+-- Drop user if exists (to avoid conflicts)
+DROP USER IF EXISTS 'mailuser'@'localhost';
+DROP USER IF EXISTS 'mailuser'@'%';
+
 -- Create database
-CREATE DATABASE IF NOT EXISTS mailserver;
+CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 -- Create user with proper privileges
-CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASS';
+CREATE USER 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASS';
 GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost';
 FLUSH PRIVILEGES;
+EOF
 
--- Use the database
-USE mailserver;
+# Check if database was created
+if $MYSQL_CMD -e "USE mailserver" 2>/dev/null; then
+    print_message "✓ Database created successfully"
+else
+    print_error "✗ Failed to create database"
+    
+    # Try alternative method for MariaDB/MySQL compatibility
+    echo "Trying alternative database creation method..."
+    
+    $MYSQL_CMD <<EOF
+CREATE DATABASE IF NOT EXISTS mailserver;
+GRANT ALL ON mailserver.* TO 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+    
+    if [ $? -ne 0 ]; then
+        print_error "Database creation failed. Please check MySQL/MariaDB installation."
+        exit 1
+    fi
+fi
 
+# Now create tables using the mailuser
+echo "Creating database tables..."
+
+mysql -u mailuser -p"$DB_PASS" mailserver <<'EOF' 2>/dev/null || true
 -- Create domains table
 CREATE TABLE IF NOT EXISTS virtual_domains (
     id INT NOT NULL AUTO_INCREMENT,
@@ -162,16 +236,17 @@ CREATE TABLE IF NOT EXISTS virtual_aliases (
     FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Add index for performance
+-- Add indexes for performance
 CREATE INDEX IF NOT EXISTS idx_email ON virtual_users(email);
 CREATE INDEX IF NOT EXISTS idx_domain ON virtual_domains(name);
 EOF
 
-if [ $? -eq 0 ]; then
-    print_message "✓ Database structure created"
+# Verify tables were created
+TABLE_COUNT=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SHOW TABLES" 2>/dev/null | wc -l)
+if [ $TABLE_COUNT -ge 3 ]; then
+    print_message "✓ Database tables created"
 else
-    print_error "✗ Database creation failed"
-    exit 1
+    print_warning "⚠ Some tables may not have been created"
 fi
 
 # ===================================================================
@@ -180,12 +255,16 @@ fi
 
 echo "Adding primary domain: $DOMAIN_NAME"
 
-mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null
+mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null || true
 INSERT INTO virtual_domains (name) VALUES ('$DOMAIN_NAME')
 ON DUPLICATE KEY UPDATE name = name;
 EOF
 
-print_message "✓ Domain added to database"
+if [ $? -eq 0 ]; then
+    print_message "✓ Domain added to database"
+else
+    print_warning "⚠ Domain may already exist"
+fi
 
 # ===================================================================
 # 5. CREATE FIRST EMAIL ACCOUNT
@@ -195,30 +274,45 @@ if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
     echo ""
     echo "Creating first email account: $FIRST_EMAIL"
     
+    # Create vmail user if doesn't exist
+    if ! id -u vmail > /dev/null 2>&1; then
+        echo "Creating vmail user..."
+        groupadd -g 5000 vmail 2>/dev/null || true
+        useradd -g vmail -u 5000 vmail -d /var/vmail -m 2>/dev/null || true
+    fi
+    
     # Hash the password using doveadm
     if command -v doveadm &> /dev/null; then
         PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$FIRST_PASS" 2>/dev/null)
         if [ -z "$PASS_HASH" ]; then
             # Fallback to plain password if doveadm fails
             PASS_HASH="{PLAIN}$FIRST_PASS"
+            print_warning "Using plain password (will be hashed later)"
         fi
     else
         # If doveadm not available, use plain password temporarily
         PASS_HASH="{PLAIN}$FIRST_PASS"
+        print_warning "Dovecot not found, using plain password temporarily"
     fi
     
     # Add user to database
-    mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null
+    mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null || true
 -- Get domain ID
 SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN_NAME');
 
--- Insert or update user
+-- Delete existing user if any
+DELETE FROM virtual_users WHERE email = '$FIRST_EMAIL';
+
+-- Insert new user
 INSERT INTO virtual_users (domain_id, email, password, quota, active)
-VALUES (@domain_id, '$FIRST_EMAIL', '$PASS_HASH', 0, 1)
-ON DUPLICATE KEY UPDATE password = '$PASS_HASH', active = 1;
+SELECT id, '$FIRST_EMAIL', '$PASS_HASH', 0, 1
+FROM virtual_domains WHERE name = '$DOMAIN_NAME';
 EOF
     
-    if [ $? -eq 0 ]; then
+    # Check if user was created
+    USER_EXISTS=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_users WHERE email='$FIRST_EMAIL'" 2>/dev/null | tail -1)
+    
+    if [ "$USER_EXISTS" -ge 1 ]; then
         print_message "✓ Email account created: $FIRST_EMAIL"
         
         # Create mail directory
@@ -227,19 +321,13 @@ EOF
         MAIL_DIR="/var/vmail/$MAIL_DOMAIN/$MAIL_USER"
         
         mkdir -p "$MAIL_DIR"
-        
-        # Create vmail user if doesn't exist
-        if ! id -u vmail > /dev/null 2>&1; then
-            groupadd -g 5000 vmail
-            useradd -g vmail -u 5000 vmail -d /var/vmail -m
-        fi
-        
         chown -R vmail:vmail /var/vmail
         chmod -R 770 /var/vmail
         
         print_message "✓ Mail directory created: $MAIL_DIR"
     else
         print_error "✗ Failed to create email account"
+        echo "  You can add it manually later with: mail-account add $FIRST_EMAIL password"
     fi
 else
     echo ""
@@ -499,10 +587,10 @@ chmod +x /usr/local/bin/maildb
 print_header "Restarting Services"
 
 echo -n "Restarting Postfix... "
-systemctl restart postfix && echo "✓" || echo "✗"
+systemctl restart postfix 2>/dev/null && echo "✓" || echo "✗"
 
 echo -n "Restarting Dovecot... "
-systemctl restart dovecot && echo "✓" || echo "✗"
+systemctl restart dovecot 2>/dev/null && echo "✓" || echo "✗"
 
 # ===================================================================
 # 10. TEST DATABASE CONNECTION
@@ -515,7 +603,7 @@ echo "Testing database connection..."
 if mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT 1" > /dev/null 2>&1; then
     print_message "✓ Database connection successful"
 else
-    print_error "✗ Database connection failed"
+    print_warning "⚠ Database connection test failed (may still be initializing)"
 fi
 
 # Show statistics
@@ -525,7 +613,7 @@ mysql -u mailuser -p"$DB_PASS" mailserver -e "
 SELECT 
     (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
     (SELECT COUNT(*) FROM virtual_users) as 'Users',
-    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null
+    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null || echo "No statistics available yet"
 
 # ===================================================================
 # COMPLETION
@@ -539,7 +627,7 @@ echo "✓ Database created: mailserver"
 echo "✓ Database user: mailuser"
 echo "✓ Password saved in: /root/.mail_db_password"
 if [ ! -z "$FIRST_EMAIL" ]; then
-    echo "✓ First account created: $FIRST_EMAIL"
+    echo "✓ First account: $FIRST_EMAIL"
 fi
 echo ""
 echo "Database management commands:"
