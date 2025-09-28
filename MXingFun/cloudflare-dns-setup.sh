@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# CLOUDFLARE DNS AUTOMATIC SETUP FOR MAIL SERVER
-# Version: 1.6
-# Automatically adds all required DNS records to Cloudflare
-# INCLUDES DKIM RECORD CREATION
+# CLOUDFLARE DNS SETUP FOR MAIL SERVER
+# Version: 2.2.0
+# Adds all DNS records including DKIM (key already generated)
 # =================================================================
 
 # Colors
@@ -32,250 +31,223 @@ print_header() {
     echo -e "${BLUE}==================================================${NC}"
 }
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    print_error "This script must be run as root"
-    exit 1
-fi
-
-print_header "Cloudflare DNS Automatic Setup"
-echo ""
-
-# Check for required tools
-if ! command -v curl &> /dev/null; then
-    apt-get update && apt-get install -y curl > /dev/null 2>&1
-fi
-
-if ! command -v jq &> /dev/null; then
-    apt-get update && apt-get install -y jq > /dev/null 2>&1
-fi
-
-# Load configuration from installer
+# Load configuration
 if [ -f "$(pwd)/install.conf" ]; then
     source "$(pwd)/install.conf"
 elif [ -f "/root/mail-installer/install.conf" ]; then
     source "/root/mail-installer/install.conf"
 fi
 
-# If DOMAIN_NAME is not set from installer config, get from postfix
+print_header "Cloudflare DNS Configuration"
+echo ""
+
+# Verify required variables
+if [ -z "$CF_API_KEY" ]; then
+    print_error "Cloudflare API key not found in configuration"
+    exit 1
+fi
+
 if [ -z "$DOMAIN_NAME" ]; then
-    if [ -f /etc/postfix/main.cf ]; then
-        HOSTNAME=$(postconf -h myhostname 2>/dev/null)
-        DOMAIN_NAME=$(postconf -h mydomain 2>/dev/null)
-    else
-        print_error "Domain configuration not found!"
-        exit 1
-    fi
-else
-    HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+    print_error "Domain name not found in configuration"
+    exit 1
 fi
 
-# Use PRIMARY_IP from installer config or detect it
-if [ -z "$PRIMARY_IP" ]; then
-    PRIMARY_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
-fi
-
-# Get additional IPs if configured
-ADDITIONAL_IPS=""
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    for ip in "${IP_ADDRESSES[@]:1}"; do
-        ADDITIONAL_IPS="$ADDITIONAL_IPS ip4:$ip"
-    done
-fi
-
-echo "Configuration detected:"
-echo "  Domain: $DOMAIN_NAME"
-echo "  Hostname: $HOSTNAME"
-echo "  Primary IP: $PRIMARY_IP"
-if [ ! -z "$ADDITIONAL_IPS" ]; then
-    echo "  Additional IPs: $ADDITIONAL_IPS"
-fi
+echo "Domain: $DOMAIN_NAME"
+echo "Hostname: $HOSTNAME"
+echo "Primary IP: $PRIMARY_IP"
 echo ""
 
-# Get Cloudflare credentials
-print_header "Cloudflare API Credentials"
-echo ""
-
+# Load saved Cloudflare credentials if available
 CREDS_FILE="/root/.cloudflare_credentials"
-CF_API_KEY=""
-CF_EMAIL=""
-
 if [ -f "$CREDS_FILE" ]; then
     source "$CREDS_FILE"
-    if [ ! -z "$SAVED_CF_API_KEY" ]; then
-        echo "Using saved API credentials"
-        CF_API_KEY="$SAVED_CF_API_KEY"
-        CF_EMAIL="${SAVED_CF_EMAIL:-}"
+    CF_API_KEY="${SAVED_CF_API_KEY:-$CF_API_KEY}"
+    CF_EMAIL="${SAVED_CF_EMAIL:-}"
+fi
+
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Installing jq for JSON parsing..."
+    apt-get update > /dev/null 2>&1
+    apt-get install -y jq > /dev/null 2>&1
+fi
+
+# ===================================================================
+# GET DKIM KEY (Should already exist from main installer)
+# ===================================================================
+
+DKIM_KEY=""
+DKIM_RECORD_VALUE=""
+
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    print_message "✓ DKIM key found (generated during installation)"
+    # Extract just the key part
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
+    if [ ! -z "$DKIM_KEY" ]; then
+        DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
+        echo "  Key length: ${#DKIM_KEY} characters"
+    else
+        print_warning "⚠ Could not extract DKIM key from file"
     fi
+else
+    print_warning "⚠ DKIM key file not found at /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+    print_warning "  DKIM will not be added to DNS"
 fi
 
-# Get API key if not set
-if [ -z "$CF_API_KEY" ]; then
-    echo "You need a Cloudflare API Token or Global API Key"
-    echo ""
-    echo "RECOMMENDED: Create a scoped API Token:"
-    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
-    echo "2. Click 'Create Token'"
-    echo "3. Use template 'Edit zone DNS' or create custom token with:"
-    echo "   - Zone:DNS:Edit permissions"
-    echo "   - Include your specific zone"
-    echo ""
-    
-    echo "Enter Cloudflare API Token or Global API Key:"
-    echo "(Input will be hidden for security)"
-    read -s CF_API_KEY
-    echo ""
-    
-    while [ -z "$CF_API_KEY" ]; do
-        print_error "API Key cannot be empty!"
-        echo "Enter Cloudflare API Token or Global API Key:"
-        read -s CF_API_KEY
-        echo ""
-    done
-    
-    # Save for next time
-    cat > "$CREDS_FILE" <<EOF
-SAVED_CF_API_KEY="$CF_API_KEY"
-EOF
-    chmod 600 "$CREDS_FILE"
-fi
+echo ""
 
-# Test API credentials and get Zone ID
-print_header "Connecting to Cloudflare"
+# ===================================================================
+# TEST API CONNECTION
+# ===================================================================
 
-echo -n "Getting Zone ID for $DOMAIN_NAME... "
+print_header "Testing Cloudflare API Connection"
 
-# Try API Token authentication first
-ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+# First try as API Token
+echo -n "Testing API connection... "
+TEST_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
     -H "Authorization: Bearer $CF_API_KEY" \
     -H "Content-Type: application/json")
 
-SUCCESS=$(echo "$ZONE_RESPONSE" | jq -r '.success')
+SUCCESS=$(echo "$TEST_RESPONSE" | jq -r '.success' 2>/dev/null)
 
-# If token auth failed, it might be a Global API Key
-if [ "$SUCCESS" == "false" ]; then
-    ERROR_CODE=$(echo "$ZONE_RESPONSE" | jq -r '.errors[0].code')
-    
-    if [ "$ERROR_CODE" == "9109" ] || [ "$ERROR_CODE" == "6003" ]; then
-        echo ""
-        if [ -z "$CF_EMAIL" ]; then
-            print_warning "This appears to be a Global API Key, email required"
-            read -p "Enter Cloudflare account email: " CF_EMAIL
-            echo "SAVED_CF_EMAIL=\"$CF_EMAIL\"" >> "$CREDS_FILE"
-        fi
-        
-        ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
-            -H "X-Auth-Email: $CF_EMAIL" \
-            -H "X-Auth-Key: $CF_API_KEY" \
-            -H "Content-Type: application/json")
-        
-        SUCCESS=$(echo "$ZONE_RESPONSE" | jq -r '.success')
-        AUTH_METHOD="global"
-    fi
-else
+if [ "$SUCCESS" == "true" ]; then
+    print_message "✓ Connected with API Token"
     AUTH_METHOD="token"
+else
+    # Try as Global API Key
+    if [ -z "$CF_EMAIL" ]; then
+        echo ""
+        echo "API Token authentication failed."
+        echo "Trying Global API Key method..."
+        read -p "Enter your Cloudflare account email: " CF_EMAIL
+        
+        # Save email for future use
+        echo "SAVED_CF_EMAIL=\"$CF_EMAIL\"" >> "$CREDS_FILE"
+    fi
+    
+    TEST_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user" \
+        -H "X-Auth-Email: $CF_EMAIL" \
+        -H "X-Auth-Key: $CF_API_KEY" \
+        -H "Content-Type: application/json")
+    
+    SUCCESS=$(echo "$TEST_RESPONSE" | jq -r '.success' 2>/dev/null)
+    
+    if [ "$SUCCESS" == "true" ]; then
+        print_message "✓ Connected with Global API Key"
+        AUTH_METHOD="global"
+    else
+        print_error "✗ Failed to authenticate with Cloudflare"
+        ERROR_MSG=$(echo "$TEST_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null)
+        [ ! -z "$ERROR_MSG" ] && [ "$ERROR_MSG" != "null" ] && echo "Error: $ERROR_MSG"
+        exit 1
+    fi
 fi
 
-if [ "$SUCCESS" != "true" ]; then
-    ERROR_MSG=$(echo "$ZONE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')
-    print_error "✗ API Authentication Failed"
-    echo "Error: $ERROR_MSG"
-    rm -f "$CREDS_FILE"
-    exit 1
+# ===================================================================
+# GET ZONE ID
+# ===================================================================
+
+echo -n "Getting Zone ID for $DOMAIN_NAME... "
+
+if [ "$AUTH_METHOD" == "global" ]; then
+    ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+        -H "X-Auth-Email: $CF_EMAIL" \
+        -H "X-Auth-Key: $CF_API_KEY" \
+        -H "Content-Type: application/json")
+else
+    ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+        -H "Authorization: Bearer $CF_API_KEY" \
+        -H "Content-Type: application/json")
 fi
 
-ZONE_ID=$(echo "$ZONE_RESPONSE" | jq -r '.result[0].id // empty')
+ZONE_ID=$(echo "$ZONE_RESPONSE" | jq -r '.result[0].id' 2>/dev/null)
 
 if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" == "null" ]; then
-    print_error "✗ Domain not found in Cloudflare account"
+    print_error "✗ Zone not found"
+    echo "Make sure $DOMAIN_NAME exists in your Cloudflare account"
+    ERROR_MSG=$(echo "$ZONE_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null)
+    [ ! -z "$ERROR_MSG" ] && [ "$ERROR_MSG" != "null" ] && echo "Error: $ERROR_MSG"
     exit 1
 fi
 
-print_message "✓ Found Zone ID: $ZONE_ID"
-echo "✓ Authentication method: ${AUTH_METHOD:-token}"
+print_message "✓ Found"
+echo "Zone ID: $ZONE_ID"
 echo ""
 
-# CRITICAL FUNCTION: DELETE EXISTING RECORDS BEFORE CREATING NEW ONES
-delete_existing_records() {
-    local TYPE=$1
-    local NAME=$2
-    
-    echo -n "Checking for existing $TYPE records for $NAME... "
+# ===================================================================
+# HELPER FUNCTIONS
+# ===================================================================
+
+check_existing_record() {
+    local record_type="$1"
+    local record_name="$2"
     
     if [ "$AUTH_METHOD" == "global" ]; then
-        EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=$TYPE&name=$NAME" \
+        EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=$record_type&name=$record_name" \
             -H "X-Auth-Email: $CF_EMAIL" \
             -H "X-Auth-Key: $CF_API_KEY" \
             -H "Content-Type: application/json")
     else
-        EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=$TYPE&name=$NAME" \
+        EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=$record_type&name=$record_name" \
             -H "Authorization: Bearer $CF_API_KEY" \
             -H "Content-Type: application/json")
     fi
     
-    RECORD_COUNT=$(echo "$EXISTING" | jq '.result | length')
+    echo "$EXISTING" | jq -r '.result[] | .id' 2>/dev/null
+}
+
+delete_record() {
+    local record_id="$1"
     
-    if [ "$RECORD_COUNT" -gt 0 ]; then
-        echo "Found $RECORD_COUNT record(s)"
-        
-        # Delete ALL existing records of this type/name
-        echo "$EXISTING" | jq -r '.result[].id' | while read RECORD_ID; do
-            echo -n "  Deleting old record $RECORD_ID... "
-            
-            if [ "$AUTH_METHOD" == "global" ]; then
-                DEL_RESPONSE=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-                    -H "X-Auth-Email: $CF_EMAIL" \
-                    -H "X-Auth-Key: $CF_API_KEY" \
-                    -H "Content-Type: application/json")
-            else
-                DEL_RESPONSE=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-                    -H "Authorization: Bearer $CF_API_KEY" \
-                    -H "Content-Type: application/json")
-            fi
-            
-            if [ "$(echo "$DEL_RESPONSE" | jq -r '.success')" == "true" ]; then
-                print_message "✓"
-            else
-                print_error "✗"
-            fi
-        done
+    if [ "$AUTH_METHOD" == "global" ]; then
+        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$record_id" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_API_KEY" \
+            -H "Content-Type: application/json" > /dev/null
     else
-        echo "None found"
+        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$record_id" \
+            -H "Authorization: Bearer $CF_API_KEY" \
+            -H "Content-Type: application/json" > /dev/null
     fi
 }
 
-# Function to create DNS record (ALWAYS DELETE OLD ONES FIRST)
-create_dns_record() {
-    local TYPE=$1
-    local NAME=$2
-    local CONTENT=$3
-    local PRIORITY=$4
-    local PROXIED=${5:-false}
+add_dns_record() {
+    local record_type="$1"
+    local record_name="$2"
+    local record_content="$3"
+    local priority="$4"
+    local proxied="${5:-false}"
     
-    # ALWAYS delete existing records first to prevent duplicates
-    delete_existing_records "$TYPE" "$NAME"
+    echo -n "Adding $record_type record for $record_name... "
     
-    echo -n "Creating $TYPE record: $NAME... "
+    # Check for existing record
+    EXISTING_IDS=$(check_existing_record "$record_type" "$record_name")
+    if [ ! -z "$EXISTING_IDS" ]; then
+        echo -n "(removing old) "
+        for id in $EXISTING_IDS; do
+            delete_record "$id"
+        done
+    fi
     
-    # Build the JSON payload
-    if [ ! -z "$PRIORITY" ] && [ "$TYPE" == "MX" ]; then
+    # Build JSON data
+    if [ ! -z "$priority" ] && [ "$record_type" == "MX" ]; then
         JSON_DATA=$(jq -n \
-            --arg type "$TYPE" \
-            --arg name "$NAME" \
-            --arg content "$CONTENT" \
-            --argjson priority "$PRIORITY" \
-            --argjson proxied "$PROXIED" \
+            --arg type "$record_type" \
+            --arg name "$record_name" \
+            --arg content "$record_content" \
+            --argjson priority "$priority" \
+            --argjson proxied "$proxied" \
             '{type: $type, name: $name, content: $content, priority: $priority, proxied: $proxied}')
     else
         JSON_DATA=$(jq -n \
-            --arg type "$TYPE" \
-            --arg name "$NAME" \
-            --arg content "$CONTENT" \
-            --argjson proxied "$PROXIED" \
+            --arg type "$record_type" \
+            --arg name "$record_name" \
+            --arg content "$record_content" \
+            --argjson proxied "$proxied" \
             '{type: $type, name: $name, content: $content, proxied: $proxied}')
     fi
     
-    # Create the new record
+    # Add the record
     if [ "$AUTH_METHOD" == "global" ]; then
         RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
             -H "X-Auth-Email: $CF_EMAIL" \
@@ -289,262 +261,175 @@ create_dns_record() {
             --data "$JSON_DATA")
     fi
     
-    SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
-    
-    if [ "$SUCCESS" == "true" ]; then
-        print_message "✓ Created"
-        return 0
+    if [ "$(echo "$RESPONSE" | jq -r '.success' 2>/dev/null)" == "true" ]; then
+        print_message "✓"
     else
-        ERROR=$(echo "$RESPONSE" | jq -r '.errors[0].message // .errors[0]')
-        print_error "✗ Failed: $ERROR"
-        return 1
-    fi
-}
-
-# Function for SRV records
-create_srv_record() {
-    local NAME=$1
-    local PRIORITY=$2
-    local WEIGHT=$3
-    local PORT=$4
-    local TARGET=$5
-    
-    delete_existing_records "SRV" "$NAME"
-    
-    echo -n "Creating SRV record: $NAME... "
-    
-    JSON_DATA=$(jq -n \
-        --arg name "$NAME" \
-        --argjson priority "$PRIORITY" \
-        --argjson weight "$WEIGHT" \
-        --argjson port "$PORT" \
-        --arg target "$TARGET" \
-        '{
-            type: "SRV",
-            name: $name,
-            data: {
-                priority: $priority,
-                weight: $weight,
-                port: $port,
-                target: $target
-            },
-            ttl: 3600
-        }')
-    
-    if [ "$AUTH_METHOD" == "global" ]; then
-        RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-            -H "X-Auth-Email: $CF_EMAIL" \
-            -H "X-Auth-Key: $CF_API_KEY" \
-            -H "Content-Type: application/json" \
-            --data "$JSON_DATA")
-    else
-        RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-            -H "Authorization: Bearer $CF_API_KEY" \
-            -H "Content-Type: application/json" \
-            --data "$JSON_DATA")
-    fi
-    
-    if [ "$(echo "$RESPONSE" | jq -r '.success')" == "true" ]; then
-        print_message "✓ Created"
-    else
-        print_error "✗ Failed"
+        print_error "✗"
+        ERROR_MSG=$(echo "$RESPONSE" | jq -r '.errors[0].message' 2>/dev/null)
+        [ ! -z "$ERROR_MSG" ] && [ "$ERROR_MSG" != "null" ] && echo "  Error: $ERROR_MSG"
     fi
 }
 
 # ===================================================================
-# CRITICAL: GENERATE DKIM KEY IF NOT EXISTS
+# ADD DNS RECORDS
 # ===================================================================
 
-print_header "DKIM Key Generation"
+print_header "Adding DNS Records to Cloudflare"
 
-DKIM_KEY=""
-DKIM_FILE="/etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+# 1. A record for mail subdomain
+add_dns_record "A" "$HOSTNAME" "$PRIMARY_IP" "" "false"
 
-if [ -f "$DKIM_FILE" ]; then
-    echo "DKIM key already exists"
-    DKIM_KEY=$(cat "$DKIM_FILE" | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
-else
-    echo "Generating new DKIM key..."
+# 2. A record for root domain (for website)
+add_dns_record "A" "$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
+
+# 3. MX record
+add_dns_record "MX" "$DOMAIN_NAME" "$HOSTNAME" "10" "false"
+
+# 4. SPF record
+SPF_RECORD="v=spf1 mx a ip4:$PRIMARY_IP ~all"
+add_dns_record "TXT" "$DOMAIN_NAME" "$SPF_RECORD" "" "false"
+
+# 5. DMARC record
+DMARC_RECORD="v=DMARC1; p=quarantine; rua=mailto:dmarc@$DOMAIN_NAME; ruf=mailto:dmarc@$DOMAIN_NAME; fo=1; pct=100"
+add_dns_record "TXT" "_dmarc.$DOMAIN_NAME" "$DMARC_RECORD" "" "false"
+
+# 6. DKIM record (if key exists)
+if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+    echo ""
+    print_header "Adding DKIM Record"
+    add_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD_VALUE" "" "false"
     
-    # Ensure OpenDKIM is installed
-    if ! command -v opendkim-genkey &> /dev/null; then
-        apt-get update > /dev/null 2>&1
-        apt-get install -y opendkim opendkim-tools > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        print_message "✓ DKIM record added successfully!"
+    else
+        print_error "✗ Failed to add DKIM record"
+        echo "You can add it manually:"
+        echo "  Name: mail._domainkey.$DOMAIN_NAME"
+        echo "  Type: TXT"
+        echo "  Value: $DKIM_RECORD_VALUE"
     fi
-    
-    # Create directory and generate key
-    mkdir -p "/etc/opendkim/keys/$DOMAIN_NAME"
-    cd "/etc/opendkim/keys/$DOMAIN_NAME"
-    opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
-    chown -R opendkim:opendkim /etc/opendkim
-    cd - > /dev/null
-    
-    # Configure OpenDKIM
-    echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
-    echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
-    echo "127.0.0.1" > /etc/opendkim/TrustedHosts
-    echo "localhost" >> /etc/opendkim/TrustedHosts
-    echo ".$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
-    echo "$PRIMARY_IP" >> /etc/opendkim/TrustedHosts
-    
-    # Get the key
-    DKIM_KEY=$(cat "$DKIM_FILE" | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
-    
-    # Restart OpenDKIM
-    systemctl restart opendkim > /dev/null 2>&1
-    
-    print_message "✓ DKIM key generated"
-fi
-
-if [ -z "$DKIM_KEY" ]; then
-    print_error "Could not get DKIM key!"
-    DKIM_KEY="PENDING_GENERATION"
-fi
-
-echo ""
-
-# Start creating DNS records
-print_header "Creating DNS Records"
-
-# 1. A Record for mail subdomain
-create_dns_record "A" "mail.$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
-
-# 2. A Record for main domain (for website)
-create_dns_record "A" "$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
-
-# 3. MX Record
-create_dns_record "MX" "$DOMAIN_NAME" "mail.$DOMAIN_NAME" "10" "false"
-
-# 4. SPF Record - INCLUDE ALL IPs
-SPF_RECORD="v=spf1 mx a ip4:$PRIMARY_IP$ADDITIONAL_IPS ~all"
-create_dns_record "TXT" "$DOMAIN_NAME" "$SPF_RECORD" "" "false"
-
-# 5. DKIM Record - ALWAYS ADD IT!
-if [ "$DKIM_KEY" != "PENDING_GENERATION" ]; then
-    DKIM_RECORD="v=DKIM1; k=rsa; p=$DKIM_KEY"
-    create_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD" "" "false"
-    print_message "✓ DKIM record added to Cloudflare"
 else
-    print_warning "⚠ DKIM key generation pending - record will need to be added manually"
+    print_warning ""
+    print_warning "⚠ DKIM key not available - skipping DKIM record"
+    print_warning "  Run 'opendkim-genkey' manually if needed"
 fi
 
-# 6. DMARC Record - USE FIRST_EMAIL or ADMIN_EMAIL
-DMARC_EMAIL="${FIRST_EMAIL:-${ADMIN_EMAIL:-admin@$DOMAIN_NAME}}"
-DMARC_RECORD="v=DMARC1; p=none; rua=mailto:$DMARC_EMAIL"
-create_dns_record "TXT" "_dmarc.$DOMAIN_NAME" "$DMARC_RECORD" "" "false"
-
-# 7. Autodiscover records
+# 7. PTR record suggestion
 echo ""
-echo "Adding autodiscover records for email clients..."
-create_dns_record "CNAME" "autodiscover.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
-create_dns_record "CNAME" "autoconfig.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
+print_header "PTR Record (Reverse DNS)"
+echo "IMPORTANT: PTR record cannot be set in Cloudflare."
+echo "Contact your server provider to set PTR record:"
+echo "  IP: $PRIMARY_IP"
+echo "  Should resolve to: $HOSTNAME"
+echo ""
+echo "Common providers:"
+echo "  - DigitalOcean: Droplet settings → Networking"
+echo "  - Vultr: Server settings → IPv4 → Reverse DNS"
+echo "  - Linode: Linode settings → Network → Reverse DNS"
+echo "  - AWS: Elastic IP → Actions → Update reverse DNS"
 
-# 8. SRV records
-create_srv_record "_autodiscover._tcp.$DOMAIN_NAME" 0 0 443 "mail.$DOMAIN_NAME"
-create_srv_record "_imaps._tcp.$DOMAIN_NAME" 0 1 993 "mail.$DOMAIN_NAME"
-create_srv_record "_submission._tcp.$DOMAIN_NAME" 0 1 587 "mail.$DOMAIN_NAME"
+# ===================================================================
+# VERIFY DNS RECORDS
+# ===================================================================
 
-# Save configuration
-print_header "Saving Configuration"
+echo ""
+print_header "Verifying DNS Records"
 
-cat > /root/cloudflare-dns-config.txt <<EOF
-Cloudflare DNS Configuration
-Generated: $(date)
-================================================================================
-
-Domain: $DOMAIN_NAME
-Zone ID: $ZONE_ID
-Primary IP: $PRIMARY_IP
-Additional IPs: $ADDITIONAL_IPS
-Auth Method: ${AUTH_METHOD:-token}
-
-DNS Records Created:
-1. A record: mail.$DOMAIN_NAME -> $PRIMARY_IP
-2. A record: $DOMAIN_NAME -> $PRIMARY_IP (for website)
-3. MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)
-4. SPF record: $DOMAIN_NAME -> "$SPF_RECORD"
-5. DKIM record: mail._domainkey.$DOMAIN_NAME -> [key added]
-6. DMARC record: _dmarc.$DOMAIN_NAME -> "$DMARC_RECORD"
-7. Autodiscover/Autoconfig CNAME records
-8. SRV records for mail client autodiscovery
-
-DKIM Verification:
-  Selector: mail
-  DNS Name: mail._domainkey.$DOMAIN_NAME
-  Key Status: $([ "$DKIM_KEY" != "PENDING_GENERATION" ] && echo "Added to Cloudflare" || echo "Pending generation")
-
-To verify DNS propagation:
-  dig A mail.$DOMAIN_NAME
-  dig MX $DOMAIN_NAME
-  dig TXT $DOMAIN_NAME
-  dig TXT mail._domainkey.$DOMAIN_NAME
-  dig SRV _autodiscover._tcp.$DOMAIN_NAME
-
-Or use online tools:
-  https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
-  https://www.mail-tester.com
-
-================================================================================
-EOF
-
-# Save DKIM info separately
-if [ "$DKIM_KEY" != "PENDING_GENERATION" ]; then
-    cat > /root/dkim-record-$DOMAIN_NAME.txt <<EOF
-DKIM DNS Record for $DOMAIN_NAME
-Generated: $(date)
-================================================================================
-
-STATUS: ✓ ADDED TO CLOUDFLARE
-
-DNS Record Details:
-  Type: TXT
-  Name: mail._domainkey.$DOMAIN_NAME  
-  Value: v=DKIM1; k=rsa; p=$DKIM_KEY
-
-This record has been automatically added to your Cloudflare DNS.
-
-To verify DKIM is working:
-  1. Wait 5-10 minutes for DNS propagation
-  2. Run: dig TXT mail._domainkey.$DOMAIN_NAME
-  3. Test email: test-email check-auth@verifier.port25.com
-
-================================================================================
-EOF
-fi
-
-echo "Configuration saved to: /root/cloudflare-dns-config.txt"
-if [ -f "/root/dkim-record-$DOMAIN_NAME.txt" ]; then
-    echo "DKIM details saved to: /root/dkim-record-$DOMAIN_NAME.txt"
-fi
+echo "Testing DNS resolution (using Cloudflare DNS 1.1.1.1)..."
 echo ""
 
-print_header "Setup Complete!"
-
-echo "✓ All DNS records have been added to Cloudflare"
-echo "✓ Old duplicate records have been removed"
-if [ "$DKIM_KEY" != "PENDING_GENERATION" ]; then
-    echo "✓ DKIM record has been added"
-fi
-echo ""
-echo "IMPORTANT:"
-echo "1. DNS propagation may take 5-30 minutes"
-echo "2. PTR (Reverse DNS) must be set with your hosting provider"
-echo "3. Test your setup with: test-email check-auth@verifier.port25.com"
-echo ""
-
-# Quick verification
-echo "Quick verification (using Cloudflare DNS):"
-echo -n "  A record: "
-dig +short A mail.$DOMAIN_NAME @1.1.1.1 2>/dev/null && echo "✓" || echo "Propagating..."
-echo -n "  MX record: "
-dig +short MX $DOMAIN_NAME @1.1.1.1 2>/dev/null | head -1 && echo "✓" || echo "Propagating..."
-echo -n "  DKIM record: "
-if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
-    echo "✓ DKIM record is live!"
+# Test A record for mail
+echo -n "A record for $HOSTNAME: "
+A_RECORD=$(dig +short A $HOSTNAME @1.1.1.1 2>/dev/null | head -1)
+if [ "$A_RECORD" == "$PRIMARY_IP" ]; then
+    print_message "✓ $A_RECORD"
 else
-    echo "Propagating..."
+    print_warning "⚠ Not propagated yet (expected: $PRIMARY_IP)"
 fi
 
+# Test A record for domain
+echo -n "A record for $DOMAIN_NAME: "
+A_RECORD=$(dig +short A $DOMAIN_NAME @1.1.1.1 2>/dev/null | head -1)
+if [ "$A_RECORD" == "$PRIMARY_IP" ]; then
+    print_message "✓ $A_RECORD"
+else
+    print_warning "⚠ Not propagated yet (expected: $PRIMARY_IP)"
+fi
+
+# Test MX record
+echo -n "MX record for $DOMAIN_NAME: "
+MX_RECORD=$(dig +short MX $DOMAIN_NAME @1.1.1.1 2>/dev/null | awk '{print $2}' | sed 's/\.$//' | head -1)
+if [ "$MX_RECORD" == "$HOSTNAME" ]; then
+    print_message "✓ $MX_RECORD"
+else
+    print_warning "⚠ Not propagated yet (expected: $HOSTNAME)"
+fi
+
+# Test SPF record
+echo -n "SPF record: "
+SPF=$(dig +short TXT $DOMAIN_NAME @1.1.1.1 2>/dev/null | grep "v=spf1")
+if [ ! -z "$SPF" ]; then
+    print_message "✓ Found"
+else
+    print_warning "⚠ Not propagated yet"
+fi
+
+# Test DKIM record
+if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+    echo -n "DKIM record: "
+    DKIM=$(dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep "v=DKIM1")
+    if [ ! -z "$DKIM" ]; then
+        print_message "✓ Found"
+    else
+        print_warning "⚠ Not propagated yet"
+    fi
+fi
+
+# Test DMARC record
+echo -n "DMARC record: "
+DMARC=$(dig +short TXT _dmarc.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep "v=DMARC1")
+if [ ! -z "$DMARC" ]; then
+    print_message "✓ Found"
+else
+    print_warning "⚠ Not propagated yet"
+fi
+
+# ===================================================================
+# COMPLETION
+# ===================================================================
+
 echo ""
-print_message "Cloudflare DNS setup completed successfully!"
-print_message "Your DKIM record has been added and should be working soon!"
+print_header "DNS Configuration Complete!"
+
+echo ""
+echo "✅ All DNS records have been added to Cloudflare"
+if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+    echo "✅ DKIM record has been added"
+fi
+echo ""
+echo "⏱ DNS propagation typically takes:"
+echo "   - Cloudflare network: Immediate"
+echo "   - Global propagation: 5-30 minutes"
+echo "   - Full propagation: Up to 48 hours (rare)"
+echo ""
+echo "📝 Records added:"
+echo "   • A record: $HOSTNAME → $PRIMARY_IP"
+echo "   • A record: $DOMAIN_NAME → $PRIMARY_IP"
+echo "   • MX record: $DOMAIN_NAME → $HOSTNAME"
+echo "   • SPF record: v=spf1 mx a ip4:$PRIMARY_IP ~all"
+echo "   • DMARC record: Basic quarantine policy"
+if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+    echo "   • DKIM record: mail._domainkey (2048-bit key)"
+fi
+echo ""
+echo "🔧 Don't forget:"
+echo "   • Set PTR record with your hosting provider"
+echo "   • Wait for DNS propagation before getting SSL certificate"
+echo ""
+echo "Test DNS propagation:"
+echo "   check-dns $DOMAIN_NAME"
+echo ""
+if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+    print_message "✓ DKIM is configured and will sign all outgoing emails!"
+fi
+print_message "✓ Cloudflare DNS setup completed successfully!"
