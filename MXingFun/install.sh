@@ -373,7 +373,7 @@ if [[ "${MULTI_IP,,}" == "y" ]]; then
     echo "║                    IP ADDRESS INPUT                          ║"
     echo "╠══════════════════════════════════════════════════════════════╣"
     echo "║ Supported formats:                                           ║"
-    echo "║   • Single IP:     192.168.1.100                            ║"
+    echo "║   • Primary IP:    $PRIMARY_IP                              ║"
     echo "║   • Range:         192.168.1.100-192.168.1.110              ║"
     echo "║   • Short range:   192.168.1.100-110                        ║"
     echo "║   • CIDR:          192.168.1.0/24                           ║"
