@@ -2,8 +2,9 @@
 
 # =================================================================
 # MAIL SERVER DATABASE SETUP
-# Version: 16.0.3
+# Version: 16.0.4
 # Creates and configures MySQL database for virtual mail hosting
+# Automatically creates first email account from installer config
 # =================================================================
 
 # Colors
@@ -359,12 +360,93 @@ EOF
 
 chmod +x /usr/local/bin/maildb
 
-# Add sample data if requested
-print_header "Database Setup Complete"
+# ===================================================================
+# AUTOMATIC DOMAIN AND EMAIL ACCOUNT CREATION - NO QUESTIONS!
+# ===================================================================
+
+print_header "Setting Up Domain and First Email Account"
+
+# Add the domain from installer
+if [ ! -z "$DOMAIN_NAME" ]; then
+    echo "Adding domain $DOMAIN_NAME to database..."
+    mysql -u mailuser -p"$DB_PASSWORD" mailserver <<SQL 2>/dev/null
+INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN_NAME');
+SQL
+    print_message "✓ Domain added: $DOMAIN_NAME"
+fi
+
+# Create the first email account if provided in config
+if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
+    echo ""
+    echo "Creating email account: $FIRST_EMAIL"
+    
+    # Hash the password using doveadm
+    if command -v doveadm &> /dev/null; then
+        HASH=$(doveadm pw -s SHA512-CRYPT -p "$FIRST_PASS" 2>/dev/null)
+        if [ -z "$HASH" ]; then
+            # Fallback to plain text if doveadm fails
+            HASH="{PLAIN}$FIRST_PASS"
+        fi
+    else
+        # If doveadm not available yet, use plain text (will be hashed later)
+        HASH="{PLAIN}$FIRST_PASS"
+    fi
+    
+    # Insert the email account
+    mysql -u mailuser -p"$DB_PASSWORD" mailserver <<SQL 2>/dev/null
+-- Get domain ID
+SET @domain_id = (SELECT id FROM virtual_domains WHERE name='$DOMAIN_NAME');
+
+-- Insert user if domain exists
+INSERT INTO virtual_users (domain_id, email, password, quota, active) 
+SELECT @domain_id, '$FIRST_EMAIL', '$HASH', 0, 1 
+WHERE @domain_id IS NOT NULL
+ON DUPLICATE KEY UPDATE password='$HASH', active=1;
+SQL
+    
+    if [ $? -eq 0 ]; then
+        print_message "✓ Email account created: $FIRST_EMAIL"
+        
+        # Create mail directory
+        MAIL_USER="${FIRST_EMAIL%@*}"
+        MAIL_DOMAIN="${FIRST_EMAIL#*@}"
+        MAIL_DIR="/var/vmail/$MAIL_DOMAIN/$MAIL_USER"
+        
+        mkdir -p "$MAIL_DIR"
+        chown -R vmail:vmail /var/vmail/
+        
+        echo ""
+        echo "Account details saved:"
+        echo "  Email: $FIRST_EMAIL"
+        echo "  Mail directory: $MAIL_DIR"
+        echo "  Status: Active"
+    else
+        print_warning "Could not create email account (might already exist)"
+    fi
+else
+    echo ""
+    echo "No first email account specified. You can add accounts later with:"
+    echo "  mail-account add user@$DOMAIN_NAME password"
+fi
+
+# Show final statistics
 echo ""
+print_header "Database Setup Complete"
+
 echo "Database: mailserver"
 echo "User: mailuser"
 echo "Password: Saved in /root/.mail_db_password"
+echo ""
+
+# Show what was created
+echo "Current setup:"
+mysql -u mailuser -p"$DB_PASSWORD" mailserver -e "
+    SELECT 
+        (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
+        (SELECT COUNT(*) FROM virtual_users WHERE active=1) as 'Email Accounts',
+        (SELECT COUNT(*) FROM ip_pool) as 'IP Addresses'
+" 2>/dev/null
+
 echo ""
 echo "Tables created:"
 echo "  - virtual_domains (mail domains)"
@@ -382,19 +464,17 @@ echo ""
 echo "Management command: maildb"
 echo ""
 
-# AUTOMATICALLY ADD THE DOMAIN FROM INSTALLER - NO QUESTIONS!
-if [ ! -z "$DOMAIN_NAME" ]; then
-    echo "Adding domain $DOMAIN_NAME to database..."
-    mysql -u mailuser -p"$DB_PASSWORD" mailserver <<SQL 2>/dev/null
-INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN_NAME');
-SQL
-    echo "✓ Domain added: $DOMAIN_NAME"
+if [ ! -z "$FIRST_EMAIL" ]; then
+    print_message "✓ Your first email account is ready to use!"
     echo ""
-    echo "You can now add email accounts with:"
-    echo "  mail-account add user@$DOMAIN_NAME password"
+    echo "  Email: $FIRST_EMAIL"
+    echo "  Password: [the one you entered during setup]"
+    echo ""
+    echo "To add more accounts:"
+    echo "  mail-account add newuser@$DOMAIN_NAME password"
 else
-    echo "Note: No domain configured yet. Add domains with:"
-    echo "  maildb add-domain yourdomain.com"
+    echo "To add email accounts:"
+    echo "  mail-account add user@$DOMAIN_NAME password"
 fi
 
 echo ""
