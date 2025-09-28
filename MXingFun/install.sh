@@ -212,7 +212,6 @@ done
 print_header "CONFIGURATION WIZARD - Answer All Questions Now"
 echo ""
 echo "After these questions, the installer will run automatically."
-echo "No more interruptions - just sit back and watch!"
 echo ""
 
 # Warning
@@ -484,7 +483,7 @@ fi
 echo ""
 print_header "AUTOMATIC INSTALLATION STARTED"
 echo ""
-echo "Sit back and relax! This will take 10-15 minutes..."
+echo "Sit back and relax! This will take 30-45 minutes..."
 echo "No more questions will be asked."
 echo ""
 sleep 3
