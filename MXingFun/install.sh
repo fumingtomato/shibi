@@ -2,12 +2,11 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER - SIMPLIFIED VERSION
-# Version: 16.0.3
+# Version: 16.0.4
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
 # =================================================================
-# Single-option installer with automatic Cloudflare DNS setup
-# Now with IP range and CIDR notation support!
+# Single-option installer with Cloudflare DNS THEN Let's Encrypt SSL
 # =================================================================
 
 set -e
@@ -58,10 +57,11 @@ print_header() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.3             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.4             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
 ║     • Automatic Cloudflare DNS Setup                        ║
+║     • Automatic Let's Encrypt SSL                           ║
 ║     • IP Range and CIDR Support                            ║
 ║     Repository: https://github.com/fumingtomato/shibi       ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -104,30 +104,14 @@ fi
 mkdir -p "$MODULES_DIR"
 cd "$INSTALLER_DIR"
 
-# List of all modules to download - INCLUDING CLOUDFLARE SETUP
-declare -a MODULES=(
-    "core-functions.sh"
-    "packages-system.sh"
-    "mysql-dovecot.sh"
-    "multiip-config.sh"
-    "postfix-setup.sh"
-    "dkim-spf.sh"
-    "dns-ssl.sh"
-    "sticky-ip.sh"
-    "monitoring-scripts.sh"
-    "security-hardening.sh"
-    "utility-scripts.sh"
-    "mailwizz-integration.sh"
-    "main-installer-part2.sh"
-)
-
 # Also download standalone scripts
 declare -a STANDALONE_SCRIPTS=(
     "create-utilities.sh"
     "setup-database.sh"
-    "post-install-config.sh"
-    "troubleshoot.sh"
     "cloudflare-dns-setup.sh"
+    "ssl-setup.sh"
+    "final-config.sh"
+    "troubleshoot.sh"
 )
 
 print_header "Downloading installation files"
@@ -136,23 +120,7 @@ echo ""
 
 DOWNLOAD_FAILED=0
 
-# Download modules (these might not exist, that's OK)
-echo "Downloading modules (optional)..."
-for module in "${MODULES[@]}"; do
-    module_url="${BASE_URL}/modules/${module}"
-    module_file="${MODULES_DIR}/${module}"
-    
-    if wget -q -O "$module_file" "$module_url" 2>/dev/null || \
-       curl -sfL -o "$module_file" "$module_url" 2>/dev/null; then
-        if [ -s "$module_file" ]; then
-            chmod +x "$module_file"
-        else
-            rm -f "$module_file"
-        fi
-    fi
-done
-
-# Download standalone scripts (these should exist)
+# Download standalone scripts
 echo "Downloading core scripts..."
 for script in "${STANDALONE_SCRIPTS[@]}"; do
     script_url="${BASE_URL}/${script}"
@@ -169,30 +137,24 @@ for script in "${STANDALONE_SCRIPTS[@]}"; do
         else
             echo "✗ (empty file)"
             rm -f "$script_file"
-            if [[ "$script" == "cloudflare-dns-setup.sh" ]]; then
-                echo "    (Cloudflare DNS automation will not be available)"
-            else
-                DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
-            fi
+            DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
         fi
     else
         echo "✗ (download failed)"
-        if [[ "$script" != "cloudflare-dns-setup.sh" ]]; then
-            DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
-        fi
+        DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
     fi
 done
 
 echo ""
 
 if [ $DOWNLOAD_FAILED -gt 0 ]; then
-    print_warning "Some optional scripts failed to download, but installation can continue"
+    print_warning "Some scripts failed to download, installation may be incomplete"
 fi
 
-print_message "✓ Core files downloaded successfully"
+print_message "✓ Core files downloaded"
 echo ""
 
-# Now create the main execution script with Cloudflare integration
+# Now create the main execution script
 print_header "Creating main installer"
 
 cat > "${INSTALLER_DIR}/run-installer.sh" << 'INSTALLER_SCRIPT'
@@ -200,7 +162,6 @@ cat > "${INSTALLER_DIR}/run-installer.sh" << 'INSTALLER_SCRIPT'
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODULES_DIR="${SCRIPT_DIR}/modules"
 
 # Redirect output to log
 LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
@@ -235,20 +196,15 @@ print_header() {
 # IP validation and expansion functions
 validate_ip() {
     local ip=$1
-    local valid=1
-    
     if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         OIFS=$IFS
         IFS='.'
-        ip=($ip)
+        ip_parts=($ip)
         IFS=$OIFS
-        [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]
-        valid=$?
-    else
-        valid=1
+        [[ ${ip_parts[0]} -le 255 && ${ip_parts[1]} -le 255 && ${ip_parts[2]} -le 255 && ${ip_parts[3]} -le 255 ]]
+        return $?
     fi
-    
-    return $valid
+    return 1
 }
 
 ip_to_decimal() {
@@ -264,24 +220,24 @@ decimal_to_ip() {
 }
 
 expand_ip_range() {
-    local start_ip=$1
-    local end_ip=$2
-    local max_ips=100  # Safety limit
+    start_ip=$1
+    end_ip=$2
+    max_ips=100
     
     if ! validate_ip "$start_ip" || ! validate_ip "$end_ip"; then
         echo "  Invalid IP addresses in range"
         return 1
     fi
     
-    local start_dec=$(ip_to_decimal "$start_ip")
-    local end_dec=$(ip_to_decimal "$end_ip")
+    start_dec=$(ip_to_decimal "$start_ip")
+    end_dec=$(ip_to_decimal "$end_ip")
     
     if [ $start_dec -gt $end_dec ]; then
         echo "  Start IP must be less than end IP"
         return 1
     fi
     
-    local range_size=$((end_dec - start_dec + 1))
+    range_size=$((end_dec - start_dec + 1))
     if [ $range_size -gt $max_ips ]; then
         echo "  Range too large (${range_size} IPs). Maximum is ${max_ips}."
         read -p "  Add first ${max_ips} IPs only? (y/n): " confirm
@@ -291,9 +247,9 @@ expand_ip_range() {
         end_dec=$((start_dec + max_ips - 1))
     fi
     
-    local count=0
+    count=0
     for ((dec=start_dec; dec<=end_dec; dec++)); do
-        local ip=$(decimal_to_ip $dec)
+        ip=$(decimal_to_ip $dec)
         if [[ "$ip" != "$PRIMARY_IP" ]] && validate_ip "$ip"; then
             IP_ADDRESSES+=("$ip")
             count=$((count + 1))
@@ -305,9 +261,9 @@ expand_ip_range() {
 }
 
 expand_cidr() {
-    local cidr=$1
-    local ip_part=${cidr%/*}
-    local mask=${cidr#*/}
+    cidr=$1
+    ip_part=${cidr%/*}
+    mask=${cidr#*/}
     
     if ! validate_ip "$ip_part"; then
         echo "  Invalid IP in CIDR notation"
@@ -319,20 +275,17 @@ expand_cidr() {
         return 1
     fi
     
-    # Calculate network range
-    local ip_dec=$(ip_to_decimal "$ip_part")
-    local mask_bits=$((32 - mask))
-    local net_size=$((2 ** mask_bits))
-    local net_mask=$(((0xFFFFFFFF << mask_bits) & 0xFFFFFFFF))
-    local network=$((ip_dec & net_mask))
-    local broadcast=$((network | ~net_mask & 0xFFFFFFFF))
+    ip_dec=$(ip_to_decimal "$ip_part")
+    mask_bits=$((32 - mask))
+    net_size=$((2 ** mask_bits))
+    net_mask=$(((0xFFFFFFFF << mask_bits) & 0xFFFFFFFF))
+    network=$((ip_dec & net_mask))
+    broadcast=$((network | ~net_mask & 0xFFFFFFFF))
     
-    # Skip network and broadcast addresses
-    local first_host=$((network + 1))
-    local last_host=$((broadcast - 1))
+    first_host=$((network + 1))
+    last_host=$((broadcast - 1))
     
-    # Safety check for large networks
-    local host_count=$((last_host - first_host + 1))
+    host_count=$((last_host - first_host + 1))
     if [ $host_count -gt 100 ]; then
         echo "  CIDR $cidr contains $host_count hosts."
         read -p "  Add first 100 IPs only? (y/n): " confirm
@@ -343,9 +296,9 @@ expand_cidr() {
     fi
     
     echo "  Expanding CIDR $cidr..."
-    local count=0
+    count=0
     for ((dec=first_host; dec<=last_host; dec++)); do
-        local ip=$(decimal_to_ip $dec)
+        ip=$(decimal_to_ip $dec)
         if [[ "$ip" != "$PRIMARY_IP" ]] && validate_ip "$ip"; then
             IP_ADDRESSES+=("$ip")
             count=$((count + 1))
@@ -358,19 +311,6 @@ expand_cidr() {
 
 print_header "Starting Mail Server Installation"
 echo ""
-
-# Load any available modules
-echo "Loading installer modules..."
-for module_file in "$MODULES_DIR"/*.sh; do
-    if [ -f "$module_file" ]; then
-        source "$module_file" 2>/dev/null || true
-    fi
-done
-echo ""
-
-# ===================================================================
-# MAIN INSTALLATION - NO MENUS, JUST INSTALL
-# ===================================================================
 
 # Warning
 echo "⚠ WARNING: This will modify system configuration files."
@@ -425,20 +365,18 @@ export IP_ADDRESSES=("$PRIMARY_IP")
 
 # Ask about Cloudflare DNS automation
 echo ""
-print_header "DNS Configuration"
+print_header "DNS Configuration Method"
 echo "Do you want to automatically configure DNS records in Cloudflare?"
 echo "(You'll need your Cloudflare API credentials)"
 echo ""
-read -p "Use Cloudflare automatic DNS setup? (y/n) [n]: " USE_CLOUDFLARE
+read -p "Use Cloudflare automatic DNS setup? (y/n) [y]: " USE_CLOUDFLARE
+USE_CLOUDFLARE=${USE_CLOUDFLARE:-y}
 export USE_CLOUDFLARE
 
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo ""
-    echo "Great! We'll set up Cloudflare DNS after the mail server installation."
-    echo "You'll need:"
-    echo "  1. Your Cloudflare account email"
-    echo "  2. Your Global API Key from: https://dash.cloudflare.com/profile/api-tokens"
-    echo ""
+if [[ "${USE_CLOUDFLARE,,}" != "y" ]]; then
+    print_warning "Manual DNS setup selected."
+    echo "You will need to manually add DNS records after installation."
+    echo "Let's Encrypt SSL will not be automatically configured."
     read -p "Press Enter to continue..."
 fi
 
@@ -519,17 +457,6 @@ if [[ "${MULTI_IP,,}" == "y" ]]; then
         # Show current count
         unique_ips=($(echo "${IP_ADDRESSES[@]}" | tr ' ' '\n' | sort -u))
         echo "  Current total: ${#unique_ips[@]} unique IPs"
-        
-        # Safety limit
-        if [ ${#unique_ips[@]} -gt 500 ]; then
-            echo ""
-            print_warning "Warning: You have configured ${#unique_ips[@]} IPs."
-            echo "Large numbers of IPs may impact performance."
-            read -p "Continue adding more IPs? (y/n): " cont
-            if [[ "${cont,,}" != "y" ]]; then
-                break
-            fi
-        fi
     done
     
     # Remove duplicates and sort
@@ -548,6 +475,16 @@ if [[ "${MULTI_IP,,}" == "y" ]]; then
 fi
 export IP_ADDRESSES
 
+# Save configuration to file
+cat > "$SCRIPT_DIR/install.conf" <<EOF
+DOMAIN_NAME="$DOMAIN_NAME"
+HOSTNAME="$HOSTNAME"
+ADMIN_EMAIL="$ADMIN_EMAIL"
+PRIMARY_IP="$PRIMARY_IP"
+IP_ADDRESSES=(${IP_ADDRESSES[@]})
+USE_CLOUDFLARE="$USE_CLOUDFLARE"
+EOF
+
 # Summary
 echo ""
 print_header "Installation Summary"
@@ -559,9 +496,9 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "Additional IPs: $((${#IP_ADDRESSES[@]} - 1)) configured"
 fi
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo "Cloudflare DNS: Yes (automatic setup)"
+    echo "DNS & SSL: Automatic via Cloudflare + Let's Encrypt"
 else
-    echo "Cloudflare DNS: No (manual setup required)"
+    echo "DNS & SSL: Manual configuration required"
 fi
 echo ""
 read -p "Proceed with installation? (y/n): " FINAL_CONFIRM
@@ -571,22 +508,13 @@ if [[ "${FINAL_CONFIRM,,}" != "y" ]]; then
 fi
 
 # ===================================================================
-# PERFORM INSTALLATION
+# INSTALLATION SEQUENCE - PROPER ORDER
 # ===================================================================
 
-print_header "Installing Mail Server"
-
-# Save configuration to file so other scripts can access it
-cat > "$SCRIPT_DIR/install.conf" <<EOF
-DOMAIN_NAME="$DOMAIN_NAME"
-HOSTNAME="$HOSTNAME"
-ADMIN_EMAIL="$ADMIN_EMAIL"
-PRIMARY_IP="$PRIMARY_IP"
-IP_ADDRESSES=(${IP_ADDRESSES[@]})
-USE_CLOUDFLARE="$USE_CLOUDFLARE"
-EOF
+print_header "Installing Mail Server - Phase 1: Core Components"
 
 # Step 1: Update system
+echo ""
 echo "Step 1: Updating system packages..."
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
@@ -594,10 +522,7 @@ DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 # Step 2: Install packages
 echo ""
 echo "Step 2: Installing required packages..."
-# Install jq for Cloudflare API if using Cloudflare
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    apt-get install -y jq
-fi
+apt-get install -y jq curl wget
 
 # Pre-configure Postfix
 debconf-set-selections <<< "postfix postfix/mailname string $HOSTNAME"
@@ -612,81 +537,139 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     certbot \
     ufw fail2ban
 
-# Step 3: Basic Postfix configuration with correct domain
+# Step 3: Basic Postfix configuration
 echo ""
 echo "Step 3: Configuring Postfix with correct domain..."
 postconf -e "myhostname = $HOSTNAME"
 postconf -e "mydomain = $DOMAIN_NAME"
 postconf -e "myorigin = \$mydomain"
-postconf -e "mydestination = "
-postconf -e "inet_interfaces = all"
-postconf -e "inet_protocols = ipv4"
+systemctl restart postfix
+
+# Step 4: Database setup
+echo ""
+echo "Step 4: Setting up database..."
+if [ -f "$SCRIPT_DIR/setup-database.sh" ]; then
+    bash "$SCRIPT_DIR/setup-database.sh"
+fi
+
+# Step 5: Create utilities
+echo ""
+echo "Step 5: Creating utility scripts..."
+if [ -f "$SCRIPT_DIR/create-utilities.sh" ]; then
+    bash "$SCRIPT_DIR/create-utilities.sh"
+fi
 
 # ===================================================================
-# CLOUDFLARE DNS SETUP FIRST (if requested)
-# This must happen BEFORE SSL certificate request!
+# Phase 2: DNS CONFIGURATION (MUST BE BEFORE SSL!)
 # ===================================================================
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Cloudflare DNS Setup (Before SSL)"
+    print_header "Installing Mail Server - Phase 2: Cloudflare DNS"
     
     if [ -f "$SCRIPT_DIR/cloudflare-dns-setup.sh" ]; then
-        echo "Running Cloudflare DNS automatic configuration..."
-        echo "This must complete before SSL certificate can be obtained..."
-        echo ""
-        
-        # Pass configuration via environment
-        export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
+        echo "Setting up DNS records in Cloudflare..."
         bash "$SCRIPT_DIR/cloudflare-dns-setup.sh"
         
         if [ $? -eq 0 ]; then
             echo ""
-            echo "✓ DNS records created. Waiting for propagation..."
-            echo "  Waiting 30 seconds for initial DNS propagation..."
-            sleep 30
+            print_message "✓ DNS records created in Cloudflare"
+            echo "Waiting 60 seconds for initial DNS propagation..."
+            sleep 60
             
             # Test DNS resolution
-            echo -n "  Testing DNS resolution for $HOSTNAME... "
+            echo -n "Testing DNS resolution for $HOSTNAME... "
             if host $HOSTNAME 8.8.8.8 > /dev/null 2>&1; then
-                echo "✓ DNS is resolving!"
+                print_message "✓ DNS is resolving!"
             else
-                echo "⚠ DNS not yet propagated"
-                echo "  SSL certificate will use self-signed until DNS propagates"
+                print_warning "⚠ DNS not fully propagated yet"
+                echo "Waiting additional 60 seconds..."
+                sleep 60
             fi
-        else
-            echo "⚠ Cloudflare setup encountered issues"
         fi
-    else
-        print_warning "Cloudflare setup script not found."
     fi
 fi
 
-# Step 4: Run additional setup scripts with configuration
-echo ""
-echo "Step 4: Running configuration scripts..."
+# ===================================================================
+# Phase 3: SSL CERTIFICATE (AFTER DNS IS SET!)
+# ===================================================================
 
-# Run database setup
-if [ -f "$SCRIPT_DIR/setup-database.sh" ]; then
-    echo "Setting up database..."
-    # Pass configuration
-    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
-    bash "$SCRIPT_DIR/setup-database.sh"
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    print_header "Installing Mail Server - Phase 3: Let's Encrypt SSL"
+    
+    if [ -f "$SCRIPT_DIR/ssl-setup.sh" ]; then
+        echo "Getting Let's Encrypt SSL certificate..."
+        bash "$SCRIPT_DIR/ssl-setup.sh"
+    else
+        # Inline SSL setup if separate file doesn't exist
+        echo "Setting up Let's Encrypt SSL certificate for $HOSTNAME..."
+        
+        # Stop services using port 80
+        systemctl stop nginx 2>/dev/null || true
+        systemctl stop apache2 2>/dev/null || true
+        
+        # Get certificate
+        certbot certonly --standalone \
+            -d "$HOSTNAME" \
+            --non-interactive \
+            --agree-tos \
+            --email "$ADMIN_EMAIL" \
+            --no-eff-email
+        
+        if [ $? -eq 0 ]; then
+            print_message "✓ SSL certificate obtained!"
+            
+            # Configure Postfix
+            postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$HOSTNAME/fullchain.pem"
+            postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$HOSTNAME/privkey.pem"
+            postconf -e "smtpd_use_tls = yes"
+            postconf -e "smtpd_tls_auth_only = yes"
+            
+            # Configure Dovecot
+            cat > /etc/dovecot/conf.d/10-ssl.conf <<SSLEOF
+ssl = required
+ssl_cert = </etc/letsencrypt/live/$HOSTNAME/fullchain.pem
+ssl_key = </etc/letsencrypt/live/$HOSTNAME/privkey.pem
+ssl_min_protocol = TLSv1.2
+ssl_cipher_list = ECDHE+AESGCM:ECDHE+RSA+AESGCM:DHE+RSA+AESGCM
+ssl_prefer_server_ciphers = yes
+SSLEOF
+            
+            # Setup auto-renewal
+            cat > /etc/cron.d/certbot-renewal <<CRONEOF
+0 2 * * * root certbot renew --quiet --post-hook "systemctl reload postfix dovecot"
+CRONEOF
+            
+            systemctl restart postfix dovecot
+        else
+            print_error "Failed to obtain SSL certificate"
+        fi
+    fi
 fi
 
-# Run utilities creation
-if [ -f "$SCRIPT_DIR/create-utilities.sh" ]; then
-    echo "Creating utility scripts..."
-    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
-    bash "$SCRIPT_DIR/create-utilities.sh"
-fi
+# ===================================================================
+# Phase 4: FINAL CONFIGURATION
+# ===================================================================
 
-# Step 5: Run post-install configuration (INCLUDING SSL)
-# This now happens AFTER Cloudflare DNS is set up
-if [ -f "$SCRIPT_DIR/post-install-config.sh" ]; then
-    echo "Running post-installation configuration..."
-    # Pass configuration via both environment and config file
-    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP USE_CLOUDFLARE
-    bash "$SCRIPT_DIR/post-install-config.sh"
+print_header "Installing Mail Server - Phase 4: Final Configuration"
+
+if [ -f "$SCRIPT_DIR/final-config.sh" ]; then
+    echo "Running final configuration..."
+    bash "$SCRIPT_DIR/final-config.sh"
+else
+    # Basic final steps
+    echo "Configuring firewall..."
+    ufw allow 22/tcp
+    ufw allow 25/tcp
+    ufw allow 587/tcp
+    ufw allow 465/tcp
+    ufw allow 143/tcp
+    ufw allow 993/tcp
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw --force enable
+    
+    echo "Restarting all services..."
+    systemctl restart postfix dovecot opendkim
 fi
 
 # ===================================================================
@@ -707,31 +690,30 @@ fi
 echo ""
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo "✓ Cloudflare DNS records have been configured automatically!"
-    echo ""
-    echo "DNS records should be active within 5-30 minutes."
+    echo "✓ DNS records configured in Cloudflare"
+    if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
+        echo "✓ Let's Encrypt SSL certificate installed"
+    else
+        echo "⚠ SSL certificate pending - run: certbot certonly --standalone -d $HOSTNAME"
+    fi
 else
-    echo "IMPORTANT NEXT STEPS:"
-    echo "====================="
-    echo ""
-    echo "1. Configure DNS records:"
+    echo "Next steps for manual configuration:"
+    echo "1. Add DNS records at your DNS provider:"
     echo "   - A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
     echo "   - MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
-    echo "   - PTR record: $PRIMARY_IP -> mail.$DOMAIN_NAME (contact your provider)"
+    echo "   - SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
     echo ""
-    echo "2. Check configuration files:"
-    echo "   - /root/dns-records-*.txt (for complete DNS records)"
-    echo ""
+    echo "2. After DNS propagates, get SSL certificate:"
+    echo "   certbot certonly --standalone -d $HOSTNAME"
 fi
 
-echo "3. Test your installation:"
-echo "   - Send a test email: test-email check-auth@verifier.port25.com"
-echo "   - Check DNS: check-dns $DOMAIN_NAME"
-echo "   - Check logs: tail -f /var/log/mail.log"
+echo ""
+echo "Test your installation:"
+echo "  test-email check-auth@verifier.port25.com"
+echo "  check-dns $DOMAIN_NAME"
+echo "  mail-status"
 echo ""
 echo "Installation log: $LOG_FILE"
-echo ""
-echo "Thank you for using the Multi-IP Mail Server Installer!"
 INSTALLER_SCRIPT
 
 chmod +x "${INSTALLER_DIR}/run-installer.sh"
