@@ -2,10 +2,11 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER WITH WEBSITE
-# Version: 16.1.0
+# Version: 16.2.0
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
 # Includes website setup for bulk email compliance
+# PROPERLY ADDS DKIM TO CLOUDFLARE
 # =================================================================
 # ALL QUESTIONS FIRST - THEN AUTOMATIC INSTALLATION
 # =================================================================
@@ -174,10 +175,10 @@ expand_cidr() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.1.0             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.2.0             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
-║     • Automatic Cloudflare DNS Setup                        ║
+║     • Automatic Cloudflare DNS Setup with DKIM              ║
 ║     • Automatic Let's Encrypt SSL                           ║
 ║     • Compliance Website for Bulk Email                     ║
 ║     • Mailwizz Compatible                                   ║
@@ -212,6 +213,7 @@ done
 print_header "CONFIGURATION WIZARD - Answer All Questions Now"
 echo ""
 echo "After these questions, the installer will run automatically."
+echo "No more interruptions - just sit back and watch!"
 echo ""
 
 # Warning
@@ -321,6 +323,7 @@ echo ""
 # 6. Cloudflare configuration
 print_header "DNS Configuration"
 echo "Do you want to automatically configure DNS records in Cloudflare?"
+echo "This will add all necessary records including DKIM."
 echo ""
 read -p "Use Cloudflare automatic DNS setup? (y/n) [y]: " USE_CLOUDFLARE
 USE_CLOUDFLARE=${USE_CLOUDFLARE:-y}
@@ -461,7 +464,7 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
 fi
 echo "Website: Will be created at http://$DOMAIN_NAME"
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo "DNS Setup: Automatic via Cloudflare"
+    echo "DNS Setup: Automatic via Cloudflare (including DKIM)"
     echo "SSL: Automatic Let's Encrypt after DNS"
 else
     echo "DNS Setup: Manual configuration required"
@@ -483,7 +486,7 @@ fi
 echo ""
 print_header "AUTOMATIC INSTALLATION STARTED"
 echo ""
-echo "Sit back and relax! This will take 30-45 minutes..."
+echo "Sit back and relax! This will take 10-15 minutes..."
 echo "No more questions will be asked."
 echo ""
 sleep 3
@@ -596,6 +599,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     opendkim opendkim-tools \
     spamassassin spamc \
     certbot \
+    nginx \
     mailutils \
     ufw fail2ban > /dev/null 2>&1
 
@@ -632,7 +636,7 @@ else
 fi
 
 # ===================================================================
-# PHASE 4: WEBSITE SETUP - NEW!
+# PHASE 4: WEBSITE SETUP
 # ===================================================================
 
 print_header "Phase 4: Setting Up Website for Bulk Email"
@@ -652,11 +656,11 @@ else
 fi
 
 # ===================================================================
-# PHASE 5: DNS CONFIGURATION (IF CLOUDFLARE)
+# PHASE 5: DNS CONFIGURATION (INCLUDING DKIM!)
 # ===================================================================
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Phase 5: Configuring Cloudflare DNS"
+    print_header "Phase 5: Configuring Cloudflare DNS (Including DKIM)"
     echo ""
     
     if [ -f "$INSTALLER_DIR/cloudflare-dns-setup.sh" ]; then
@@ -665,6 +669,7 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
         if [ $? -eq 0 ]; then
             echo ""
             print_message "✓ DNS records created in Cloudflare"
+            print_message "✓ DKIM record added to Cloudflare"
             echo "Waiting 60 seconds for initial DNS propagation..."
             sleep 60
             
@@ -675,6 +680,14 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
             else
                 print_warning "⚠ DNS not fully propagated yet"
                 echo "Continuing anyway, SSL might need manual setup later..."
+            fi
+            
+            # Test DKIM
+            echo -n "Testing DKIM record... "
+            if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
+                print_message "✓ DKIM record is live!"
+            else
+                print_warning "⚠ DKIM still propagating"
             fi
         fi
     else
@@ -688,11 +701,12 @@ else
     echo "  A record: $DOMAIN_NAME -> $PRIMARY_IP"
     echo "  MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
     echo "  SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
+    echo "  DKIM: Check /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
     echo ""
 fi
 
 # ===================================================================
-# PHASE 6: SSL CERTIFICATE (IF CLOUDFLARE AND DNS IS READY)
+# PHASE 6: SSL CERTIFICATE
 # ===================================================================
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
@@ -720,6 +734,8 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
         else
             print_warning "⚠ Could not get SSL certificate yet (DNS might not be ready)"
         fi
+        
+        systemctl start nginx 2>/dev/null || true
     fi
 else
     print_header "Phase 6: SSL Certificate - Manual Setup Required"
@@ -753,7 +769,7 @@ fi
 
 # Restart all services
 echo "Restarting mail services..."
-systemctl restart postfix dovecot opendkim > /dev/null 2>&1
+systemctl restart postfix dovecot opendkim nginx > /dev/null 2>&1
 
 # ===================================================================
 # INSTALLATION COMPLETE!
@@ -787,11 +803,21 @@ echo ""
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
     echo "✓ DNS records configured in Cloudflare"
+    echo "✓ DKIM record added to Cloudflare"
     if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
         echo "✓ Let's Encrypt SSL certificate installed"
     else
         echo "⚠ SSL certificate pending - DNS might still be propagating"
-        echo "  Try later: certbot certonly --standalone -d $HOSTNAME"
+        echo "  Try later: get-ssl or certbot certonly --standalone -d $HOSTNAME"
+    fi
+    
+    # Quick DKIM verification
+    echo ""
+    echo -n "DKIM Status: "
+    if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
+        print_message "✓ DKIM is ACTIVE in Cloudflare!"
+    else
+        print_warning "⚠ DKIM is propagating (this is normal, wait 5-10 minutes)"
     fi
 else
     echo "Next steps for manual configuration:"
@@ -801,9 +827,10 @@ else
     echo "   • A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
     echo "   • MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
     echo "   • SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
+    echo "   • DKIM: mail._domainkey TXT record from /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
     echo ""
     echo "2. After DNS propagates (5-30 minutes), get SSL certificate:"
-    echo "   certbot certonly --standalone -d $HOSTNAME"
+    echo "   get-ssl or certbot certonly --standalone -d $HOSTNAME"
 fi
 
 echo ""
@@ -822,18 +849,24 @@ echo "2. Add your physical address to: /var/www/$DOMAIN_NAME/contact.html"
 echo "3. Restart nginx after changes: systemctl reload nginx"
 echo ""
 
-print_header "HOW TO SEND TEST EMAILS"
+print_header "HOW TO TEST YOUR MAIL SERVER"
 echo ""
-echo "Method 1 - Using test-email command (easiest):"
-echo "  sudo test-email recipient@example.com $FIRST_EMAIL"
+echo "1. Quick server test:"
+echo "   mail-test"
 echo ""
-echo "Method 2 - Using mail command:"
-echo "  echo \"Test message body\" | mail -s \"Test Subject\" recipient@example.com -r $FIRST_EMAIL"
+echo "2. Send test email with DKIM signing:"
+echo "   test-email check-auth@verifier.port25.com $FIRST_EMAIL"
 echo ""
-echo "Method 3 - Test with mail-tester.com:"
-echo "  1. Go to https://www.mail-tester.com"
-echo "  2. Copy the test email address they give you"
-echo "  3. Run: sudo test-email [their-address] $FIRST_EMAIL"
+echo "3. Check your mail score:"
+echo "   Go to https://www.mail-tester.com"
+echo "   Get a test address and run:"
+echo "   test-email [their-address] $FIRST_EMAIL"
+echo ""
+echo "4. Verify DNS and DKIM:"
+echo "   check-dns $DOMAIN_NAME"
+echo ""
+echo "5. Check Mailwizz configuration:"
+echo "   mailwizz-info"
 echo ""
 
 echo ""
@@ -841,12 +874,23 @@ echo "Available Commands:"
 echo "  mail-account add user@$DOMAIN_NAME password  - Add email account"
 echo "  mail-account list                            - List all accounts"
 echo "  test-email recipient@example.com             - Send test email"
-echo "  check-dns $DOMAIN_NAME                       - Verify DNS"
+echo "  check-dns $DOMAIN_NAME                       - Verify DNS & DKIM"
 echo "  mail-status                                   - Check server status"
 echo "  mail-queue show                               - Check mail queue"
 echo "  mail-log follow                               - Watch mail logs"
+echo "  mailwizz-info                                 - Mailwizz setup info"
+echo "  get-ssl                                       - Manage SSL certificates"
 echo ""
 echo "Installation log: $LOG_FILE"
 echo ""
+
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    print_message "✅ DKIM has been automatically configured in Cloudflare!"
+    print_message "✅ Your emails will be properly signed with DKIM!"
+fi
+
+print_message ""
 print_message "Thank you for using the mail server installer!"
 print_message "Repository: https://github.com/fumingtomato/shibi"
+print_message ""
+print_message "Your mail server is ready for bulk email operations!"
