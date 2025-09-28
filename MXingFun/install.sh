@@ -2,7 +2,7 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER - SIMPLIFIED VERSION
-# Version: 16.0.4
+# Version: 16.0.5
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
 # =================================================================
@@ -57,7 +57,7 @@ print_header() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.4             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.5             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
 ║     • Automatic Cloudflare DNS Setup                        ║
@@ -104,13 +104,13 @@ fi
 mkdir -p "$MODULES_DIR"
 cd "$INSTALLER_DIR"
 
-# Also download standalone scripts
+# Download standalone scripts - REMOVED final-config.sh
 declare -a STANDALONE_SCRIPTS=(
     "create-utilities.sh"
     "setup-database.sh"
     "cloudflare-dns-setup.sh"
     "ssl-setup.sh"
-    "final-config.sh"
+    "post-install-config.sh"
     "troubleshoot.sh"
 )
 
@@ -119,6 +119,7 @@ echo "Downloading from: ${BASE_URL}/"
 echo ""
 
 DOWNLOAD_FAILED=0
+CRITICAL_MISSING=0
 
 # Download standalone scripts
 echo "Downloading core scripts..."
@@ -137,21 +138,36 @@ for script in "${STANDALONE_SCRIPTS[@]}"; do
         else
             echo "✗ (empty file)"
             rm -f "$script_file"
+            if [[ "$script" == "cloudflare-dns-setup.sh" ]] || [[ "$script" == "ssl-setup.sh" ]]; then
+                echo "    (Optional - manual configuration will be needed)"
+            else
+                CRITICAL_MISSING=$((CRITICAL_MISSING + 1))
+            fi
             DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
         fi
     else
         echo "✗ (download failed)"
+        if [[ "$script" == "cloudflare-dns-setup.sh" ]] || [[ "$script" == "ssl-setup.sh" ]]; then
+            echo "    (Optional - manual configuration will be needed)"
+        else
+            CRITICAL_MISSING=$((CRITICAL_MISSING + 1))
+        fi
         DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
     fi
 done
 
 echo ""
 
-if [ $DOWNLOAD_FAILED -gt 0 ]; then
-    print_warning "Some scripts failed to download, installation may be incomplete"
+if [ $CRITICAL_MISSING -gt 0 ]; then
+    print_error "Critical scripts are missing. Installation cannot continue."
+    exit 1
 fi
 
-print_message "✓ Core files downloaded"
+if [ $DOWNLOAD_FAILED -gt 0 ]; then
+    print_warning "Some optional scripts failed to download"
+fi
+
+print_message "✓ Core files ready"
 echo ""
 
 # Now create the main execution script
@@ -376,7 +392,7 @@ export USE_CLOUDFLARE
 if [[ "${USE_CLOUDFLARE,,}" != "y" ]]; then
     print_warning "Manual DNS setup selected."
     echo "You will need to manually add DNS records after installation."
-    echo "Let's Encrypt SSL will not be automatically configured."
+    echo "SSL certificates will need to be obtained manually after DNS propagates."
     read -p "Press Enter to continue..."
 fi
 
@@ -549,6 +565,7 @@ systemctl restart postfix
 echo ""
 echo "Step 4: Setting up database..."
 if [ -f "$SCRIPT_DIR/setup-database.sh" ]; then
+    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
     bash "$SCRIPT_DIR/setup-database.sh"
 fi
 
@@ -556,6 +573,7 @@ fi
 echo ""
 echo "Step 5: Creating utility scripts..."
 if [ -f "$SCRIPT_DIR/create-utilities.sh" ]; then
+    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
     bash "$SCRIPT_DIR/create-utilities.sh"
 fi
 
@@ -568,6 +586,7 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
     
     if [ -f "$SCRIPT_DIR/cloudflare-dns-setup.sh" ]; then
         echo "Setting up DNS records in Cloudflare..."
+        export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
         bash "$SCRIPT_DIR/cloudflare-dns-setup.sh"
         
         if [ $? -eq 0 ]; then
@@ -598,6 +617,7 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
     
     if [ -f "$SCRIPT_DIR/ssl-setup.sh" ]; then
         echo "Getting Let's Encrypt SSL certificate..."
+        export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
         bash "$SCRIPT_DIR/ssl-setup.sh"
     else
         # Inline SSL setup if separate file doesn't exist
@@ -647,14 +667,15 @@ CRONEOF
 fi
 
 # ===================================================================
-# Phase 4: FINAL CONFIGURATION
+# Phase 4: POST-INSTALLATION CONFIGURATION
 # ===================================================================
 
 print_header "Installing Mail Server - Phase 4: Final Configuration"
 
-if [ -f "$SCRIPT_DIR/final-config.sh" ]; then
-    echo "Running final configuration..."
-    bash "$SCRIPT_DIR/final-config.sh"
+if [ -f "$SCRIPT_DIR/post-install-config.sh" ]; then
+    echo "Running post-installation configuration..."
+    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP USE_CLOUDFLARE
+    bash "$SCRIPT_DIR/post-install-config.sh"
 else
     # Basic final steps
     echo "Configuring firewall..."
