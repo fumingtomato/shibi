@@ -576,6 +576,16 @@ fi
 
 print_header "Installing Mail Server"
 
+# Save configuration to file so other scripts can access it
+cat > "$SCRIPT_DIR/install.conf" <<EOF
+DOMAIN_NAME="$DOMAIN_NAME"
+HOSTNAME="$HOSTNAME"
+ADMIN_EMAIL="$ADMIN_EMAIL"
+PRIMARY_IP="$PRIMARY_IP"
+IP_ADDRESSES=(${IP_ADDRESSES[@]})
+USE_CLOUDFLARE="$USE_CLOUDFLARE"
+EOF
+
 # Step 1: Update system
 echo "Step 1: Updating system packages..."
 apt-get update -y
@@ -602,45 +612,81 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     certbot \
     ufw fail2ban
 
-# Step 3: Run additional setup scripts if available
+# Step 3: Basic Postfix configuration with correct domain
 echo ""
-echo "Step 3: Running configuration scripts..."
+echo "Step 3: Configuring Postfix with correct domain..."
+postconf -e "myhostname = $HOSTNAME"
+postconf -e "mydomain = $DOMAIN_NAME"
+postconf -e "myorigin = \$mydomain"
+postconf -e "mydestination = "
+postconf -e "inet_interfaces = all"
+postconf -e "inet_protocols = ipv4"
+
+# ===================================================================
+# CLOUDFLARE DNS SETUP FIRST (if requested)
+# This must happen BEFORE SSL certificate request!
+# ===================================================================
+
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    print_header "Cloudflare DNS Setup (Before SSL)"
+    
+    if [ -f "$SCRIPT_DIR/cloudflare-dns-setup.sh" ]; then
+        echo "Running Cloudflare DNS automatic configuration..."
+        echo "This must complete before SSL certificate can be obtained..."
+        echo ""
+        
+        # Pass configuration via environment
+        export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
+        bash "$SCRIPT_DIR/cloudflare-dns-setup.sh"
+        
+        if [ $? -eq 0 ]; then
+            echo ""
+            echo "✓ DNS records created. Waiting for propagation..."
+            echo "  Waiting 30 seconds for initial DNS propagation..."
+            sleep 30
+            
+            # Test DNS resolution
+            echo -n "  Testing DNS resolution for $HOSTNAME... "
+            if host $HOSTNAME 8.8.8.8 > /dev/null 2>&1; then
+                echo "✓ DNS is resolving!"
+            else
+                echo "⚠ DNS not yet propagated"
+                echo "  SSL certificate will use self-signed until DNS propagates"
+            fi
+        else
+            echo "⚠ Cloudflare setup encountered issues"
+        fi
+    else
+        print_warning "Cloudflare setup script not found."
+    fi
+fi
+
+# Step 4: Run additional setup scripts with configuration
+echo ""
+echo "Step 4: Running configuration scripts..."
 
 # Run database setup
 if [ -f "$SCRIPT_DIR/setup-database.sh" ]; then
     echo "Setting up database..."
+    # Pass configuration
+    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
     bash "$SCRIPT_DIR/setup-database.sh"
 fi
 
 # Run utilities creation
 if [ -f "$SCRIPT_DIR/create-utilities.sh" ]; then
     echo "Creating utility scripts..."
+    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP
     bash "$SCRIPT_DIR/create-utilities.sh"
 fi
 
-# Run post-install configuration
+# Step 5: Run post-install configuration (INCLUDING SSL)
+# This now happens AFTER Cloudflare DNS is set up
 if [ -f "$SCRIPT_DIR/post-install-config.sh" ]; then
     echo "Running post-installation configuration..."
+    # Pass configuration via both environment and config file
+    export DOMAIN_NAME HOSTNAME ADMIN_EMAIL PRIMARY_IP USE_CLOUDFLARE
     bash "$SCRIPT_DIR/post-install-config.sh"
-fi
-
-# ===================================================================
-# CLOUDFLARE DNS SETUP (if requested)
-# ===================================================================
-
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Cloudflare DNS Setup"
-    
-    if [ -f "$SCRIPT_DIR/cloudflare-dns-setup.sh" ]; then
-        echo "Running Cloudflare DNS automatic configuration..."
-        echo ""
-        bash "$SCRIPT_DIR/cloudflare-dns-setup.sh"
-    else
-        print_warning "Cloudflare setup script not found."
-        echo "You can manually download and run it later:"
-        echo "  wget https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun/cloudflare-dns-setup.sh"
-        echo "  sudo bash cloudflare-dns-setup.sh"
-    fi
 fi
 
 # ===================================================================
