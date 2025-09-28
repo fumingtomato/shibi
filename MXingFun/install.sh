@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # =================================================================
-# MULTI-IP BULK MAIL SERVER INSTALLER - SIMPLIFIED VERSION
-# Version: 16.0.8
+# MULTI-IP BULK MAIL SERVER INSTALLER WITH WEBSITE
+# Version: 16.1.0
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
+# Includes website setup for bulk email compliance
 # =================================================================
 # ALL QUESTIONS FIRST - THEN AUTOMATIC INSTALLATION
 # =================================================================
@@ -173,12 +174,13 @@ expand_cidr() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.8             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.1.0             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
 ║     • Automatic Cloudflare DNS Setup                        ║
 ║     • Automatic Let's Encrypt SSL                           ║
-║     • IP Range and CIDR Support                            ║
+║     • Compliance Website for Bulk Email                     ║
+║     • Mailwizz Compatible                                   ║
 ║     Repository: https://github.com/fumingtomato/shibi       ║
 ╚══════════════════════════════════════════════════════════════╝
 
@@ -214,7 +216,7 @@ echo "No more interruptions - just sit back and watch!"
 echo ""
 
 # Warning
-echo "⚠ WARNING: This will modify system configuration files."
+echo "⚠ WARNING: This will install a mail server and website."
 echo "It is recommended to run this on a fresh server installation."
 echo ""
 read -p "Continue with installation? (y/n): " CONTINUE
@@ -247,7 +249,7 @@ done
 echo "✓ Admin email set"
 echo ""
 
-# 3. First email account - NEW!
+# 3. First email account
 print_header "Email Account Setup"
 echo "Let's create your first email account now."
 echo ""
@@ -305,7 +307,19 @@ IP_ADDRESSES=("$PRIMARY_IP")
 echo "✓ Primary IP configured"
 echo ""
 
-# 5. Cloudflare configuration
+# 5. Website setup
+print_header "Website Configuration"
+echo "A website is REQUIRED for bulk email compliance (CAN-SPAM/GDPR)."
+echo "This will create a simple website with:"
+echo "  • Privacy Policy"
+echo "  • Terms of Service"
+echo "  • Contact Page"
+echo "  • Unsubscribe redirect to Mailwizz"
+echo ""
+echo "The website will be available at: http://$DOMAIN_NAME"
+echo ""
+
+# 6. Cloudflare configuration
 print_header "DNS Configuration"
 echo "Do you want to automatically configure DNS records in Cloudflare?"
 echo ""
@@ -350,7 +364,7 @@ else
 fi
 echo ""
 
-# 6. Multi-IP configuration
+# 7. Multi-IP configuration
 read -p "Do you want to configure additional IP addresses? (y/n) [n]: " MULTI_IP
 if [[ "${MULTI_IP,,}" == "y" ]]; then
     echo ""
@@ -446,6 +460,7 @@ echo "Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "Additional IPs: $((${#IP_ADDRESSES[@]} - 1)) configured"
 fi
+echo "Website: Will be created at http://$DOMAIN_NAME"
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
     echo "DNS Setup: Automatic via Cloudflare"
     echo "SSL: Automatic Let's Encrypt after DNS"
@@ -469,7 +484,7 @@ fi
 echo ""
 print_header "AUTOMATIC INSTALLATION STARTED"
 echo ""
-echo "Sit back and relax! This will take 5-10 minutes..."
+echo "Sit back and relax! This will take 10-15 minutes..."
 echo "No more questions will be asked."
 echo ""
 sleep 3
@@ -516,6 +531,7 @@ declare -a STANDALONE_SCRIPTS=(
     "create-utilities.sh"
     "setup-database.sh"
     "cloudflare-dns-setup.sh"
+    "setup-website.sh"
     "ssl-setup.sh"
     "post-install-config.sh"
     "troubleshoot.sh"
@@ -617,11 +633,31 @@ else
 fi
 
 # ===================================================================
-# PHASE 4: DNS CONFIGURATION (IF CLOUDFLARE)
+# PHASE 4: WEBSITE SETUP - NEW!
+# ===================================================================
+
+print_header "Phase 4: Setting Up Website for Bulk Email"
+echo ""
+
+if [ -f "$INSTALLER_DIR/setup-website.sh" ]; then
+    bash "$INSTALLER_DIR/setup-website.sh"
+    
+    if [ $? -eq 0 ]; then
+        print_message "✓ Website created successfully"
+    else
+        print_warning "Website setup had some issues, check manually"
+    fi
+else
+    print_warning "Website setup script not found, skipping..."
+    echo "You can set it up manually later."
+fi
+
+# ===================================================================
+# PHASE 5: DNS CONFIGURATION (IF CLOUDFLARE)
 # ===================================================================
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Phase 4: Configuring Cloudflare DNS"
+    print_header "Phase 5: Configuring Cloudflare DNS"
     echo ""
     
     if [ -f "$INSTALLER_DIR/cloudflare-dns-setup.sh" ]; then
@@ -646,21 +682,22 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
         print_warning "Cloudflare script not found, skipping DNS automation..."
     fi
 else
-    print_header "Phase 4: Manual DNS Configuration Required"
+    print_header "Phase 5: Manual DNS Configuration Required"
     echo ""
     echo "After installation, add these DNS records at your provider:"
     echo "  A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
+    echo "  A record: $DOMAIN_NAME -> $PRIMARY_IP"
     echo "  MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
     echo "  SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
     echo ""
 fi
 
 # ===================================================================
-# PHASE 5: SSL CERTIFICATE (IF CLOUDFLARE AND DNS IS READY)
+# PHASE 6: SSL CERTIFICATE (IF CLOUDFLARE AND DNS IS READY)
 # ===================================================================
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Phase 5: Getting SSL Certificate"
+    print_header "Phase 6: Getting SSL Certificates"
     echo ""
     
     if [ -f "$INSTALLER_DIR/ssl-setup.sh" ]; then
@@ -686,15 +723,15 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
         fi
     fi
 else
-    print_header "Phase 5: SSL Certificate - Manual Setup Required"
+    print_header "Phase 6: SSL Certificate - Manual Setup Required"
     echo "After DNS propagates, run: certbot certonly --standalone -d $HOSTNAME"
 fi
 
 # ===================================================================
-# PHASE 6: POST-INSTALLATION CONFIGURATION
+# PHASE 7: POST-INSTALLATION CONFIGURATION
 # ===================================================================
 
-print_header "Phase 6: Final Configuration"
+print_header "Phase 7: Final Configuration"
 echo ""
 
 if [ -f "$INSTALLER_DIR/post-install-config.sh" ]; then
@@ -726,7 +763,7 @@ systemctl restart postfix dovecot opendkim > /dev/null 2>&1
 echo ""
 print_header "🎉 INSTALLATION COMPLETE! 🎉"
 echo ""
-print_message "Your mail server has been successfully installed!"
+print_message "Your mail server and website have been successfully installed!"
 echo ""
 echo "Configuration:"
 echo "  Domain: $DOMAIN_NAME"
@@ -737,6 +774,16 @@ echo "  Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "  Additional IPs: $((${#IP_ADDRESSES[@]} - 1))"
 fi
+echo ""
+
+echo "WEBSITE:"
+echo "  URL: http://$DOMAIN_NAME"
+if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
+    echo "  SSL: https://$DOMAIN_NAME"
+fi
+echo "  Privacy Policy: http://$DOMAIN_NAME/privacy.html"
+echo "  Terms: http://$DOMAIN_NAME/terms.html"
+echo "  Contact: http://$DOMAIN_NAME/contact.html"
 echo ""
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
@@ -751,6 +798,7 @@ else
     echo "Next steps for manual configuration:"
     echo ""
     echo "1. Add DNS records at your DNS provider:"
+    echo "   • A record: $DOMAIN_NAME -> $PRIMARY_IP"
     echo "   • A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
     echo "   • MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
     echo "   • SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
@@ -760,6 +808,21 @@ else
 fi
 
 echo ""
+print_header "MAILWIZZ CONFIGURATION"
+echo ""
+echo "Configure Mailwizz with these settings:"
+echo "  SMTP Server: $HOSTNAME"
+echo "  Port: 587 (TLS) or 465 (SSL)"
+echo "  Username: $FIRST_EMAIL"
+echo "  Password: [the one you set]"
+echo "  Encryption: TLS or SSL"
+echo ""
+echo "IMPORTANT NEXT STEPS:"
+echo "1. Update Mailwizz unsubscribe URL in: /etc/nginx/sites-available/$DOMAIN_NAME"
+echo "2. Add your physical address to: /var/www/$DOMAIN_NAME/contact.html"
+echo "3. Restart nginx after changes: systemctl reload nginx"
+echo ""
+
 print_header "HOW TO SEND TEST EMAILS"
 echo ""
 echo "Method 1 - Using test-email command (easiest):"
@@ -773,23 +836,16 @@ echo "  1. Go to https://www.mail-tester.com"
 echo "  2. Copy the test email address they give you"
 echo "  3. Run: sudo test-email [their-address] $FIRST_EMAIL"
 echo ""
-echo "Method 4 - Using sendmail directly:"
-echo "  (echo \"Subject: Test\"; echo \"\"; echo \"Test body\") | sendmail -f $FIRST_EMAIL recipient@example.com"
-echo ""
 
 echo ""
 echo "Available Commands:"
-echo "  mail-account add user@$DOMAIN_NAME password  - Add another email account"
-echo "  mail-account list                            - List all email accounts"
+echo "  mail-account add user@$DOMAIN_NAME password  - Add email account"
+echo "  mail-account list                            - List all accounts"
 echo "  test-email recipient@example.com             - Send test email"
 echo "  check-dns $DOMAIN_NAME                       - Verify DNS"
 echo "  mail-status                                   - Check server status"
 echo "  mail-queue show                               - Check mail queue"
 echo "  mail-log follow                               - Watch mail logs"
-echo ""
-echo "Your first email account is ready:"
-echo "  Email: $FIRST_EMAIL"
-echo "  Password: [the one you entered]"
 echo ""
 echo "Installation log: $LOG_FILE"
 echo ""
