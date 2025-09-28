@@ -2,7 +2,7 @@
 
 # =================================================================
 # CLOUDFLARE DNS AUTOMATIC SETUP FOR MAIL SERVER
-# Version: 1.2
+# Version: 1.4
 # Automatically adds all required DNS records to Cloudflare
 # Works with API Token (no email needed) or Global API Key (email required)
 # =================================================================
@@ -81,7 +81,7 @@ echo "  Hostname: $HOSTNAME"
 echo "  Primary IP: $PRIMARY_IP"
 echo ""
 
-# Get Cloudflare credentials - SIMPLIFIED!
+# Get Cloudflare credentials - NO CONFIRMATION, JUST USE THEM!
 print_header "Cloudflare API Credentials"
 echo ""
 
@@ -92,12 +92,8 @@ CF_API_KEY=""
 if [ -f "$CREDS_FILE" ]; then
     source "$CREDS_FILE"
     if [ ! -z "$SAVED_CF_API_KEY" ]; then
-        echo "Found saved API credentials"
-        read -p "Use saved credentials? (y/n) [y]: " USE_SAVED
-        USE_SAVED=${USE_SAVED:-y}
-        if [[ "${USE_SAVED,,}" == "y" ]]; then
-            CF_API_KEY="$SAVED_CF_API_KEY"
-        fi
+        echo "Using saved API credentials"
+        CF_API_KEY="$SAVED_CF_API_KEY"
     fi
 fi
 
@@ -127,13 +123,13 @@ if [ -z "$CF_API_KEY" ]; then
         read -s CF_API_KEY
         echo ""
     done
-fi
-
-# Save credentials for future use (just the key)
-cat > "$CREDS_FILE" <<EOF
+    
+    # Save for next time
+    cat > "$CREDS_FILE" <<EOF
 SAVED_CF_API_KEY="$CF_API_KEY"
 EOF
-chmod 600 "$CREDS_FILE"
+    chmod 600 "$CREDS_FILE"
+fi
 
 # Test API credentials and get Zone ID
 print_header "Connecting to Cloudflare"
@@ -293,6 +289,112 @@ create_dns_record() {
     fi
 }
 
+# Function to create SRV record - FIXED WITH PROPER DATA STRUCTURE INCLUDING WEIGHT!
+create_srv_record() {
+    local NAME=$1
+    local PRIORITY=$2
+    local WEIGHT=$3
+    local PORT=$4
+    local TARGET=$5
+    
+    echo -n "Creating SRV record: $NAME... "
+    
+    # Build the data object for SRV record with all required fields
+    JSON_DATA=$(jq -n \
+        --arg name "$NAME" \
+        --arg service "_${NAME%%.*}" \
+        --arg proto "tcp" \
+        --argjson priority "$PRIORITY" \
+        --argjson weight "$WEIGHT" \
+        --argjson port "$PORT" \
+        --arg target "$TARGET" \
+        --arg name "$NAME" \
+        '{
+            type: "SRV",
+            name: $name,
+            data: {
+                service: $service,
+                proto: "_tcp",
+                name: $name,
+                priority: $priority,
+                weight: $weight,
+                port: $port,
+                target: $target
+            },
+            ttl: 3600
+        }')
+    
+    # Use appropriate auth headers
+    if [ "$AUTH_METHOD" == "global" ]; then
+        RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$JSON_DATA")
+    else
+        RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+            -H "Authorization: Bearer $CF_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$JSON_DATA")
+    fi
+    
+    SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+    
+    if [ "$SUCCESS" == "true" ]; then
+        print_message "✓ Created"
+        return 0
+    else
+        ERROR=$(echo "$RESPONSE" | jq -r '.errors[0].message // .errors[0]')
+        if [[ "$ERROR" == *"already exists"* ]]; then
+            print_warning "⚠ Already exists"
+            
+            # Try to update the existing record
+            echo -n "  Updating existing SRV record... "
+            
+            if [ "$AUTH_METHOD" == "global" ]; then
+                RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=SRV&name=$NAME" \
+                    -H "X-Auth-Email: $CF_EMAIL" \
+                    -H "X-Auth-Key: $CF_API_KEY" \
+                    -H "Content-Type: application/json" | jq -r '.result[0].id')
+                
+                if [ "$RECORD_ID" != "null" ] && [ ! -z "$RECORD_ID" ]; then
+                    UPDATE_RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                        -H "X-Auth-Email: $CF_EMAIL" \
+                        -H "X-Auth-Key: $CF_API_KEY" \
+                        -H "Content-Type: application/json" \
+                        --data "$JSON_DATA")
+                    
+                    if [ "$(echo "$UPDATE_RESPONSE" | jq -r '.success')" == "true" ]; then
+                        print_message "✓ Updated"
+                    else
+                        print_error "✗ Failed to update: $(echo "$UPDATE_RESPONSE" | jq -r '.errors[0].message')"
+                    fi
+                fi
+            else
+                RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=SRV&name=$NAME" \
+                    -H "Authorization: Bearer $CF_API_KEY" \
+                    -H "Content-Type: application/json" | jq -r '.result[0].id')
+                
+                if [ "$RECORD_ID" != "null" ] && [ ! -z "$RECORD_ID" ]; then
+                    UPDATE_RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                        -H "Authorization: Bearer $CF_API_KEY" \
+                        -H "Content-Type: application/json" \
+                        --data "$JSON_DATA")
+                    
+                    if [ "$(echo "$UPDATE_RESPONSE" | jq -r '.success')" == "true" ]; then
+                        print_message "✓ Updated"
+                    else
+                        print_error "✗ Failed to update: $(echo "$UPDATE_RESPONSE" | jq -r '.errors[0].message')"
+                    fi
+                fi
+            fi
+        else
+            print_error "✗ Failed: $ERROR"
+        fi
+        return 1
+    fi
+}
+
 # Get DKIM key if it exists
 DKIM_KEY=""
 DKIM_FILE="/etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
@@ -328,16 +430,17 @@ fi
 DMARC_RECORD="v=DMARC1; p=none; rua=mailto:admin@$DOMAIN_NAME"
 create_dns_record "TXT" "_dmarc.$DOMAIN_NAME" "$DMARC_RECORD" "" "false"
 
-# 6. Autodiscover records - AUTO YES, NO MORE QUESTIONS!
+# 6. Autodiscover records
 echo ""
 echo "Adding autodiscover records for email clients..."
 create_dns_record "CNAME" "autodiscover.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
 create_dns_record "CNAME" "autoconfig.$DOMAIN_NAME" "mail.$DOMAIN_NAME" "" "false"
 
-# SRV records for autodiscovery
-create_dns_record "SRV" "_autodiscover._tcp.$DOMAIN_NAME" "0 0 443 mail.$DOMAIN_NAME" "" "false"
-create_dns_record "SRV" "_imaps._tcp.$DOMAIN_NAME" "0 1 993 mail.$DOMAIN_NAME" "" "false"
-create_dns_record "SRV" "_submission._tcp.$DOMAIN_NAME" "0 1 587 mail.$DOMAIN_NAME" "" "false"
+# SRV records with proper weight field - FIXED!
+# Priority, Weight, Port, Target
+create_srv_record "_autodiscover._tcp.$DOMAIN_NAME" 0 0 443 "mail.$DOMAIN_NAME"
+create_srv_record "_imaps._tcp.$DOMAIN_NAME" 0 1 993 "mail.$DOMAIN_NAME"
+create_srv_record "_submission._tcp.$DOMAIN_NAME" 0 1 587 "mail.$DOMAIN_NAME"
 
 # Save configuration
 print_header "Saving Configuration"
@@ -358,12 +461,14 @@ DNS Records Created:
 3. SPF record: $DOMAIN_NAME -> "$SPF_RECORD"
 4. DKIM record: mail._domainkey.$DOMAIN_NAME
 5. DMARC record: _dmarc.$DOMAIN_NAME -> "$DMARC_RECORD"
-6. Autodiscover/Autoconfig records
+6. Autodiscover/Autoconfig CNAME records
+7. SRV records for mail client autodiscovery (with weight)
 
 To verify DNS propagation:
   dig A mail.$DOMAIN_NAME
   dig MX $DOMAIN_NAME
   dig TXT $DOMAIN_NAME
+  dig SRV _autodiscover._tcp.$DOMAIN_NAME
 
 Or use online tools:
   https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
