@@ -2,7 +2,7 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER - SIMPLIFIED VERSION
-# Version: 16.0.6
+# Version: 16.0.7
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
 # =================================================================
@@ -173,7 +173,7 @@ expand_cidr() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.6             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.7             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
 ║     • Automatic Cloudflare DNS Setup                        ║
@@ -263,42 +263,45 @@ IP_ADDRESSES=("$PRIMARY_IP")
 echo "✓ Primary IP configured"
 echo ""
 
-# 4. Cloudflare configuration
+# 4. Cloudflare configuration - FIXED: NO EMAIL QUESTION!
 print_header "DNS Configuration"
 echo "Do you want to automatically configure DNS records in Cloudflare?"
-echo "(You'll need your Cloudflare API credentials)"
 echo ""
 read -p "Use Cloudflare automatic DNS setup? (y/n) [y]: " USE_CLOUDFLARE
 USE_CLOUDFLARE=${USE_CLOUDFLARE:-y}
 
-CF_EMAIL=""
 CF_API_KEY=""
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
     echo ""
-    echo "Get your API key from: https://dash.cloudflare.com/profile/api-tokens"
-    echo "(Click 'View' next to Global API Key)"
+    echo "You'll need a Cloudflare API Token (recommended) or Global API Key"
+    echo ""
+    echo "To create an API Token:"
+    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
+    echo "2. Click 'Create Token'"
+    echo "3. Use template 'Edit zone DNS' or create custom with Zone:DNS:Edit"
+    echo "4. Include your specific zone: $DOMAIN_NAME"
+    echo ""
+    echo "OR use Global API Key (less secure):"
+    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
+    echo "2. Click 'View' next to Global API Key"
     echo ""
     
-    read -p "Enter Cloudflare email: " CF_EMAIL
-    while [ -z "$CF_EMAIL" ]; do
-        print_error "Email cannot be empty!"
-        read -p "Enter Cloudflare email: " CF_EMAIL
-    done
-    
-    echo "Enter Cloudflare Global API Key:"
+    echo "Enter your Cloudflare API Token or Global API Key:"
     echo "(Input will be hidden for security)"
     read -s CF_API_KEY
     echo ""
     
     while [ -z "$CF_API_KEY" ]; do
         print_error "API Key cannot be empty!"
-        echo "Enter Cloudflare Global API Key:"
+        echo "Enter Cloudflare API Token or Global API Key:"
         read -s CF_API_KEY
         echo ""
     done
     
-    echo "✓ Cloudflare credentials saved"
+    echo "✓ Cloudflare API key saved"
+    echo ""
+    echo "Note: If using a Global API Key, you'll be prompted for email during DNS setup."
 else
     print_warning "Manual DNS setup selected."
     echo "You will need to manually add DNS records after installation."
@@ -443,7 +446,7 @@ fi
 mkdir -p "$MODULES_DIR"
 cd "$INSTALLER_DIR"
 
-# Save configuration for all scripts to use
+# Save configuration for all scripts to use (NO CF_EMAIL!)
 cat > "$INSTALLER_DIR/install.conf" <<EOF
 DOMAIN_NAME="$DOMAIN_NAME"
 HOSTNAME="$HOSTNAME"
@@ -451,14 +454,12 @@ ADMIN_EMAIL="$ADMIN_EMAIL"
 PRIMARY_IP="$PRIMARY_IP"
 IP_ADDRESSES=(${IP_ADDRESSES[@]})
 USE_CLOUDFLARE="$USE_CLOUDFLARE"
-CF_EMAIL="$CF_EMAIL"
 CF_API_KEY="$CF_API_KEY"
 EOF
 
 # Save Cloudflare credentials if provided
-if [ ! -z "$CF_EMAIL" ] && [ ! -z "$CF_API_KEY" ]; then
+if [ ! -z "$CF_API_KEY" ]; then
     cat > "/root/.cloudflare_credentials" <<EOF
-SAVED_CF_EMAIL="$CF_EMAIL"
 SAVED_CF_API_KEY="$CF_API_KEY"
 EOF
     chmod 600 "/root/.cloudflare_credentials"
