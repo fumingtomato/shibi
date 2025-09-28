@@ -2,8 +2,9 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION
-# Version: 16.0.3
-# Configures SSL (Let's Encrypt only), firewall, and final optimizations
+# Version: 16.0.4
+# Configures SSL, firewall, and final optimizations
+# Runs automatically without user interaction
 # =================================================================
 
 # Colors
@@ -61,19 +62,8 @@ else
     HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
 fi
 
-# Validate we have proper domain
-if [[ "$DOMAIN_NAME" == "localdomain" ]] || [ -z "$DOMAIN_NAME" ] || [[ "$DOMAIN_NAME" == "localhost"* ]]; then
-    print_error "Invalid domain detected: $DOMAIN_NAME"
-    read -p "Please enter your actual domain name (e.g., example.com): " DOMAIN_NAME
-    while [[ ! "$DOMAIN_NAME" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; do
-        echo "Invalid domain format. Please use format: example.com"
-        read -p "Enter your domain name: " DOMAIN_NAME
-    done
-    HOSTNAME="mail.$DOMAIN_NAME"
-fi
-
 # Get admin email if not set
-if [ -z "$ADMIN_EMAIL" ] || [[ "$ADMIN_EMAIL" == *"localdomain"* ]]; then
+if [ -z "$ADMIN_EMAIL" ]; then
     ADMIN_EMAIL="admin@$DOMAIN_NAME"
 fi
 
@@ -90,16 +80,16 @@ echo "  Primary IP: $PRIMARY_IP"
 echo ""
 
 # ===================================================================
-# 1. SSL/TLS CONFIGURATION - AUTOMATED FOR LET'S ENCRYPT
+# 1. SSL/TLS CONFIGURATION - AUTOMATED
 # ===================================================================
 
-print_header "SSL/TLS Configuration (Let's Encrypt)"
+print_header "SSL/TLS Configuration"
 
 # Check if certbot is installed
 if ! command -v certbot &> /dev/null; then
     echo "Installing Certbot..."
-    apt-get update
-    apt-get install -y certbot
+    apt-get update > /dev/null 2>&1
+    apt-get install -y certbot > /dev/null 2>&1
 fi
 
 # Check if certificate already exists
@@ -108,7 +98,7 @@ if [ -d "/etc/letsencrypt/live/$HOSTNAME" ]; then
     echo "Certificate expiry:"
     certbot certificates 2>/dev/null | grep -A2 "$HOSTNAME" | grep "Expiry"
 else
-    print_message "Requesting Let's Encrypt certificate for $HOSTNAME..."
+    print_message "Attempting to get Let's Encrypt certificate..."
     
     # Check if DNS is resolving first
     echo -n "Checking DNS resolution for $HOSTNAME... "
@@ -119,14 +109,13 @@ else
         systemctl stop nginx 2>/dev/null || true
         systemctl stop apache2 2>/dev/null || true
         
-        # Get certificate
+        # Get certificate without interaction
         certbot certonly --standalone \
             -d "$HOSTNAME" \
             --non-interactive \
             --agree-tos \
             --email "$ADMIN_EMAIL" \
-            --no-eff-email \
-            --force-renewal
+            --no-eff-email > /dev/null 2>&1
         
         if [ $? -eq 0 ]; then
             print_message "✓ SSL certificate obtained successfully"
@@ -154,19 +143,8 @@ EOF
             print_message "✓ Auto-renewal configured"
             
         else
-            print_error "Failed to obtain Let's Encrypt certificate"
-            echo ""
-            echo "Possible reasons:"
-            echo "1. DNS records not yet propagated (wait 5-30 minutes)"
-            echo "2. Port 80 is blocked by firewall"
-            echo "3. Domain doesn't point to this server ($PRIMARY_IP)"
-            echo ""
-            echo "You can retry later with:"
-            echo "  certbot certonly --standalone -d $HOSTNAME"
-            echo ""
-            
-            # Use temporary self-signed certificate
-            print_warning "Creating temporary self-signed certificate..."
+            print_warning "Could not get Let's Encrypt certificate (DNS might not be ready)"
+            echo "Creating temporary self-signed certificate..."
             
             openssl req -new -x509 -days 365 -nodes \
                 -out /etc/ssl/certs/mailserver-temp.crt \
@@ -185,15 +163,11 @@ ssl_key = </etc/ssl/private/mailserver-temp.key
 ssl_min_protocol = TLSv1.2
 EOF
             
-            print_warning "Temporary certificate created. Replace with Let's Encrypt when DNS is ready."
+            print_message "Temporary certificate created."
+            echo "Get Let's Encrypt certificate later with: certbot certonly --standalone -d $HOSTNAME"
         fi
     else
-        print_warning "✗ DNS not resolving yet"
-        echo ""
-        echo "DNS is not resolving for $HOSTNAME"
-        echo "This is normal if you just added DNS records."
-        echo ""
-        echo "Creating temporary self-signed certificate..."
+        print_warning "DNS not resolving yet - using self-signed certificate"
         
         openssl req -new -x509 -days 365 -nodes \
             -out /etc/ssl/certs/mailserver-temp.crt \
@@ -206,11 +180,6 @@ EOF
         postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver-temp.key"
         
         print_message "Temporary certificate created."
-        echo ""
-        echo "To get Let's Encrypt certificate after DNS propagates:"
-        echo "  certbot certonly --standalone -d $HOSTNAME"
-        echo ""
-        echo "Then update Postfix and Dovecot to use the new certificate."
     fi
 fi
 
@@ -230,37 +199,38 @@ if command -v ufw &> /dev/null; then
     print_message "Configuring UFW firewall..."
     
     # Default policies
-    ufw --force disable
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
+    ufw --force disable > /dev/null 2>&1
+    ufw --force reset > /dev/null 2>&1
+    ufw default deny incoming > /dev/null 2>&1
+    ufw default allow outgoing > /dev/null 2>&1
     
     # Allow SSH (important!)
-    ufw allow 22/tcp comment 'SSH'
+    ufw allow 22/tcp comment 'SSH' > /dev/null 2>&1
     
     # Mail server ports
-    ufw allow 25/tcp comment 'SMTP'
-    ufw allow 587/tcp comment 'Submission'
-    ufw allow 465/tcp comment 'SMTPS'
-    ufw allow 143/tcp comment 'IMAP'
-    ufw allow 993/tcp comment 'IMAPS'
-    ufw allow 110/tcp comment 'POP3'
-    ufw allow 995/tcp comment 'POP3S'
+    ufw allow 25/tcp comment 'SMTP' > /dev/null 2>&1
+    ufw allow 587/tcp comment 'Submission' > /dev/null 2>&1
+    ufw allow 465/tcp comment 'SMTPS' > /dev/null 2>&1
+    ufw allow 143/tcp comment 'IMAP' > /dev/null 2>&1
+    ufw allow 993/tcp comment 'IMAPS' > /dev/null 2>&1
+    ufw allow 110/tcp comment 'POP3' > /dev/null 2>&1
+    ufw allow 995/tcp comment 'POP3S' > /dev/null 2>&1
     
     # Web ports (for webmail and certbot)
-    ufw allow 80/tcp comment 'HTTP'
-    ufw allow 443/tcp comment 'HTTPS'
+    ufw allow 80/tcp comment 'HTTP' > /dev/null 2>&1
+    ufw allow 443/tcp comment 'HTTPS' > /dev/null 2>&1
     
     # Enable firewall
-    ufw --force enable
+    ufw --force enable > /dev/null 2>&1
     
     print_message "✓ Firewall configured and enabled"
     
     # Show status
-    ufw status numbered
+    echo ""
+    echo "Firewall rules:"
+    ufw status numbered | head -20
 else
     print_warning "UFW not installed, skipping firewall configuration"
-    echo "Install with: apt-get install -y ufw"
 fi
 
 # ===================================================================
@@ -271,7 +241,7 @@ print_header "Fail2ban Configuration"
 
 if ! command -v fail2ban-client &> /dev/null; then
     print_message "Installing Fail2ban..."
-    apt-get install -y fail2ban
+    apt-get install -y fail2ban > /dev/null 2>&1
 fi
 
 # Create jail configuration for mail services
@@ -308,18 +278,9 @@ logpath = /var/log/mail.log
 maxretry = 3
 EOF
 
-# Create custom filters
-cat > /etc/fail2ban/filter.d/postfix-custom.conf <<'EOF'
-[Definition]
-failregex = ^.*postfix/smtpd.*: NOQUEUE: reject:.*from\s+\[<HOST>\].*$
-            ^.*postfix/smtpd.*:.*\[<HOST>\]: Relay access denied.*$
-            ^.*postfix/smtpd.*: warning:.*\[<HOST>\]: SASL.*authentication failed.*$
-ignoreregex =
-EOF
-
 # Restart fail2ban
-systemctl restart fail2ban
-systemctl enable fail2ban
+systemctl restart fail2ban > /dev/null 2>&1
+systemctl enable fail2ban > /dev/null 2>&1
 
 print_message "✓ Fail2ban configured"
 
@@ -339,11 +300,6 @@ postconf -e "smtp_connection_reuse_time_limit = 300s"
 postconf -e "disable_vrfy_command = yes"
 postconf -e "smtpd_helo_required = yes"
 postconf -e "strict_rfc821_envelopes = yes"
-postconf -e "invalid_hostname_reject_code = 550"
-postconf -e "non_fqdn_reject_code = 550"
-postconf -e "unknown_address_reject_code = 550"
-postconf -e "unknown_client_reject_code = 550"
-postconf -e "unknown_hostname_reject_code = 550"
 
 # Anti-spam settings
 postconf -e "smtpd_recipient_limit = 100"
@@ -356,8 +312,12 @@ postconf -e "smtpd_tls_auth_only = yes"
 postconf -e "smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
 postconf -e "smtpd_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
 postconf -e "smtpd_tls_mandatory_ciphers = medium"
+postconf -e "smtpd_tls_loglevel = 1"
+postconf -e "smtpd_tls_received_header = yes"
+postconf -e "smtpd_tls_session_cache_database = btree:\${data_directory}/smtpd_scache"
+postconf -e "smtp_tls_session_cache_database = btree:\${data_directory}/smtp_scache"
 
-# Update master.cf for submission port
+# Update master.cf for submission port if not already configured
 if ! grep -q "^submission" /etc/postfix/master.cf; then
     cat >> /etc/postfix/master.cf <<'EOF'
 
@@ -424,7 +384,7 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_window_scaling = 1
 EOF
 
-sysctl -p /etc/sysctl.d/99-mailserver.conf 2>/dev/null
+sysctl -p /etc/sysctl.d/99-mailserver.conf > /dev/null 2>&1
 
 print_message "✓ System optimized"
 
@@ -473,34 +433,29 @@ for service in "${services[@]}"; do
 done
 
 # ===================================================================
-# 8. CREATE SSL HELPER SCRIPT
+# 8. CREATE HELPFUL SHORTCUTS
 # ===================================================================
 
-print_header "Creating SSL Helper Script"
+print_header "Creating Helper Scripts"
 
+# Quick SSL getter
 cat > /usr/local/bin/get-ssl-cert << EOF
 #!/bin/bash
 
-# SSL Certificate Helper Script
-# Attempts to get Let's Encrypt certificate
-
+# Quick SSL Certificate Getter
 HOSTNAME="$HOSTNAME"
 ADMIN_EMAIL="$ADMIN_EMAIL"
 
-echo "SSL Certificate Setup for: \$HOSTNAME"
-echo "===================================="
+echo "Getting Let's Encrypt certificate for: \$HOSTNAME"
 echo ""
 
 # Check DNS
-echo -n "Checking DNS resolution... "
+echo -n "Checking DNS... "
 if host "\$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
-    echo "✓ DNS is resolving"
+    echo "✓ Resolving"
     
-    # Stop services using port 80
-    systemctl stop nginx 2>/dev/null || true
-    systemctl stop apache2 2>/dev/null || true
+    systemctl stop nginx apache2 2>/dev/null || true
     
-    # Get certificate
     certbot certonly --standalone \\
         -d "\$HOSTNAME" \\
         --non-interactive \\
@@ -511,138 +466,32 @@ if host "\$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
     
     if [ \$? -eq 0 ]; then
         echo ""
-        echo "✓ Certificate obtained successfully!"
-        echo ""
-        echo "Updating mail server configuration..."
+        echo "✓ Certificate obtained!"
         
-        # Update Postfix
+        # Update configs
         postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/\$HOSTNAME/fullchain.pem"
         postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/\$HOSTNAME/privkey.pem"
         
-        # Update Dovecot
         sed -i "s|ssl_cert = .*|ssl_cert = </etc/letsencrypt/live/\$HOSTNAME/fullchain.pem|" /etc/dovecot/conf.d/10-ssl.conf
         sed -i "s|ssl_key = .*|ssl_key = </etc/letsencrypt/live/\$HOSTNAME/privkey.pem|" /etc/dovecot/conf.d/10-ssl.conf
         
-        # Restart services
-        systemctl reload postfix
-        systemctl reload dovecot
-        
-        echo "✓ Services updated with new certificate"
+        systemctl reload postfix dovecot
+        echo "✓ Services updated"
     else
-        echo ""
-        echo "✗ Failed to obtain certificate"
-        echo "Check that port 80 is accessible and DNS is correct"
+        echo "✗ Failed - check that port 80 is accessible"
     fi
 else
-    echo "✗ DNS not resolving"
-    echo ""
-    echo "Please ensure DNS records are set up:"
-    echo "  A record: \$HOSTNAME -> \$(curl -s https://ipinfo.io/ip)"
-    echo ""
-    echo "Then run this script again."
+    echo "✗ DNS not resolving yet"
+    echo "Please wait for DNS propagation"
 fi
 EOF
 
 chmod +x /usr/local/bin/get-ssl-cert
 
 # ===================================================================
-# 9. CREATE QUICK TEST SCRIPT
+# 9. SAVE CONFIGURATION SUMMARY
 # ===================================================================
 
-cat > /usr/local/bin/mail-test << 'EOF'
-#!/bin/bash
-
-echo "MAIL SERVER QUICK TEST"
-echo "====================="
-echo ""
-
-# Check services
-echo "1. Service Status:"
-for service in postfix dovecot opendkim mysql; do
-    printf "   %-10s: " "$service"
-    systemctl is-active $service || echo "NOT RUNNING"
-done
-echo ""
-
-# Check ports
-echo "2. Open Ports:"
-netstat -tlnp 2>/dev/null | grep -E ":(25|587|465|143|993|110|995) " | awk '{print "   Port", $4}'
-echo ""
-
-# Check SSL
-echo "3. SSL Certificate:"
-HOSTNAME=$(postconf -h myhostname)
-if [ -f /etc/letsencrypt/live/$HOSTNAME/fullchain.pem ]; then
-    echo "   ✓ Let's Encrypt certificate found"
-    echo "   Expires: $(openssl x509 -in /etc/letsencrypt/live/$HOSTNAME/fullchain.pem -noout -enddate | cut -d= -f2)"
-elif [ -f /etc/ssl/certs/mailserver-temp.crt ]; then
-    echo "   ⚠ Using temporary self-signed certificate"
-    echo "   Run 'get-ssl-cert' after DNS propagates to get Let's Encrypt certificate"
-else
-    echo "   ✗ No SSL certificate found"
-fi
-echo ""
-
-# Check DNS
-DOMAIN=$(postconf -h mydomain)
-echo "4. DNS Quick Check:"
-echo -n "   MX Record: "
-dig +short MX $DOMAIN @8.8.8.8 | head -1 || echo "NOT SET"
-echo ""
-
-# Test email
-echo "5. Send Test Email:"
-echo "   Use: test-email recipient@example.com"
-echo ""
-
-echo "For full DNS check: check-dns $DOMAIN"
-echo "For server status: mail-status"
-echo "To get SSL certificate: get-ssl-cert"
-EOF
-
-chmod +x /usr/local/bin/mail-test
-
-# ===================================================================
-# COMPLETION
-# ===================================================================
-
-print_header "Post-Installation Complete!"
-echo ""
-echo "✓ SSL/TLS configured"
-echo "✓ Firewall configured"
-echo "✓ Fail2ban configured"
-echo "✓ Services optimized"
-echo "✓ Log rotation configured"
-echo ""
-
-# SSL status
-if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
-    print_message "✓ Let's Encrypt SSL certificate is active"
-else
-    print_warning "⚠ Temporary certificate in use"
-    echo "  Run 'get-ssl-cert' after DNS propagates to get Let's Encrypt certificate"
-fi
-echo ""
-
-echo "Quick Commands:"
-echo "  mail-test      - Run quick test"
-echo "  mail-status    - Check server status"
-echo "  check-dns      - Verify DNS records"
-echo "  test-email     - Send test email"
-echo "  get-ssl-cert   - Get/renew Let's Encrypt certificate"
-echo ""
-
-# Run quick test
-echo "Running quick test..."
-echo ""
-/usr/local/bin/mail-test
-
-echo ""
-print_message "✓ Post-installation configuration completed!"
-print_message ""
-print_message "Your mail server is now ready to use!"
-
-# Save configuration summary
 cat > /root/mail-server-config.txt <<EOF
 Mail Server Configuration Summary
 Generated: $(date)
@@ -653,14 +502,16 @@ Hostname: $HOSTNAME
 Admin Email: $ADMIN_EMAIL
 Primary IP: $PRIMARY_IP
 
+First Email Account: ${FIRST_EMAIL:-Not configured}
+
 SSL Certificate:
 $(if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
     echo "  Type: Let's Encrypt"
     echo "  Location: /etc/letsencrypt/live/$HOSTNAME/"
-    certbot certificates 2>/dev/null | grep -A2 "$HOSTNAME"
+    echo "  Auto-renewal: Enabled"
 else
-    echo "  Type: Temporary self-signed"
-    echo "  Run 'get-ssl-cert' to obtain Let's Encrypt certificate"
+    echo "  Type: Self-signed (temporary)"
+    echo "  Get Let's Encrypt: run 'get-ssl-cert'"
 fi)
 
 Services:
@@ -669,6 +520,7 @@ Services:
   OpenDKIM: $(systemctl is-active opendkim)
   MySQL: $(systemctl is-active mysql || systemctl is-active mariadb)
   Fail2ban: $(systemctl is-active fail2ban)
+  Firewall: $(ufw status | grep -q "Status: active" && echo "Active" || echo "Inactive")
 
 Ports:
   25  - SMTP
@@ -679,17 +531,69 @@ Ports:
   110 - POP3
   995 - POP3S
 
+Email Testing:
+  Send test: test-email check-auth@verifier.port25.com ${FIRST_EMAIL:-user@$DOMAIN_NAME}
+  Mail Tester: https://www.mail-tester.com
+  MX Toolbox: https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
+
 Management Commands:
-  mail-account   - Manage email accounts
-  mail-queue     - Manage mail queue
-  mail-status    - Check server status
-  mail-backup    - Backup mail server
-  mail-log       - View mail logs
   test-email     - Send test email
+  mail-account   - Manage email accounts
+  mail-status    - Check server status
+  mail-queue     - Manage mail queue
+  mail-log       - View mail logs
   check-dns      - Verify DNS records
   get-ssl-cert   - Get/renew SSL certificate
+
+Logs:
+  /var/log/mail.log     - Mail server log
+  /var/log/syslog       - System log
+  journalctl -xe        - Service logs
+
+Backup:
+  Run: mail-backup
 
 ================================================================================
 EOF
 
-echo "Configuration saved to: /root/mail-server-config.txt"
+# ===================================================================
+# COMPLETION
+# ===================================================================
+
+print_header "Post-Installation Complete!"
+echo ""
+echo "✓ SSL/TLS configured"
+echo "✓ Firewall configured" 
+echo "✓ Fail2ban configured"
+echo "✓ Services optimized"
+echo "✓ Log rotation configured"
+echo ""
+
+# Show status
+if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
+    print_message "✓ Let's Encrypt SSL certificate is active"
+else
+    print_warning "⚠ Using temporary self-signed certificate"
+    echo "  Get Let's Encrypt certificate: get-ssl-cert"
+fi
+
+echo ""
+if [ ! -z "$FIRST_EMAIL" ]; then
+    print_message "Your email account is ready:"
+    echo "  Email: $FIRST_EMAIL"
+    echo "  Password: [the one you set]"
+    echo ""
+fi
+
+print_header "QUICK TEST COMMANDS"
+echo ""
+echo "1. Check everything: mail-test"
+echo "2. Send test email: test-email check-auth@verifier.port25.com"
+echo "3. Check DNS: check-dns $DOMAIN_NAME"
+echo "4. View logs: mail-log follow"
+echo ""
+
+print_message "Configuration saved to: /root/mail-server-config.txt"
+echo ""
+print_message "✓ Post-installation configuration completed!"
+print_message "Your mail server is now ready to use!"
