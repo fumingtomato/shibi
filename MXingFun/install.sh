@@ -2,7 +2,7 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER - SIMPLIFIED VERSION
-# Version: 16.0.7
+# Version: 16.0.8
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
 # =================================================================
@@ -173,7 +173,7 @@ expand_cidr() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.7             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.0.8             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
 ║     • Automatic Cloudflare DNS Setup                        ║
@@ -247,7 +247,49 @@ done
 echo "✓ Admin email set"
 echo ""
 
-# 3. Server IP
+# 3. First email account - NEW!
+print_header "Email Account Setup"
+echo "Let's create your first email account now."
+echo ""
+read -p "Enter username for first email account (e.g., newsletter): " FIRST_USER
+while [[ ! "$FIRST_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; do
+    echo "Invalid username. Use only letters, numbers, dots, dashes, and underscores."
+    read -p "Enter username: " FIRST_USER
+done
+
+FIRST_EMAIL="${FIRST_USER}@${DOMAIN_NAME}"
+echo "Email address will be: $FIRST_EMAIL"
+
+# Password input with confirmation
+while true; do
+    echo ""
+    echo "Enter password for $FIRST_EMAIL"
+    echo "(minimum 8 characters recommended):"
+    read -s FIRST_PASS
+    echo ""
+    
+    if [ ${#FIRST_PASS} -lt 8 ]; then
+        print_warning "Password should be at least 8 characters for security."
+        read -p "Use this password anyway? (y/n): " USE_SHORT
+        if [[ "${USE_SHORT,,}" != "y" ]]; then
+            continue
+        fi
+    fi
+    
+    echo "Confirm password:"
+    read -s FIRST_PASS_CONFIRM
+    echo ""
+    
+    if [ "$FIRST_PASS" == "$FIRST_PASS_CONFIRM" ]; then
+        echo "✓ Password confirmed"
+        break
+    else
+        print_error "Passwords don't match. Please try again."
+    fi
+done
+echo ""
+
+# 4. Server IP
 echo "Detecting server IP address..."
 PRIMARY_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || curl -s https://api.ipify.org 2>/dev/null || echo "")
 if [ -z "$PRIMARY_IP" ]; then
@@ -263,7 +305,7 @@ IP_ADDRESSES=("$PRIMARY_IP")
 echo "✓ Primary IP configured"
 echo ""
 
-# 4. Cloudflare configuration - FIXED: NO EMAIL QUESTION!
+# 5. Cloudflare configuration
 print_header "DNS Configuration"
 echo "Do you want to automatically configure DNS records in Cloudflare?"
 echo ""
@@ -308,7 +350,7 @@ else
 fi
 echo ""
 
-# 5. Multi-IP configuration
+# 6. Multi-IP configuration
 read -p "Do you want to configure additional IP addresses? (y/n) [n]: " MULTI_IP
 if [[ "${MULTI_IP,,}" == "y" ]]; then
     echo ""
@@ -399,6 +441,7 @@ print_header "Configuration Summary"
 echo "Domain: $DOMAIN_NAME"
 echo "Hostname: $HOSTNAME"
 echo "Admin Email: $ADMIN_EMAIL"
+echo "First Account: $FIRST_EMAIL"
 echo "Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "Additional IPs: $((${#IP_ADDRESSES[@]} - 1)) configured"
@@ -446,7 +489,7 @@ fi
 mkdir -p "$MODULES_DIR"
 cd "$INSTALLER_DIR"
 
-# Save configuration for all scripts to use (NO CF_EMAIL!)
+# Save configuration for all scripts to use
 cat > "$INSTALLER_DIR/install.conf" <<EOF
 DOMAIN_NAME="$DOMAIN_NAME"
 HOSTNAME="$HOSTNAME"
@@ -455,6 +498,9 @@ PRIMARY_IP="$PRIMARY_IP"
 IP_ADDRESSES=(${IP_ADDRESSES[@]})
 USE_CLOUDFLARE="$USE_CLOUDFLARE"
 CF_API_KEY="$CF_API_KEY"
+FIRST_EMAIL="$FIRST_EMAIL"
+FIRST_USER="$FIRST_USER"
+FIRST_PASS="$FIRST_PASS"
 EOF
 
 # Save Cloudflare credentials if provided
@@ -535,6 +581,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     opendkim opendkim-tools \
     spamassassin spamc \
     certbot \
+    mailutils \
     ufw fail2ban > /dev/null 2>&1
 
 echo "Configuring Postfix..."
@@ -544,7 +591,7 @@ postconf -e "myorigin = \$mydomain"
 systemctl restart postfix > /dev/null 2>&1
 
 # ===================================================================
-# PHASE 2: DATABASE SETUP
+# PHASE 2: DATABASE SETUP (Creates first email account!)
 # ===================================================================
 
 print_header "Phase 2: Setting Up Database"
@@ -685,6 +732,7 @@ echo "Configuration:"
 echo "  Domain: $DOMAIN_NAME"
 echo "  Hostname: $HOSTNAME"
 echo "  Admin Email: $ADMIN_EMAIL"
+echo "  Email Account: $FIRST_EMAIL (ready to use!)"
 echo "  Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "  Additional IPs: $((${#IP_ADDRESSES[@]} - 1))"
@@ -712,11 +760,36 @@ else
 fi
 
 echo ""
+print_header "HOW TO SEND TEST EMAILS"
+echo ""
+echo "Method 1 - Using test-email command (easiest):"
+echo "  sudo test-email recipient@example.com $FIRST_EMAIL"
+echo ""
+echo "Method 2 - Using mail command:"
+echo "  echo \"Test message body\" | mail -s \"Test Subject\" recipient@example.com -r $FIRST_EMAIL"
+echo ""
+echo "Method 3 - Test with mail-tester.com:"
+echo "  1. Go to https://www.mail-tester.com"
+echo "  2. Copy the test email address they give you"
+echo "  3. Run: sudo test-email [their-address] $FIRST_EMAIL"
+echo ""
+echo "Method 4 - Using sendmail directly:"
+echo "  (echo \"Subject: Test\"; echo \"\"; echo \"Test body\") | sendmail -f $FIRST_EMAIL recipient@example.com"
+echo ""
+
+echo ""
 echo "Available Commands:"
-echo "  mail-account add user@$DOMAIN_NAME password  - Add email account"
-echo "  test-email check-auth@verifier.port25.com    - Test delivery"
+echo "  mail-account add user@$DOMAIN_NAME password  - Add another email account"
+echo "  mail-account list                            - List all email accounts"
+echo "  test-email recipient@example.com             - Send test email"
 echo "  check-dns $DOMAIN_NAME                       - Verify DNS"
 echo "  mail-status                                   - Check server status"
+echo "  mail-queue show                               - Check mail queue"
+echo "  mail-log follow                               - Watch mail logs"
+echo ""
+echo "Your first email account is ready:"
+echo "  Email: $FIRST_EMAIL"
+echo "  Password: [the one you entered]"
 echo ""
 echo "Installation log: $LOG_FILE"
 echo ""
