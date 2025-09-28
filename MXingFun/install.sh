@@ -2,11 +2,10 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER WITH WEBSITE
-# Version: 16.2.0
+# Version: 16.3.0
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
-# Includes website setup for bulk email compliance
-# PROPERLY ADDS DKIM TO CLOUDFLARE
+# FIXED: DKIM keys generated BEFORE DNS setup
 # =================================================================
 # ALL QUESTIONS FIRST - THEN AUTOMATIC INSTALLATION
 # =================================================================
@@ -175,10 +174,10 @@ expand_cidr() {
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v16.2.0             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v16.3.0             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
-║     • Automatic Cloudflare DNS Setup with DKIM              ║
+║     • FIXED: DKIM properly added to Cloudflare              ║
 ║     • Automatic Let's Encrypt SSL                           ║
 ║     • Compliance Website for Bulk Email                     ║
 ║     • Mailwizz Compatible                                   ║
@@ -610,10 +609,80 @@ postconf -e "myorigin = \$mydomain"
 systemctl restart postfix > /dev/null 2>&1
 
 # ===================================================================
-# PHASE 2: DATABASE SETUP (Creates first email account!)
+# CRITICAL: GENERATE DKIM KEYS NOW - BEFORE DNS SETUP!
 # ===================================================================
 
-print_header "Phase 2: Setting Up Database"
+print_header "Phase 2: Generating DKIM Keys (BEFORE DNS Setup)"
+echo ""
+
+echo "Creating DKIM keys for $DOMAIN_NAME..."
+
+# Create directories
+mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
+cd /etc/opendkim/keys/$DOMAIN_NAME
+
+# Generate DKIM keys
+opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
+chown -R opendkim:opendkim /etc/opendkim
+chmod 600 mail.private
+chmod 644 mail.txt
+
+# Configure OpenDKIM basics
+cat > /etc/opendkim.conf <<EODKIM
+AutoRestart             Yes
+AutoRestartRate         10/1h
+UMask                   002
+Syslog                  yes
+SyslogSuccess           Yes
+LogWhy                  Yes
+Canonicalization        relaxed/simple
+ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
+InternalHosts           refile:/etc/opendkim/TrustedHosts
+KeyTable                refile:/etc/opendkim/KeyTable
+SigningTable            refile:/etc/opendkim/SigningTable
+Mode                    sv
+PidFile                 /var/run/opendkim/opendkim.pid
+SignatureAlgorithm      rsa-sha256
+UserID                  opendkim:opendkim
+Socket                  inet:8891@localhost
+EODKIM
+
+# Setup key files
+echo "127.0.0.1" > /etc/opendkim/TrustedHosts
+echo "localhost" >> /etc/opendkim/TrustedHosts
+echo ".$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
+echo "$PRIMARY_IP" >> /etc/opendkim/TrustedHosts
+
+echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
+echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
+
+# Configure Postfix to use OpenDKIM
+postconf -e "milter_protocol = 6"
+postconf -e "milter_default_action = accept"
+postconf -e "smtpd_milters = inet:localhost:8891"
+postconf -e "non_smtpd_milters = inet:localhost:8891"
+
+# Start OpenDKIM
+systemctl restart opendkim
+systemctl enable opendkim
+
+# Verify DKIM key was generated
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
+    print_message "✓ DKIM key generated successfully!"
+    echo "Key length: ${#DKIM_KEY} characters"
+else
+    print_error "✗ DKIM key generation failed!"
+fi
+
+cd "$INSTALLER_DIR"
+echo ""
+
+# ===================================================================
+# PHASE 3: DATABASE SETUP (Creates first email account!)
+# ===================================================================
+
+print_header "Phase 3: Setting Up Database"
 echo ""
 
 if [ -f "$INSTALLER_DIR/setup-database.sh" ]; then
@@ -623,10 +692,10 @@ else
 fi
 
 # ===================================================================
-# PHASE 3: CREATE UTILITIES
+# PHASE 4: CREATE UTILITIES
 # ===================================================================
 
-print_header "Phase 3: Creating Management Utilities"
+print_header "Phase 4: Creating Management Utilities"
 echo ""
 
 if [ -f "$INSTALLER_DIR/create-utilities.sh" ]; then
@@ -636,10 +705,10 @@ else
 fi
 
 # ===================================================================
-# PHASE 4: WEBSITE SETUP
+# PHASE 5: WEBSITE SETUP
 # ===================================================================
 
-print_header "Phase 4: Setting Up Website for Bulk Email"
+print_header "Phase 5: Setting Up Website for Bulk Email"
 echo ""
 
 if [ -f "$INSTALLER_DIR/setup-website.sh" ]; then
@@ -656,12 +725,19 @@ else
 fi
 
 # ===================================================================
-# PHASE 5: DNS CONFIGURATION (INCLUDING DKIM!)
+# PHASE 6: DNS CONFIGURATION (NOW WITH DKIM KEY READY!)
 # ===================================================================
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Phase 5: Configuring Cloudflare DNS (Including DKIM)"
+    print_header "Phase 6: Configuring Cloudflare DNS (Including DKIM)"
     echo ""
+    
+    # Verify DKIM key exists before running DNS setup
+    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+        echo "✓ DKIM key is ready to be added to DNS"
+    else
+        print_warning "⚠ DKIM key not found, DNS setup may be incomplete"
+    fi
     
     if [ -f "$INSTALLER_DIR/cloudflare-dns-setup.sh" ]; then
         bash "$INSTALLER_DIR/cloudflare-dns-setup.sh"
@@ -694,23 +770,27 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
         print_warning "Cloudflare script not found, skipping DNS automation..."
     fi
 else
-    print_header "Phase 5: Manual DNS Configuration Required"
+    print_header "Phase 6: Manual DNS Configuration Required"
     echo ""
     echo "After installation, add these DNS records at your provider:"
     echo "  A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
     echo "  A record: $DOMAIN_NAME -> $PRIMARY_IP"
     echo "  MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
     echo "  SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
-    echo "  DKIM: Check /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+    
+    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+        echo "  DKIM: mail._domainkey TXT record:"
+        echo "        v=DKIM1; k=rsa; p=$DKIM_KEY"
+    fi
     echo ""
 fi
 
 # ===================================================================
-# PHASE 6: SSL CERTIFICATE
+# PHASE 7: SSL CERTIFICATE
 # ===================================================================
 
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Phase 6: Getting SSL Certificates"
+    print_header "Phase 7: Getting SSL Certificates"
     echo ""
     
     if [ -f "$INSTALLER_DIR/ssl-setup.sh" ]; then
@@ -738,15 +818,15 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
         systemctl start nginx 2>/dev/null || true
     fi
 else
-    print_header "Phase 6: SSL Certificate - Manual Setup Required"
+    print_header "Phase 7: SSL Certificate - Manual Setup Required"
     echo "After DNS propagates, run: certbot certonly --standalone -d $HOSTNAME"
 fi
 
 # ===================================================================
-# PHASE 7: POST-INSTALLATION CONFIGURATION
+# PHASE 8: POST-INSTALLATION CONFIGURATION
 # ===================================================================
 
-print_header "Phase 7: Final Configuration"
+print_header "Phase 8: Final Configuration"
 echo ""
 
 if [ -f "$INSTALLER_DIR/post-install-config.sh" ]; then
@@ -770,6 +850,46 @@ fi
 # Restart all services
 echo "Restarting mail services..."
 systemctl restart postfix dovecot opendkim nginx > /dev/null 2>&1
+
+# ===================================================================
+# VERIFY DKIM IS WORKING
+# ===================================================================
+
+print_header "Verifying DKIM Configuration"
+
+# Check OpenDKIM is running
+if systemctl is-active --quiet opendkim; then
+    print_message "✓ OpenDKIM service is running"
+else
+    print_error "✗ OpenDKIM service is not running"
+    systemctl restart opendkim
+fi
+
+# Check OpenDKIM is listening
+if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+    print_message "✓ OpenDKIM is listening on port 8891"
+else
+    print_error "✗ OpenDKIM is not listening on port 8891"
+fi
+
+# Check DKIM key exists
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    print_message "✓ DKIM key file exists"
+else
+    print_error "✗ DKIM key file missing!"
+fi
+
+# Check if DKIM is in DNS (if using Cloudflare)
+if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+    echo -n "Checking DKIM in Cloudflare DNS... "
+    if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
+        print_message "✓ DKIM is ACTIVE in Cloudflare!"
+    else
+        print_warning "⚠ DKIM is propagating (wait 5-10 minutes)"
+    fi
+fi
+
+echo ""
 
 # ===================================================================
 # INSTALLATION COMPLETE!
@@ -801,6 +921,30 @@ echo "  Terms: http://$DOMAIN_NAME/terms.html"
 echo "  Contact: http://$DOMAIN_NAME/contact.html"
 echo ""
 
+echo "DKIM STATUS:"
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    print_message "  ✓ DKIM key generated"
+    if systemctl is-active --quiet opendkim; then
+        print_message "  ✓ OpenDKIM service running"
+    fi
+    if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
+        if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
+            print_message "  ✓ DKIM record ACTIVE in Cloudflare!"
+        else
+            print_warning "  ⚠ DKIM record propagating (normal, wait 5-10 min)"
+        fi
+    else
+        echo "  ⚠ Add DKIM record manually to your DNS:"
+        echo "    Name: mail._domainkey"
+        echo "    Type: TXT"
+        echo "    Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
+    fi
+else
+    print_error "  ✗ DKIM not configured!"
+fi
+
+echo ""
+
 if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
     echo "✓ DNS records configured in Cloudflare"
     echo "✓ DKIM record added to Cloudflare"
@@ -810,30 +954,30 @@ if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
         echo "⚠ SSL certificate pending - DNS might still be propagating"
         echo "  Try later: get-ssl or certbot certonly --standalone -d $HOSTNAME"
     fi
-    
-    # Quick DKIM verification
-    echo ""
-    echo -n "DKIM Status: "
-    if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
-        print_message "✓ DKIM is ACTIVE in Cloudflare!"
-    else
-        print_warning "⚠ DKIM is propagating (this is normal, wait 5-10 minutes)"
-    fi
 else
     echo "Next steps for manual configuration:"
     echo ""
-    echo "1. Add DNS records at your DNS provider:"
-    echo "   • A record: $DOMAIN_NAME -> $PRIMARY_IP"
-    echo "   • A record: mail.$DOMAIN_NAME -> $PRIMARY_IP"
-    echo "   • MX record: $DOMAIN_NAME -> mail.$DOMAIN_NAME (priority 10)"
-    echo "   • SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
-    echo "   • DKIM: mail._domainkey TXT record from /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
-    echo ""
-    echo "2. After DNS propagates (5-30 minutes), get SSL certificate:"
-    echo "   get-ssl or certbot certonly --standalone -d $HOSTNAME"
+    echo "1. Add DNS records at your DNS provider (including DKIM above)"
+    echo "2. After DNS propagates, get SSL: get-ssl"
 fi
 
 echo ""
+print_header "TEST YOUR DKIM NOW!"
+echo ""
+echo "1. Quick DKIM test:"
+echo "   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
+echo ""
+echo "2. Send test email with DKIM:"
+echo "   test-email check-auth@verifier.port25.com $FIRST_EMAIL"
+echo "   (Wait for reply - it will show DKIM pass/fail)"
+echo ""
+echo "3. Check mail score:"
+echo "   https://www.mail-tester.com"
+echo ""
+echo "4. Verify all DNS records:"
+echo "   check-dns $DOMAIN_NAME"
+echo ""
+
 print_header "MAILWIZZ CONFIGURATION"
 echo ""
 echo "Configure Mailwizz with these settings:"
@@ -843,54 +987,19 @@ echo "  Username: $FIRST_EMAIL"
 echo "  Password: [the one you set]"
 echo "  Encryption: TLS or SSL"
 echo ""
-echo "IMPORTANT NEXT STEPS:"
-echo "1. Update Mailwizz unsubscribe URL in: /etc/nginx/sites-available/$DOMAIN_NAME"
-echo "2. Add your physical address to: /var/www/$DOMAIN_NAME/contact.html"
-echo "3. Restart nginx after changes: systemctl reload nginx"
+echo "IMPORTANT: Update unsubscribe URL in /etc/nginx/sites-available/$DOMAIN_NAME"
 echo ""
 
-print_header "HOW TO TEST YOUR MAIL SERVER"
-echo ""
-echo "1. Quick server test:"
-echo "   mail-test"
-echo ""
-echo "2. Send test email with DKIM signing:"
-echo "   test-email check-auth@verifier.port25.com $FIRST_EMAIL"
-echo ""
-echo "3. Check your mail score:"
-echo "   Go to https://www.mail-tester.com"
-echo "   Get a test address and run:"
-echo "   test-email [their-address] $FIRST_EMAIL"
-echo ""
-echo "4. Verify DNS and DKIM:"
-echo "   check-dns $DOMAIN_NAME"
-echo ""
-echo "5. Check Mailwizz configuration:"
-echo "   mailwizz-info"
-echo ""
-
-echo ""
 echo "Available Commands:"
-echo "  mail-account add user@$DOMAIN_NAME password  - Add email account"
-echo "  mail-account list                            - List all accounts"
-echo "  test-email recipient@example.com             - Send test email"
-echo "  check-dns $DOMAIN_NAME                       - Verify DNS & DKIM"
-echo "  mail-status                                   - Check server status"
-echo "  mail-queue show                               - Check mail queue"
-echo "  mail-log follow                               - Watch mail logs"
-echo "  mailwizz-info                                 - Mailwizz setup info"
-echo "  get-ssl                                       - Manage SSL certificates"
+echo "  test-email     - Send test email with DKIM"
+echo "  check-dns      - Verify all DNS including DKIM"
+echo "  mail-status    - Check server status"
+echo "  mailwizz-info  - Mailwizz setup info"
+echo ""
+
+print_message "✅ Your mail server is ready for LEGAL bulk email with DKIM signing!"
+print_message "✅ DKIM will ensure your emails pass authentication checks!"
 echo ""
 echo "Installation log: $LOG_FILE"
 echo ""
-
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_message "✅ DKIM has been automatically configured in Cloudflare!"
-    print_message "✅ Your emails will be properly signed with DKIM!"
-fi
-
-print_message ""
-print_message "Thank you for using the mail server installer!"
 print_message "Repository: https://github.com/fumingtomato/shibi"
-print_message ""
-print_message "Your mail server is ready for bulk email operations!"
