@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # =================================================================
-# MAIL SERVER DATABASE SETUP
-# Version: 16.0.4
-# Creates and configures MySQL database for virtual mail hosting
-# Automatically creates first email account from installer config
+# DATABASE SETUP FOR MAIL SERVER
+# Version: 16.1.0
+# Sets up MySQL/MariaDB with virtual users for Postfix/Dovecot
+# Creates first email account during installation
 # =================================================================
 
 # Colors
@@ -28,14 +28,14 @@ print_header() {
     echo -e "${BLUE}==================================================${NC}"
 }
 
-print_header "Mail Server Database Setup"
-echo ""
-
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
     print_error "This script must be run as root"
     exit 1
 fi
+
+print_header "Setting Up Mail Server Database"
+echo ""
 
 # Load configuration from installer
 if [ -f "$(pwd)/install.conf" ]; then
@@ -44,57 +44,98 @@ elif [ -f "/root/mail-installer/install.conf" ]; then
     source "/root/mail-installer/install.conf"
 fi
 
-# Check if MySQL/MariaDB is installed
-if ! command -v mysql &> /dev/null; then
-    echo "MySQL/MariaDB not found. Installing..."
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server mysql-client
+# Get domain info
+if [ -z "$DOMAIN_NAME" ]; then
+    if [ -f /etc/postfix/main.cf ]; then
+        HOSTNAME=$(postconf -h myhostname 2>/dev/null || hostname -f)
+        DOMAIN_NAME=$(postconf -h mydomain 2>/dev/null || hostname -d)
+    else
+        print_error "Domain configuration not found!"
+        exit 1
+    fi
+else
+    HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
 fi
 
-# Start MySQL service
-echo "Starting MySQL service..."
-systemctl start mysql 2>/dev/null || systemctl start mariadb 2>/dev/null
+echo "Domain: $DOMAIN_NAME"
+echo "Hostname: $HOSTNAME"
+if [ ! -z "$FIRST_EMAIL" ]; then
+    echo "First email account: $FIRST_EMAIL"
+fi
+echo ""
 
-# Generate secure password
+# ===================================================================
+# 1. INSTALL AND START DATABASE
+# ===================================================================
+
+echo "Checking database installation..."
+
+# Check if MySQL or MariaDB is installed
+DB_SERVICE=""
+if systemctl list-units --all | grep -q "mysql.service"; then
+    DB_SERVICE="mysql"
+elif systemctl list-units --all | grep -q "mariadb.service"; then
+    DB_SERVICE="mariadb"
+else
+    echo "Installing MariaDB..."
+    apt-get update > /dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client > /dev/null 2>&1
+    DB_SERVICE="mariadb"
+fi
+
+# Start and enable database service
+systemctl start $DB_SERVICE
+systemctl enable $DB_SERVICE
+
+print_message "✓ Database service ($DB_SERVICE) is running"
+
+# ===================================================================
+# 2. GENERATE DATABASE PASSWORD
+# ===================================================================
+
+echo "Generating database password..."
+
+# Check if password already exists
 if [ -f /root/.mail_db_password ]; then
-    DB_PASSWORD=$(cat /root/.mail_db_password)
+    DB_PASS=$(cat /root/.mail_db_password)
     echo "Using existing database password"
 else
-    DB_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
-    echo "$DB_PASSWORD" > /root/.mail_db_password
+    # Generate strong password
+    DB_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
+    echo "$DB_PASS" > /root/.mail_db_password
     chmod 600 /root/.mail_db_password
-    echo "Generated new database password"
+    echo "New database password generated"
 fi
 
-# Create database and user
-print_message "Creating mailserver database..."
+# ===================================================================
+# 3. CREATE DATABASE AND TABLES
+# ===================================================================
 
+echo "Creating mail server database..."
+
+# Create database and user
 mysql <<EOF 2>/dev/null
 -- Create database
-CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS mailserver;
 
--- Create user
-CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
-CREATE USER IF NOT EXISTS 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_PASSWORD';
-
--- Grant privileges
+-- Create user with proper privileges
+CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASS';
 GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost';
-GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'127.0.0.1';
 FLUSH PRIVILEGES;
 
 -- Use the database
 USE mailserver;
 
--- Create virtual_domains table
+-- Create domains table
 CREATE TABLE IF NOT EXISTS virtual_domains (
     id INT NOT NULL AUTO_INCREMENT,
     name VARCHAR(255) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY domain_name (name)
+    UNIQUE KEY domain_unique (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Create virtual_users table
+-- Create users table
 CREATE TABLE IF NOT EXISTS virtual_users (
     id INT NOT NULL AUTO_INCREMENT,
     domain_id INT NOT NULL,
@@ -104,305 +145,78 @@ CREATE TABLE IF NOT EXISTS virtual_users (
     active TINYINT DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY email (email),
+    UNIQUE KEY email_unique (email),
     FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Create virtual_aliases table
+-- Create aliases table
 CREATE TABLE IF NOT EXISTS virtual_aliases (
     id INT NOT NULL AUTO_INCREMENT,
     domain_id INT NOT NULL,
     source VARCHAR(255) NOT NULL,
-    destination TEXT NOT NULL,
+    destination VARCHAR(255) NOT NULL,
     active TINYINT DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY source (source),
+    UNIQUE KEY source_unique (source),
     FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Create sender_access table for multi-IP routing
-CREATE TABLE IF NOT EXISTS sender_access (
-    id INT NOT NULL AUTO_INCREMENT,
-    email VARCHAR(255) NOT NULL,
-    ip_address VARCHAR(45) NOT NULL,
-    transport VARCHAR(255) DEFAULT NULL,
-    priority INT DEFAULT 50,
-    active TINYINT DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY email_ip (email, ip_address),
-    KEY idx_email (email),
-    KEY idx_active (active)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- Create transport_maps table
-CREATE TABLE IF NOT EXISTS transport_maps (
-    id INT NOT NULL AUTO_INCREMENT,
-    domain VARCHAR(255) NOT NULL,
-    transport VARCHAR(255) NOT NULL,
-    active TINYINT DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY domain (domain)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- Create mail_statistics table
-CREATE TABLE IF NOT EXISTS mail_statistics (
-    id INT NOT NULL AUTO_INCREMENT,
-    email VARCHAR(255) NOT NULL,
-    ip_address VARCHAR(45),
-    sent_count INT DEFAULT 0,
-    bounce_count INT DEFAULT 0,
-    last_sent TIMESTAMP NULL,
-    date_created DATE,
-    PRIMARY KEY (id),
-    UNIQUE KEY email_date (email, date_created),
-    KEY idx_date (date_created)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- Create ip_pool table for IP management
-CREATE TABLE IF NOT EXISTS ip_pool (
-    id INT NOT NULL AUTO_INCREMENT,
-    ip_address VARCHAR(45) NOT NULL,
-    hostname VARCHAR(255),
-    transport_name VARCHAR(100),
-    weight INT DEFAULT 1,
-    max_connections INT DEFAULT 10,
-    active TINYINT DEFAULT 1,
-    last_used TIMESTAMP NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY ip_address (ip_address)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- Show created tables
-SHOW TABLES;
+-- Add index for performance
+CREATE INDEX IF NOT EXISTS idx_email ON virtual_users(email);
+CREATE INDEX IF NOT EXISTS idx_domain ON virtual_domains(name);
 EOF
 
 if [ $? -eq 0 ]; then
-    print_message "✓ Database created successfully"
+    print_message "✓ Database structure created"
 else
-    print_error "Database creation had some issues (this might be normal if already exists)"
-fi
-
-# Create Postfix MySQL configuration files
-print_header "Creating Postfix MySQL Configuration"
-
-mkdir -p /etc/postfix/mysql
-
-# Virtual domains
-cat > /etc/postfix/mysql/virtual_domains.cf <<EOF
-user = mailuser
-password = $DB_PASSWORD
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT name FROM virtual_domains WHERE name='%s' AND id > 0
-EOF
-
-# Virtual mailboxes
-cat > /etc/postfix/mysql/virtual_mailboxes.cf <<EOF
-user = mailuser
-password = $DB_PASSWORD
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT CONCAT(SUBSTRING_INDEX(email,'@',-1),'/',SUBSTRING_INDEX(email,'@',1),'/') FROM virtual_users WHERE email='%s' AND active = 1
-EOF
-
-# Virtual aliases
-cat > /etc/postfix/mysql/virtual_aliases.cf <<EOF
-user = mailuser
-password = $DB_PASSWORD
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT destination FROM virtual_aliases WHERE source='%s' AND active = 1
-EOF
-
-# Email to user mapping
-cat > /etc/postfix/mysql/virtual_email2user.cf <<EOF
-user = mailuser
-password = $DB_PASSWORD
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT email FROM virtual_users WHERE email='%s' AND active = 1
-EOF
-
-# Sender dependent transport
-cat > /etc/postfix/mysql/sender_transport.cf <<EOF
-user = mailuser
-password = $DB_PASSWORD
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT transport FROM sender_access WHERE email='%s' AND active = 1 ORDER BY priority DESC LIMIT 1
-EOF
-
-# Set permissions
-chmod 640 /etc/postfix/mysql/*.cf
-chown root:postfix /etc/postfix/mysql/*.cf
-
-print_message "✓ Postfix MySQL configuration created"
-
-# Create Dovecot SQL configuration
-print_header "Creating Dovecot SQL Configuration"
-
-cat > /etc/dovecot/dovecot-sql.conf.ext <<EOF
-driver = mysql
-connect = host=127.0.0.1 dbname=mailserver user=mailuser password=$DB_PASSWORD
-default_pass_scheme = SHA512-CRYPT
-
-password_query = \\
-    SELECT email as user, password \\
-    FROM virtual_users \\
-    WHERE email='%u' AND active = 1
-
-user_query = \\
-    SELECT CONCAT('/var/vmail/',SUBSTRING_INDEX(email,'@',-1),'/',SUBSTRING_INDEX(email,'@',1)) as home, \\
-    5000 AS uid, \\
-    5000 AS gid, \\
-    CONCAT('*:bytes=', COALESCE(quota, 0)) AS quota_rule \\
-    FROM virtual_users \\
-    WHERE email='%u' AND active = 1
-
-iterate_query = SELECT email FROM virtual_users WHERE active = 1
-EOF
-
-chmod 600 /etc/dovecot/dovecot-sql.conf.ext
-chown root:dovecot /etc/dovecot/dovecot-sql.conf.ext
-
-print_message "✓ Dovecot SQL configuration created"
-
-# Create helper functions script
-print_header "Creating Database Helper Functions"
-
-cat > /usr/local/bin/maildb << 'EOF'
-#!/bin/bash
-
-# Mail Database Manager
-
-if [ -f /root/.mail_db_password ]; then
-    DB_PASS=$(cat /root/.mail_db_password)
-else
-    echo "Error: Database password file not found"
+    print_error "✗ Database creation failed"
     exit 1
 fi
 
-case "$1" in
-    console)
-        mysql -u mailuser -p"$DB_PASS" mailserver
-        ;;
-        
-    query)
-        shift
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "$*"
-        ;;
-        
-    add-domain)
-        if [ -z "$2" ]; then
-            echo "Usage: maildb add-domain domain.com"
-            exit 1
-        fi
-        mysql -u mailuser -p"$DB_PASS" mailserver <<SQL
-INSERT IGNORE INTO virtual_domains (name) VALUES ('$2');
-SQL
-        echo "Domain added: $2"
-        ;;
-        
-    list-domains)
-        echo "Virtual domains:"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT name FROM virtual_domains;" 2>/dev/null | tail -n +2
-        ;;
-        
-    add-ip)
-        if [ -z "$2" ]; then
-            echo "Usage: maildb add-ip 1.2.3.4 [transport_name]"
-            exit 1
-        fi
-        transport="${3:-smtp-$2}"
-        mysql -u mailuser -p"$DB_PASS" mailserver <<SQL
-INSERT INTO ip_pool (ip_address, transport_name) 
-VALUES ('$2', '$transport')
-ON DUPLICATE KEY UPDATE transport_name='$transport';
-SQL
-        echo "IP added to pool: $2"
-        ;;
-        
-    list-ips)
-        echo "IP pool:"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT ip_address, transport_name, active FROM ip_pool;" 2>/dev/null
-        ;;
-        
-    stats)
-        echo "Mail Statistics:"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "
-            SELECT 
-                COUNT(DISTINCT email) as total_accounts,
-                COUNT(DISTINCT domain_id) as total_domains,
-                (SELECT COUNT(*) FROM ip_pool WHERE active=1) as active_ips
-            FROM virtual_users WHERE active=1;
-        " 2>/dev/null
-        ;;
-        
-    *)
-        echo "Mail Database Manager"
-        echo "Usage: maildb {console|query|add-domain|list-domains|add-ip|list-ips|stats}"
-        echo ""
-        echo "Commands:"
-        echo "  console         - Open MySQL console"
-        echo "  query <SQL>     - Execute SQL query"
-        echo "  add-domain      - Add virtual domain"
-        echo "  list-domains    - List all domains"
-        echo "  add-ip          - Add IP to pool"
-        echo "  list-ips        - List IP pool"
-        echo "  stats           - Show statistics"
-        ;;
-esac
+# ===================================================================
+# 4. ADD PRIMARY DOMAIN
+# ===================================================================
+
+echo "Adding primary domain: $DOMAIN_NAME"
+
+mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null
+INSERT INTO virtual_domains (name) VALUES ('$DOMAIN_NAME')
+ON DUPLICATE KEY UPDATE name = name;
 EOF
 
-chmod +x /usr/local/bin/maildb
+print_message "✓ Domain added to database"
 
 # ===================================================================
-# AUTOMATIC DOMAIN AND EMAIL ACCOUNT CREATION - NO QUESTIONS!
+# 5. CREATE FIRST EMAIL ACCOUNT
 # ===================================================================
 
-print_header "Setting Up Domain and First Email Account"
-
-# Add the domain from installer
-if [ ! -z "$DOMAIN_NAME" ]; then
-    echo "Adding domain $DOMAIN_NAME to database..."
-    mysql -u mailuser -p"$DB_PASSWORD" mailserver <<SQL 2>/dev/null
-INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN_NAME');
-SQL
-    print_message "✓ Domain added: $DOMAIN_NAME"
-fi
-
-# Create the first email account if provided in config
 if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
     echo ""
-    echo "Creating email account: $FIRST_EMAIL"
+    echo "Creating first email account: $FIRST_EMAIL"
     
     # Hash the password using doveadm
     if command -v doveadm &> /dev/null; then
-        HASH=$(doveadm pw -s SHA512-CRYPT -p "$FIRST_PASS" 2>/dev/null)
-        if [ -z "$HASH" ]; then
-            # Fallback to plain text if doveadm fails
-            HASH="{PLAIN}$FIRST_PASS"
+        PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$FIRST_PASS" 2>/dev/null)
+        if [ -z "$PASS_HASH" ]; then
+            # Fallback to plain password if doveadm fails
+            PASS_HASH="{PLAIN}$FIRST_PASS"
         fi
     else
-        # If doveadm not available yet, use plain text (will be hashed later)
-        HASH="{PLAIN}$FIRST_PASS"
+        # If doveadm not available, use plain password temporarily
+        PASS_HASH="{PLAIN}$FIRST_PASS"
     fi
     
-    # Insert the email account
-    mysql -u mailuser -p"$DB_PASSWORD" mailserver <<SQL 2>/dev/null
+    # Add user to database
+    mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null
 -- Get domain ID
-SET @domain_id = (SELECT id FROM virtual_domains WHERE name='$DOMAIN_NAME');
+SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN_NAME');
 
--- Insert user if domain exists
-INSERT INTO virtual_users (domain_id, email, password, quota, active) 
-SELECT @domain_id, '$FIRST_EMAIL', '$HASH', 0, 1 
-WHERE @domain_id IS NOT NULL
-ON DUPLICATE KEY UPDATE password='$HASH', active=1;
-SQL
+-- Insert or update user
+INSERT INTO virtual_users (domain_id, email, password, quota, active)
+VALUES (@domain_id, '$FIRST_EMAIL', '$PASS_HASH', 0, 1)
+ON DUPLICATE KEY UPDATE password = '$PASS_HASH', active = 1;
+EOF
     
     if [ $? -eq 0 ]; then
         print_message "✓ Email account created: $FIRST_EMAIL"
@@ -413,69 +227,339 @@ SQL
         MAIL_DIR="/var/vmail/$MAIL_DOMAIN/$MAIL_USER"
         
         mkdir -p "$MAIL_DIR"
-        chown -R vmail:vmail /var/vmail/
         
-        echo ""
-        echo "Account details saved:"
-        echo "  Email: $FIRST_EMAIL"
-        echo "  Mail directory: $MAIL_DIR"
-        echo "  Status: Active"
+        # Create vmail user if doesn't exist
+        if ! id -u vmail > /dev/null 2>&1; then
+            groupadd -g 5000 vmail
+            useradd -g vmail -u 5000 vmail -d /var/vmail -m
+        fi
+        
+        chown -R vmail:vmail /var/vmail
+        chmod -R 770 /var/vmail
+        
+        print_message "✓ Mail directory created: $MAIL_DIR"
     else
-        print_warning "Could not create email account (might already exist)"
+        print_error "✗ Failed to create email account"
     fi
 else
     echo ""
-    echo "No first email account specified. You can add accounts later with:"
-    echo "  mail-account add user@$DOMAIN_NAME password"
+    echo "No initial email account specified"
+    echo "You can add accounts later with: mail-account add user@$DOMAIN_NAME password"
 fi
 
-# Show final statistics
-echo ""
-print_header "Database Setup Complete"
+# ===================================================================
+# 6. CONFIGURE POSTFIX
+# ===================================================================
 
-echo "Database: mailserver"
-echo "User: mailuser"
-echo "Password: Saved in /root/.mail_db_password"
-echo ""
+print_header "Configuring Postfix for Virtual Users"
 
-# Show what was created
-echo "Current setup:"
-mysql -u mailuser -p"$DB_PASSWORD" mailserver -e "
-    SELECT 
-        (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
-        (SELECT COUNT(*) FROM virtual_users WHERE active=1) as 'Email Accounts',
-        (SELECT COUNT(*) FROM ip_pool) as 'IP Addresses'
-" 2>/dev/null
+# Create Postfix MySQL configuration files
+mkdir -p /etc/postfix/mysql
+
+# Virtual domains lookup
+cat > /etc/postfix/mysql/virtual_domains.cf <<EOF
+user = mailuser
+password = $DB_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT 1 FROM virtual_domains WHERE name='%s' AND name != ''
+EOF
+
+# Virtual mailbox lookup
+cat > /etc/postfix/mysql/virtual_mailbox.cf <<EOF
+user = mailuser
+password = $DB_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT CONCAT(SUBSTRING_INDEX(email,'@',-1),'/',SUBSTRING_INDEX(email,'@',1),'/') FROM virtual_users WHERE email='%s' AND active = 1
+EOF
+
+# Virtual alias lookup
+cat > /etc/postfix/mysql/virtual_alias.cf <<EOF
+user = mailuser
+password = $DB_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT destination FROM virtual_aliases WHERE source='%s' AND active = 1
+EOF
+
+# Set permissions
+chmod 640 /etc/postfix/mysql/*.cf
+chown root:postfix /etc/postfix/mysql/*.cf
+
+# Configure Postfix main.cf
+postconf -e "virtual_transport = lmtp:unix:private/dovecot-lmtp"
+postconf -e "virtual_mailbox_domains = mysql:/etc/postfix/mysql/virtual_domains.cf"
+postconf -e "virtual_mailbox_maps = mysql:/etc/postfix/mysql/virtual_mailbox.cf"
+postconf -e "virtual_alias_maps = mysql:/etc/postfix/mysql/virtual_alias.cf"
+postconf -e "virtual_mailbox_base = /var/vmail"
+postconf -e "virtual_uid_maps = static:5000"
+postconf -e "virtual_gid_maps = static:5000"
+postconf -e "smtpd_sasl_type = dovecot"
+postconf -e "smtpd_sasl_path = private/auth"
+postconf -e "smtpd_sasl_auth_enable = yes"
+postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated,permit_mynetworks,reject_unauth_destination"
+
+print_message "✓ Postfix configured for virtual users"
+
+# ===================================================================
+# 7. CONFIGURE DOVECOT
+# ===================================================================
+
+print_header "Configuring Dovecot"
+
+# Backup original configs
+cp -n /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.conf.bak 2>/dev/null || true
+
+# Configure Dovecot authentication
+cat > /etc/dovecot/conf.d/10-auth.conf <<EOF
+disable_plaintext_auth = yes
+auth_mechanisms = plain login
+
+!include auth-sql.conf.ext
+EOF
+
+# Configure SQL authentication
+cat > /etc/dovecot/dovecot-sql.conf.ext <<EOF
+driver = mysql
+connect = host=127.0.0.1 dbname=mailserver user=mailuser password=$DB_PASS
+
+default_pass_scheme = SHA512-CRYPT
+
+password_query = \\
+  SELECT email as user, password \\
+  FROM virtual_users \\
+  WHERE email = '%u' AND active = 1
+
+user_query = \\
+  SELECT CONCAT('/var/vmail/', SUBSTRING_INDEX(email,'@',-1),'/',SUBSTRING_INDEX(email,'@',1)) as home, \\
+  5000 AS uid, 5000 AS gid \\
+  FROM virtual_users \\
+  WHERE email = '%u' AND active = 1
+EOF
+
+# Configure mail location
+cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
+mail_location = maildir:/var/vmail/%d/%n
+namespace inbox {
+  inbox = yes
+  location = 
+  mailbox Drafts {
+    special_use = \\Drafts
+  }
+  mailbox Junk {
+    special_use = \\Junk
+  }
+  mailbox Sent {
+    special_use = \\Sent
+  }
+  mailbox "Sent Messages" {
+    special_use = \\Sent
+  }
+  mailbox Trash {
+    special_use = \\Trash
+  }
+  prefix = 
+}
+
+mail_uid = vmail
+mail_gid = vmail
+first_valid_uid = 5000
+last_valid_uid = 5000
+mail_privileged_group = vmail
+EOF
+
+# Configure master process
+cat > /etc/dovecot/conf.d/10-master.conf <<EOF
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+  inet_listener imaps {
+    port = 993
+    ssl = yes
+  }
+}
+
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+  inet_listener pop3s {
+    port = 995
+    ssl = yes
+  }
+}
+
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
+}
+
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0666
+    user = postfix
+    group = postfix
+  }
+  
+  unix_listener auth-userdb {
+    mode = 0600
+    user = vmail
+  }
+  
+  user = dovecot
+}
+
+service auth-worker {
+  user = vmail
+}
+EOF
+
+# Set permissions
+chmod 600 /etc/dovecot/dovecot-sql.conf.ext
+chown root:root /etc/dovecot/dovecot-sql.conf.ext
+
+print_message "✓ Dovecot configured"
+
+# ===================================================================
+# 8. CREATE DATABASE MANAGEMENT SCRIPT
+# ===================================================================
+
+echo "Creating database management utility..."
+
+cat > /usr/local/bin/maildb << 'EOF'
+#!/bin/bash
+
+# Mail Database Manager
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+else
+    echo "Error: Database password file not found"
+    exit 1
+fi
+
+case "$1" in
+    stats)
+        echo "Mail Database Statistics:"
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "
+        SELECT 
+            (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
+            (SELECT COUNT(*) FROM virtual_users) as 'Users',
+            (SELECT COUNT(*) FROM virtual_users WHERE active=1) as 'Active Users',
+            (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';"
+        ;;
+        
+    users)
+        echo "Email Users:"
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "
+        SELECT email as 'Email', 
+               CASE active WHEN 1 THEN 'Active' ELSE 'Disabled' END as 'Status',
+               created_at as 'Created'
+        FROM virtual_users ORDER BY email;"
+        ;;
+        
+    domains)
+        echo "Mail Domains:"
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "
+        SELECT name as 'Domain', 
+               (SELECT COUNT(*) FROM virtual_users WHERE domain_id = virtual_domains.id) as 'Users',
+               created_at as 'Created'
+        FROM virtual_domains ORDER BY name;"
+        ;;
+        
+    backup)
+        BACKUP_FILE="/root/maildb-$(date +%Y%m%d-%H%M%S).sql"
+        mysqldump -u mailuser -p"$DB_PASS" mailserver > "$BACKUP_FILE"
+        echo "Database backed up to: $BACKUP_FILE"
+        ;;
+        
+    *)
+        echo "Mail Database Manager"
+        echo "Usage: maildb {stats|users|domains|backup}"
+        echo ""
+        echo "Commands:"
+        echo "  stats   - Show database statistics"
+        echo "  users   - List all email users"
+        echo "  domains - List all domains"
+        echo "  backup  - Backup database"
+        ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/maildb
+
+# ===================================================================
+# 9. RESTART SERVICES
+# ===================================================================
+
+print_header "Restarting Services"
+
+echo -n "Restarting Postfix... "
+systemctl restart postfix && echo "✓" || echo "✗"
+
+echo -n "Restarting Dovecot... "
+systemctl restart dovecot && echo "✓" || echo "✗"
+
+# ===================================================================
+# 10. TEST DATABASE CONNECTION
+# ===================================================================
 
 echo ""
-echo "Tables created:"
-echo "  - virtual_domains (mail domains)"
-echo "  - virtual_users (email accounts)"
-echo "  - virtual_aliases (email aliases)"
-echo "  - sender_access (IP routing)"
-echo "  - transport_maps (transport rules)"
-echo "  - mail_statistics (usage stats)"
-echo "  - ip_pool (IP management)"
+echo "Testing database connection..."
+
+# Test connection
+if mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT 1" > /dev/null 2>&1; then
+    print_message "✓ Database connection successful"
+else
+    print_error "✗ Database connection failed"
+fi
+
+# Show statistics
 echo ""
-echo "Configuration files created:"
-echo "  - /etc/postfix/mysql/*.cf"
-echo "  - /etc/dovecot/dovecot-sql.conf.ext"
+echo "Database Statistics:"
+mysql -u mailuser -p"$DB_PASS" mailserver -e "
+SELECT 
+    (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
+    (SELECT COUNT(*) FROM virtual_users) as 'Users',
+    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null
+
+# ===================================================================
+# COMPLETION
+# ===================================================================
+
 echo ""
-echo "Management command: maildb"
+print_header "Database Setup Complete!"
+
+echo ""
+echo "✓ Database created: mailserver"
+echo "✓ Database user: mailuser"
+echo "✓ Password saved in: /root/.mail_db_password"
+if [ ! -z "$FIRST_EMAIL" ]; then
+    echo "✓ First account created: $FIRST_EMAIL"
+fi
+echo ""
+echo "Database management commands:"
+echo "  maildb stats   - Show statistics"
+echo "  maildb users   - List users"
+echo "  maildb domains - List domains"
+echo "  maildb backup  - Backup database"
+echo ""
+echo "Email account management:"
+echo "  mail-account add user@domain.com password"
+echo "  mail-account list"
+echo "  mail-account delete user@domain.com"
 echo ""
 
 if [ ! -z "$FIRST_EMAIL" ]; then
-    print_message "✓ Your first email account is ready to use!"
-    echo ""
+    print_message "Your first email account is ready to use!"
     echo "  Email: $FIRST_EMAIL"
-    echo "  Password: [the one you entered during setup]"
-    echo ""
-    echo "To add more accounts:"
-    echo "  mail-account add newuser@$DOMAIN_NAME password"
-else
-    echo "To add email accounts:"
-    echo "  mail-account add user@$DOMAIN_NAME password"
+    echo "  Password: [the one you set]"
+    echo "  SMTP/IMAP Server: $HOSTNAME"
+    echo "  Ports: 587 (SMTP), 993 (IMAP)"
 fi
 
-echo ""
 print_message "✓ Database setup completed successfully!"
