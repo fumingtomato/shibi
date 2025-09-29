@@ -2,7 +2,7 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.2 - FIXED ip_local_port_range warning
+# Version: 17.0.4 - FIXED ip_local_port_range and DKIM verification
 # Configures SSL, firewall, IP rotation finalization, and optimizations
 # =================================================================
 
@@ -117,10 +117,10 @@ EOF
 fi
 
 # ===================================================================
-# 2. FIX OPENDKIM CONFIGURATION TO ACTUALLY SIGN EMAILS
+# 2. VERIFY DKIM IS PROPERLY CONFIGURED (1024-bit)
 # ===================================================================
 
-print_header "Fixing OpenDKIM Configuration for DKIM Signing"
+print_header "Verifying DKIM Configuration"
 
 # Check if OpenDKIM is installed
 if ! command -v opendkim &> /dev/null; then
@@ -129,21 +129,51 @@ if ! command -v opendkim &> /dev/null; then
     apt-get install -y opendkim opendkim-tools > /dev/null 2>&1
 fi
 
-# Check if DKIM keys exist
+# Check DKIM key size
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
-    print_message "✓ DKIM keys exist"
+    KEY_BITS=$(openssl rsa -in "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" -text -noout 2>/dev/null | grep "Private-Key:" | grep -oP '\d+' || echo "0")
+    
+    if [ "$KEY_BITS" -eq 1024 ]; then
+        print_message "✓ DKIM key is 1024-bit (DNS compatible)"
+    elif [ "$KEY_BITS" -eq 2048 ]; then
+        print_warning "⚠ DKIM key is 2048-bit - regenerating as 1024-bit for DNS compatibility"
+        
+        cd /etc/opendkim/keys/$DOMAIN_NAME
+        mv mail.private mail.private.backup
+        mv mail.txt mail.txt.backup
+        
+        opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024
+        chown opendkim:opendkim mail.private mail.txt
+        chmod 600 mail.private
+        chmod 644 mail.txt
+        
+        print_message "✓ Regenerated as 1024-bit key"
+    else
+        print_warning "⚠ Could not determine DKIM key size"
+    fi
+    
+    # Display key info
+    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+        DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=//' | sed 's/".*//' | tr -d '\n\t\r ')
+        echo "DKIM public key length: ${#DKIM_KEY} characters"
+        if [ ${#DKIM_KEY} -gt 250 ]; then
+            print_warning "⚠ Key seems too long for 1024-bit (should be ~215 chars)"
+        fi
+    fi
 else
     print_warning "⚠ DKIM keys not found - generating now"
     mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
     cd /etc/opendkim/keys/$DOMAIN_NAME
-    opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
+    opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024
     chown -R opendkim:opendkim /etc/opendkim
     chmod 600 mail.private
+    chmod 644 mail.txt
+    print_message "✓ Generated 1024-bit DKIM key"
 fi
 
-# FIX: Proper OpenDKIM configuration that ACTUALLY SIGNS
+# Ensure OpenDKIM is properly configured for signing
 cat > /etc/opendkim.conf <<EOF
-# OpenDKIM Configuration - FIXED TO SIGN EMAILS
+# OpenDKIM Configuration - SIGNING ENABLED
 AutoRestart             Yes
 AutoRestartRate         10/1h
 UMask                   002
@@ -200,7 +230,7 @@ fi
 # Setup KeyTable
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 
-# FIX: Complete SigningTable for all sending scenarios
+# Setup comprehensive SigningTable
 cat > /etc/opendkim/SigningTable <<EOF
 *@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
 *@$HOSTNAME mail._domainkey.$DOMAIN_NAME
@@ -255,20 +285,30 @@ if ! command -v certbot &> /dev/null; then
     apt-get install -y certbot python3-certbot-nginx > /dev/null 2>&1
 fi
 
-# Check if certificate already exists for mail server
-if [ -d "/etc/letsencrypt/live/$HOSTNAME" ]; then
-    print_message "✓ SSL certificate already exists for $HOSTNAME"
+# Build list of ALL domains for SSL
+SSL_DOMAINS="$DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ] && [ ! -z "$MAIL_SUBDOMAIN" ]; then
+    for i in {1..9}; do
+        if [ $i -lt ${#IP_ADDRESSES[@]} ]; then
+            SSL_DOMAINS="$SSL_DOMAINS ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+        fi
+    done
+fi
+
+# Check if certificate already exists
+if [ -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
+    print_message "✓ SSL certificate already exists for $DOMAIN_NAME"
     
     # Update Postfix configuration
-    postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$HOSTNAME/fullchain.pem"
-    postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$HOSTNAME/privkey.pem"
+    postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem"
+    postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem"
     
     # Update Dovecot configuration if exists
     if [ -d /etc/dovecot/conf.d ]; then
         cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
 ssl = required
-ssl_cert = </etc/letsencrypt/live/$HOSTNAME/fullchain.pem
-ssl_key = </etc/letsencrypt/live/$HOSTNAME/privkey.pem
+ssl_cert = </etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem
+ssl_key = </etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem
 ssl_min_protocol = TLSv1.2
 ssl_cipher_list = ECDHE+AESGCM:ECDHE+RSA+AESGCM:DHE+RSA+AESGCM
 ssl_prefer_server_ciphers = yes
@@ -276,36 +316,39 @@ ssl_dh = </etc/dovecot/dh.pem
 EOF
     fi
 else
-    print_message "Attempting to get SSL certificate for mail server..."
+    print_message "Attempting to get SSL certificate for all domains..."
     
     # Check if DNS is resolving
-    if host "$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
-        print_message "DNS is resolving for $HOSTNAME"
+    if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
+        print_message "DNS is resolving for $DOMAIN_NAME"
         
-        # Stop services that might be using port 80
-        systemctl stop nginx 2>/dev/null || true
+        # Build certbot domain arguments
+        CERT_ARGS=""
+        for domain in $SSL_DOMAINS; do
+            CERT_ARGS="$CERT_ARGS -d $domain"
+        done
         
-        # Try to get certificate
-        certbot certonly --standalone \
-            -d "$HOSTNAME" \
+        # Try to get certificate with nginx plugin
+        certbot --nginx \
+            $CERT_ARGS \
             --non-interactive \
             --agree-tos \
             --email "$ADMIN_EMAIL" \
-            --no-eff-email > /dev/null 2>&1
+            --no-eff-email 2>/dev/null
         
         if [ $? -eq 0 ]; then
-            print_message "✓ SSL certificate obtained for mail server"
+            print_message "✓ SSL certificate obtained for all domains"
             
             # Update Postfix
-            postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$HOSTNAME/fullchain.pem"
-            postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$HOSTNAME/privkey.pem"
+            postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem"
+            postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem"
             
             # Update Dovecot
             if [ -d /etc/dovecot/conf.d ]; then
                 cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
 ssl = required
-ssl_cert = </etc/letsencrypt/live/$HOSTNAME/fullchain.pem
-ssl_key = </etc/letsencrypt/live/$HOSTNAME/privkey.pem
+ssl_cert = </etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem
+ssl_key = </etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem
 ssl_min_protocol = TLSv1.2
 ssl_cipher_list = ECDHE+AESGCM:ECDHE+RSA+AESGCM:DHE+RSA+AESGCM
 ssl_prefer_server_ciphers = yes
@@ -328,11 +371,8 @@ EOF
             postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver.crt"
             postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver.key"
         fi
-        
-        # Start nginx again
-        systemctl start nginx 2>/dev/null || true
     else
-        print_warning "⚠ DNS not resolving yet for $HOSTNAME"
+        print_warning "⚠ DNS not resolving yet for $DOMAIN_NAME"
         print_message "Using self-signed certificate temporarily"
         
         mkdir -p /etc/ssl/certs /etc/ssl/private
@@ -345,30 +385,6 @@ EOF
         
         postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver.crt"
         postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver.key"
-    fi
-fi
-
-# Try for website certificate too
-if [ ! -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
-    if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
-        print_message "Attempting to get SSL certificate for website..."
-        
-        certbot certonly --webroot \
-            -w "/var/www/$DOMAIN_NAME" \
-            -d "$DOMAIN_NAME" \
-            -d "www.$DOMAIN_NAME" \
-            --non-interactive \
-            --agree-tos \
-            --email "$ADMIN_EMAIL" \
-            --no-eff-email 2>/dev/null || \
-        certbot certonly --standalone \
-            -d "$DOMAIN_NAME" \
-            -d "www.$DOMAIN_NAME" \
-            --non-interactive \
-            --agree-tos \
-            --email "$ADMIN_EMAIL" \
-            --no-eff-email 2>/dev/null || \
-        echo "Website SSL will be obtained when DNS propagates"
     fi
 fi
 
@@ -392,20 +408,22 @@ if [ -f /root/mail-installer/install.conf ]; then
     source /root/mail-installer/install.conf
 fi
 
-# Check if mail cert exists
-if [ ! -d "/etc/letsencrypt/live/$HOSTNAME" ]; then
-    certbot certonly --standalone -d "$HOSTNAME" \
-        --non-interactive --agree-tos --email "$ADMIN_EMAIL" \
-        --no-eff-email 2>/dev/null && \
-    systemctl reload postfix dovecot 2>/dev/null
-fi
-
-# Check if website cert exists
+# Check if cert exists
 if [ ! -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
-    certbot certonly --standalone -d "$DOMAIN_NAME" -d "www.$DOMAIN_NAME" \
-        --non-interactive --agree-tos --email "$ADMIN_EMAIL" \
-        --no-eff-email 2>/dev/null && \
-    systemctl reload nginx 2>/dev/null
+    if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
+        # Build domain list
+        CERT_ARGS="-d $DOMAIN_NAME -d www.$DOMAIN_NAME -d $HOSTNAME"
+        if [ ! -z "$MAIL_SUBDOMAIN" ]; then
+            for i in {1..9}; do
+                [ -d "/var/www/$DOMAIN_NAME" ] && CERT_ARGS="$CERT_ARGS -d ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+            done
+        fi
+        
+        certbot --nginx $CERT_ARGS \
+            --non-interactive --agree-tos --email "$ADMIN_EMAIL" \
+            --no-eff-email 2>/dev/null && \
+        systemctl reload postfix dovecot nginx 2>/dev/null
+    fi
 fi
 EOF
 
@@ -603,7 +621,7 @@ if ! grep -q "# Mail server limits" /etc/security/limits.conf; then
 EOF
 fi
 
-# FIX: Kernel parameters with proper ip_local_port_range values (odd start, even end)
+# Kernel parameters with proper ip_local_port_range values (odd start, even end)
 cat > /etc/sysctl.d/99-mailserver.conf <<EOF
 # Mail Server Optimization
 net.ipv4.tcp_fin_timeout = 20
@@ -692,7 +710,7 @@ done
 
 print_header "Creating Helper Scripts"
 
-# Quick SSL getter
+# Quick SSL getter with ALL domains
 cat > /usr/local/bin/get-ssl-cert <<EOF
 #!/bin/bash
 
@@ -700,6 +718,7 @@ cat > /usr/local/bin/get-ssl-cert <<EOF
 HOSTNAME="$HOSTNAME"
 DOMAIN="$DOMAIN_NAME"
 ADMIN_EMAIL="$ADMIN_EMAIL"
+MAIL_SUBDOMAIN="${MAIL_SUBDOMAIN:-mail}"
 
 GREEN='\033[38;5;208m'
 YELLOW='\033[1;33m'
@@ -709,58 +728,44 @@ NC='\033[0m'
 echo "Getting Let's Encrypt certificates automatically..."
 echo ""
 
-# Check DNS for mail server
-echo -n "Checking DNS for \$HOSTNAME... "
-if host "\$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
-    echo -e "\${GREEN}✓ Resolving\${NC}"
-    
-    systemctl stop nginx 2>/dev/null || true
-    
-    # Get certificate for mail server
-    certbot certonly --standalone \\
-        -d "\$HOSTNAME" \\
-        --non-interactive \\
-        --agree-tos \\
-        --email "\$ADMIN_EMAIL" \\
-        --no-eff-email \\
-        --force-renewal
-    
-    if [ \$? -eq 0 ]; then
-        echo -e "\${GREEN}✓ Mail server certificate obtained!\${NC}"
-        
-        # Update configs
-        postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/\$HOSTNAME/fullchain.pem"
-        postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/\$HOSTNAME/privkey.pem"
-        
-        if [ -f /etc/dovecot/conf.d/10-ssl.conf ]; then
-            sed -i "s|ssl_cert = .*|ssl_cert = </etc/letsencrypt/live/\$HOSTNAME/fullchain.pem|" /etc/dovecot/conf.d/10-ssl.conf
-            sed -i "s|ssl_key = .*|ssl_key = </etc/letsencrypt/live/\$HOSTNAME/privkey.pem|" /etc/dovecot/conf.d/10-ssl.conf
-        fi
-    else
-        echo -e "\${YELLOW}✗ Failed (DNS may not be ready)\${NC}"
-    fi
-else
-    echo -e "\${RED}✗ DNS not resolving yet\${NC}"
-fi
-
-# Check DNS for website
+# Check DNS for domain
 echo -n "Checking DNS for \$DOMAIN... "
 if host "\$DOMAIN" 8.8.8.8 > /dev/null 2>&1; then
     echo -e "\${GREEN}✓ Resolving\${NC}"
     
-    # Get certificate for website
-    systemctl start nginx 2>/dev/null || true
+    # Build complete domain list
+    CERT_ARGS="-d \$DOMAIN -d www.\$DOMAIN -d \$HOSTNAME"
     
+    # Add numbered subdomains if they exist
+    for i in {1..9}; do
+        SUB="\${MAIL_SUBDOMAIN}\${i}.\$DOMAIN"
+        if host "\$SUB" 8.8.8.8 > /dev/null 2>&1; then
+            CERT_ARGS="\$CERT_ARGS -d \$SUB"
+        fi
+    done
+    
+    echo "Requesting certificate for all domains..."
+    
+    # Get certificate with nginx plugin
     certbot --nginx \\
-        -d "\$DOMAIN" \\
-        -d "www.\$DOMAIN" \\
+        \$CERT_ARGS \\
         --non-interactive \\
         --agree-tos \\
         --email "\$ADMIN_EMAIL" \\
-        --no-eff-email
+        --no-eff-email \\
+        --redirect
     
     if [ \$? -eq 0 ]; then
-        echo -e "\${GREEN}✓ Website certificate obtained!\${NC}"
+        echo -e "\${GREEN}✓ SSL certificates obtained for all domains!\${NC}"
+        
+        # Update configs
+        postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/\$DOMAIN/fullchain.pem"
+        postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/\$DOMAIN/privkey.pem"
+        
+        if [ -f /etc/dovecot/conf.d/10-ssl.conf ]; then
+            sed -i "s|ssl_cert = .*|ssl_cert = </etc/letsencrypt/live/\$DOMAIN/fullchain.pem|" /etc/dovecot/conf.d/10-ssl.conf
+            sed -i "s|ssl_key = .*|ssl_key = </etc/letsencrypt/live/\$DOMAIN/privkey.pem|" /etc/dovecot/conf.d/10-ssl.conf
+        fi
     else
         echo -e "\${YELLOW}✗ Failed (DNS may not be ready)\${NC}"
     fi
@@ -797,26 +802,20 @@ $([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "Total IPs: ${#IP_ADDRESSES[@]}")
 First Email Account: ${FIRST_EMAIL:-Not configured}
 
 SSL Certificate:
-$(if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
-    echo "  Mail Server: Let's Encrypt"
-    echo "  Location: /etc/letsencrypt/live/$HOSTNAME/"
+$(if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
+    echo "  Status: Let's Encrypt Active"
+    echo "  Location: /etc/letsencrypt/live/$DOMAIN_NAME/"
     echo "  Auto-renewal: Enabled"
 else
-    echo "  Mail Server: Self-signed (temporary)"
+    echo "  Status: Self-signed (temporary)"
     echo "  Get Let's Encrypt: run 'get-ssl-cert'"
-fi)
-
-$(if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
-    echo "  Website: Let's Encrypt"
-    echo "  Location: /etc/letsencrypt/live/$DOMAIN_NAME/"
-else
-    echo "  Website: Not configured yet (will auto-retry)"
 fi)
 
 DKIM Status:
   Service: $(systemctl is-active opendkim 2>/dev/null || echo "not running")
   Port 8891: $(netstat -lnp 2>/dev/null | grep -q ":8891" && echo "Listening" || echo "Not listening")
-  DKIM Key: $([ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ] && echo "Generated" || echo "Missing")
+  DKIM Key: $([ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ] && echo "Generated (1024-bit)" || echo "Missing")
+  Mode: SIGNING (sv)
   DKIM in DNS: $(dig +short TXT mail._domainkey.$DOMAIN_NAME @8.8.8.8 2>/dev/null | grep -q "v=DKIM1" && echo "Yes" || echo "Pending")
 
 $(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
@@ -886,12 +885,12 @@ EOF
 
 print_header "Post-Installation Complete!"
 echo ""
-echo "✓ OpenDKIM configured and signing enabled"
-echo "✓ SSL/TLS configured (auto-retry enabled for pending certificates)"
+echo "✓ OpenDKIM configured with 1024-bit key and signing enabled"
+echo "✓ SSL/TLS configured (auto-retry enabled for all domains)"
 echo "✓ Firewall configured" 
 echo "✓ Fail2ban configured"
 echo "✓ Services optimized"
-echo "✓ System optimization fixed (no kernel warnings)"
+echo "✓ System optimization completed (no kernel warnings)"
 echo "✓ Log rotation configured"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "✓ IP rotation configured with database-backed sticky sessions"
@@ -907,6 +906,7 @@ echo "  Port: localhost:8891"
 echo "  Selector: mail"
 echo "  Domain: $DOMAIN_NAME"
 echo "  Mode: SIGNING ENABLED (sv)"
+echo "  Key Size: 1024-bit"
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
@@ -919,17 +919,11 @@ fi
 
 echo ""
 echo "SSL STATUS:"
-if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
-    print_message "  ✓ Mail server: Let's Encrypt certificate active"
-else
-    print_warning "  ⚠ Mail server: Using temporary self-signed certificate"
-    echo "    Auto-retry every 30 minutes or run: get-ssl-cert"
-fi
-
 if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
-    print_message "  ✓ Website: Let's Encrypt certificate active"
+    print_message "  ✓ SSL certificates active for all domains"
 else
-    print_warning "  ⚠ Website: No SSL certificate yet (auto-retry enabled)"
+    print_warning "  ⚠ SSL pending (auto-retry every 30 minutes)"
+    echo "    Run manually: get-ssl-cert"
 fi
 
 echo ""
@@ -946,14 +940,17 @@ echo ""
 echo "1. Test DKIM signature:"
 echo "   test-email check-auth@verifier.port25.com ${FIRST_EMAIL:-test@$DOMAIN_NAME}"
 echo ""
-echo "2. Check everything:"
+echo "2. Verify DKIM key in DNS:"
+echo "   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
+echo ""
+echo "3. Check everything:"
 echo "   mail-test"
 echo ""
-echo "3. Check DNS and DKIM:"
+echo "4. Check DNS:"
 echo "   check-dns $DOMAIN_NAME"
 echo ""
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "4. Monitor IP rotation:"
+    echo "5. Monitor IP rotation:"
     echo "   ip-rotation-status"
     echo ""
 fi
@@ -961,11 +958,11 @@ fi
 print_message "Configuration saved to: /root/mail-server-config.txt"
 echo ""
 print_message "✓ Post-installation configuration completed!"
-print_message "✓ Your mail server is ready with DKIM signing ENABLED!"
-print_message "✓ System optimization completed WITHOUT kernel warnings!"
+print_message "✓ Your mail server is ready with 1024-bit DKIM signing!"
+print_message "✓ System optimized WITHOUT kernel warnings!"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     print_message "✓ IP rotation is active with database-backed sticky sessions!"
 fi
 echo ""
 print_warning "REMINDER: Update physical address in /var/www/$DOMAIN_NAME/contact.html"
-print_warning "REMINDER: Update Mailwizz URL in /etc/nginx/sites-available/$DOMAIN_NAME"
+print_warning "REMINDER: Update Mailwizz URL in /etc/nginx/sites-available/$DOMAIN_NAME.conf"
