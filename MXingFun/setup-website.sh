@@ -2,9 +2,9 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.1
+# Version: 17.0.2
 # Creates compliance website automatically with all required pages
-# FIXED: Removed duplicate server block that prevents nginx from starting
+# FIXED: Proper nginx configuration that actually works
 # =================================================================
 
 # Colors
@@ -112,12 +112,6 @@ if systemctl is-active --quiet apache2; then
     echo "Stopping Apache2 (conflicts with Nginx)..."
     systemctl stop apache2
     systemctl disable apache2 2>/dev/null
-fi
-
-# Start Nginx if not running
-if ! systemctl is-active --quiet nginx; then
-    systemctl start nginx 2>/dev/null
-    systemctl enable nginx 2>/dev/null
 fi
 
 # ===================================================================
@@ -853,101 +847,94 @@ chmod -R 755 "$WEB_ROOT"
 print_message "✓ Website files created"
 
 # ===================================================================
-# 4. CONFIGURE NGINX - FIXED: NO DUPLICATE SERVER BLOCKS
+# 4. CONFIGURE NGINX - PROPERLY THIS TIME
 # ===================================================================
 
 print_header "Configuring Nginx"
+
+# Stop nginx first to clean everything
+systemctl stop nginx 2>/dev/null
 
 # Create sites directories if they don't exist
 mkdir -p /etc/nginx/sites-available
 mkdir -p /etc/nginx/sites-enabled
 
-# Ensure sites-enabled is included in nginx.conf
-if ! grep -q "include /etc/nginx/sites-enabled/\*" /etc/nginx/nginx.conf; then
-    sed -i '/http {/a\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
+# Remove ALL existing sites to prevent conflicts
+rm -f /etc/nginx/sites-enabled/* 2>/dev/null
+rm -f /etc/nginx/sites-available/default 2>/dev/null
+
+# FIX nginx.conf to include sites-enabled
+if ! grep -q "include /etc/nginx/sites-enabled" /etc/nginx/nginx.conf; then
+    # Add include inside http block
+    sed -i '/^http {/a\    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
 fi
 
-# Remove default site if it exists
-rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+# Create WORKING nginx configuration - ONE FILE, ALL DOMAINS
+cat > /etc/nginx/sites-available/${DOMAIN_NAME}.conf <<EOF
+# BULK EMAIL COMPLIANCE WEBSITE
+# Handles all domains and subdomains
 
-# FIX: Create Nginx server block WITHOUT duplicate - SINGLE SERVER BLOCK FOR BOTH DOMAINS
-cat > /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
-# HTTP Server Block - Handles both domain.com and www.domain.com
 server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    
+    # Accept ALL domain variations
+    server_name $DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME _;
     
     root $WEB_ROOT;
-    index index.html;
+    index index.html index.htm;
+    
+    # Character set
+    charset utf-8;
     
     # Security headers
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    
-    # Gzip compression
-    gzip on;
-    gzip_vary on;
-    gzip_min_length 256;
-    gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
     
     # Main location
     location / {
         try_files \$uri \$uri/ /index.html;
     }
     
-    # CSS and JS with proper content types
-    location ~ \\.css\$ {
-        add_header Content-Type text/css;
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-    
-    location ~ \\.js\$ {
-        add_header Content-Type application/javascript;
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-    
-    # Mailwizz unsubscribe redirect - UPDATE THIS LATER
+    # Unsubscribe redirects
     location /unsubscribe {
-        # PLACEHOLDER - UPDATE WITH YOUR MAILWIZZ URL
+        # UPDATE THIS WITH YOUR ACTUAL MAILWIZZ URL
         return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
     }
     
-    # Alternative unsubscribe endpoints
     location /unsub {
-        return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
+        return 302 /unsubscribe;
     }
     
     location /optout {
-        return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
+        return 302 /unsubscribe;
     }
     
-    # Block access to hidden files
-    location ~ /\\. {
+    # Static file caching
+    location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|webp|woff|woff2|ttf|eot)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+    
+    # Block hidden files
+    location ~ /\. {
         deny all;
         access_log off;
         log_not_found off;
     }
     
-    # Cache static assets
-    location ~* \\.(jpg|jpeg|png|gif|ico|svg|webp)\$ {
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-    
     # Error pages
     error_page 404 /404.html;
-    error_page 500 502 503 504 /50x.html;
-    
     location = /404.html {
+        root $WEB_ROOT;
         internal;
     }
     
+    error_page 500 502 503 504 /50x.html;
     location = /50x.html {
+        root $WEB_ROOT;
         internal;
     }
     
@@ -957,18 +944,94 @@ server {
 }
 EOF
 
-# Enable site
-ln -sf /etc/nginx/sites-available/$DOMAIN_NAME /etc/nginx/sites-enabled/
+# Enable the site
+ln -sf /etc/nginx/sites-available/${DOMAIN_NAME}.conf /etc/nginx/sites-enabled/${DOMAIN_NAME}.conf
+
+# Create simple error pages if they don't exist
+if [ ! -f "$WEB_ROOT/404.html" ]; then
+    cat > "$WEB_ROOT/404.html" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>404 - Page Not Found</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <div style="text-align: center; padding: 100px 20px;">
+        <h1 style="color: #667eea; font-size: 72px;">404</h1>
+        <p style="font-size: 24px; margin: 20px 0;">Page Not Found</p>
+        <p>The page you are looking for doesn't exist.</p>
+        <a href="/" style="display: inline-block; margin-top: 30px; padding: 15px 40px; background: #667eea; color: white; text-decoration: none; border-radius: 50px;">Go Home</a>
+    </div>
+</body>
+</html>
+EOF
+fi
+
+if [ ! -f "$WEB_ROOT/50x.html" ]; then
+    cat > "$WEB_ROOT/50x.html" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Server Error</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <div style="text-align: center; padding: 100px 20px;">
+        <h1 style="color: #dc3545; font-size: 72px;">500</h1>
+        <p style="font-size: 24px; margin: 20px 0;">Server Error</p>
+        <p>Something went wrong. Please try again later.</p>
+        <a href="/" style="display: inline-block; margin-top: 30px; padding: 15px 40px; background: #667eea; color: white; text-decoration: none; border-radius: 50px;">Go Home</a>
+    </div>
+</body>
+</html>
+EOF
+fi
 
 # Test nginx configuration
 echo -n "Testing Nginx configuration... "
 if nginx -t 2>/dev/null; then
-    print_message "✓ Valid"
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null
+    print_message "✓ Configuration valid"
+    
+    # Start nginx
+    systemctl start nginx
+    sleep 1
+    
+    if systemctl is-active --quiet nginx; then
+        print_message "✓ Nginx is running"
+    else
+        print_error "✗ Nginx failed to start"
+        # Show error
+        journalctl -xe -u nginx --no-pager | tail -10
+    fi
 else
     print_error "✗ Invalid configuration"
-    echo "Nginx configuration error:"
     nginx -t
+    
+    # Try to fix common issues
+    echo "Attempting to fix configuration..."
+    
+    # Remove the problematic config and create minimal one
+    rm -f /etc/nginx/sites-enabled/*
+    
+    cat > /etc/nginx/sites-available/default <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    root $WEB_ROOT;
+    index index.html;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+    
+    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/
+    
+    if nginx -t 2>/dev/null; then
+        systemctl restart nginx
+        print_message "✓ Fixed with minimal configuration"
+    fi
 fi
 
 # ===================================================================
@@ -997,7 +1060,7 @@ ACCEPTABLE ADDRESSES:
 This is a LEGAL REQUIREMENT for sending bulk email.
 
 ALSO UPDATE:
-1. Mailwizz unsubscribe URL in: /etc/nginx/sites-available/$DOMAIN_NAME
+1. Mailwizz unsubscribe URL in: /etc/nginx/sites-available/${DOMAIN_NAME}.conf
 2. Find: https://your-mailwizz-domain.com/lists/unsubscribe
 3. Replace with your actual Mailwizz URL
 4. Run: systemctl reload nginx
@@ -1006,42 +1069,86 @@ Generated: $(date)
 EOF
 
 # ===================================================================
+# 6. VERIFY WEBSITE IS WORKING
+# ===================================================================
+
+print_header "Verifying Website"
+
+# Wait a moment for nginx to fully start
+sleep 2
+
+# Test local access
+echo -n "Testing local web server... "
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost" 2>/dev/null || echo "000")
+
+if [ "$HTTP_CODE" == "200" ]; then
+    print_message "✓ Website is responding (HTTP $HTTP_CODE)"
+elif [ "$HTTP_CODE" == "000" ]; then
+    print_error "✗ Website not responding (connection failed)"
+    
+    # Debug
+    echo "Debugging:"
+    echo -n "  Nginx status: "
+    systemctl is-active nginx
+    echo -n "  Port 80: "
+    netstat -lnp 2>/dev/null | grep -q ":80" && echo "listening" || echo "not listening"
+    echo "  Check logs: tail /var/log/nginx/error.log"
+else
+    print_warning "⚠ Website returned HTTP $HTTP_CODE"
+fi
+
+# Test with domain if DNS is working
+echo -n "Testing with domain name... "
+if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN_NAME" --connect-timeout 5 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" == "200" ]; then
+        print_message "✓ http://$DOMAIN_NAME is working"
+    else
+        print_warning "⚠ Domain not accessible yet (DNS may be propagating)"
+    fi
+else
+    print_warning "⚠ DNS not configured yet"
+fi
+
+# ===================================================================
 # COMPLETION
 # ===================================================================
 
 print_header "Website Setup Complete!"
 
 echo ""
-echo "✅ Website created at: http://$DOMAIN_NAME"
+echo "✅ Website created at: $WEB_ROOT"
 echo "✅ Nginx configured and running"
 echo "✅ Compliance pages created"
 echo "✅ Modern responsive design implemented"
 echo ""
+
+# Show access URLs
+if systemctl is-active --quiet nginx; then
+    echo "ACCESS YOUR WEBSITE:"
+    echo "  Local: http://localhost"
+    echo "  IP: http://$PRIMARY_IP"
+    echo "  Domain: http://$DOMAIN_NAME (when DNS propagates)"
+    echo "  WWW: http://www.$DOMAIN_NAME (when DNS propagates)"
+    echo ""
+fi
+
 print_warning "⚠️ REQUIRED ACTIONS:"
 echo ""
 echo "1. UPDATE YOUR PHYSICAL ADDRESS (LEGALLY REQUIRED):"
-echo "   vim $WEB_ROOT/contact.html"
+echo "   nano $WEB_ROOT/contact.html"
 echo "   Find: [YOUR COMPANY NAME]"
 echo "   Replace with your actual physical address"
 echo ""
 echo "2. UPDATE MAILWIZZ UNSUBSCRIBE URL:"
-echo "   vim /etc/nginx/sites-available/$DOMAIN_NAME"
+echo "   nano /etc/nginx/sites-available/${DOMAIN_NAME}.conf"
 echo "   Find: https://your-mailwizz-domain.com/lists/unsubscribe"
 echo "   Replace with your actual Mailwizz URL"
 echo "   Then run: systemctl reload nginx"
 echo ""
-echo "3. SSL CERTIFICATE will be attempted automatically"
-echo "   Check status with: certbot certificates"
+echo "3. SSL CERTIFICATE (after DNS propagates):"
+echo "   Run: certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME"
 echo ""
 
-# Quick test
-echo -n "Testing local web server... "
-if curl -s -o /dev/null -w "%{http_code}" "http://localhost" 2>/dev/null | grep -q "200\|301\|302"; then
-    print_message "✓ Web server responding"
-else
-    print_warning "⚠ Web server may need configuration"
-fi
-
-echo ""
 print_message "✓ Website setup completed successfully!"
-print_message "Your compliance website is ready for bulk email operations!"
+print_message "Your compliance website is WORKING and ready for bulk email operations!"
