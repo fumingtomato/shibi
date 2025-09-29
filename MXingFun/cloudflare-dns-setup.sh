@@ -2,7 +2,7 @@
 
 # =================================================================
 # CLOUDFLARE DNS SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.0
+# Version: 17.0.1 - FIXED to use configured subdomain
 # Adds all DNS records including DKIM automatically
 # =================================================================
 
@@ -53,15 +53,18 @@ if [ -z "$DOMAIN_NAME" ]; then
     exit 1
 fi
 
-# Use configured hostname with subdomain
+# FIX: Use configured hostname with subdomain
 if [ ! -z "$MAIL_SUBDOMAIN" ]; then
     HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
+    MAIL_PREFIX="$MAIL_SUBDOMAIN"
 else
     HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+    MAIL_PREFIX="mail"
 fi
 
 echo "Domain: $DOMAIN_NAME"
 echo "Mail Server: $HOSTNAME"
+echo "Mail Subdomain: $MAIL_PREFIX"
 echo "Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "Additional IPs: $((${#IP_ADDRESSES[@]} - 1))"
@@ -294,7 +297,7 @@ add_dns_record() {
 
 print_header "Adding DNS Records to Cloudflare"
 
-# 1. A record for mail subdomain
+# 1. A record for mail subdomain (USING CONFIGURED SUBDOMAIN)
 add_dns_record "A" "$HOSTNAME" "$PRIMARY_IP" "" "false"
 
 # 2. A record for root domain (for website)
@@ -303,7 +306,7 @@ add_dns_record "A" "$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
 # 3. A record for www subdomain
 add_dns_record "A" "www.$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
 
-# 4. Additional IPs as A records (if configured)
+# 4. Additional IPs as A records (FIXED TO USE CONFIGURED SUBDOMAIN PREFIX)
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
     echo "Adding additional IP addresses..."
@@ -311,9 +314,10 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     for ip in "${IP_ADDRESSES[@]:1}"; do
         i=$((i+1))
         if [ $i -le 9 ]; then
-            add_dns_record "A" "mail$i.$DOMAIN_NAME" "$ip" "" "false"
+            # Use configured subdomain prefix instead of hardcoded "mail"
+            add_dns_record "A" "${MAIL_PREFIX}${i}.$DOMAIN_NAME" "$ip" "" "false"
         else
-            add_dns_record "A" "smtp$i.$DOMAIN_NAME" "$ip" "" "false"
+            add_dns_record "A" "smtp${i}.$DOMAIN_NAME" "$ip" "" "false"
         fi
     done
 fi
@@ -425,7 +429,7 @@ test_dns() {
     timeout 5 dig +short $query_type $domain @$nameserver 2>/dev/null
 }
 
-# Test A record for mail
+# Test A record for mail (USING CONFIGURED HOSTNAME)
 echo -n "A record for $HOSTNAME: "
 A_RECORD=$(test_dns A $HOSTNAME | head -1)
 if [ "$A_RECORD" == "$PRIMARY_IP" ]; then
@@ -559,6 +563,7 @@ Generated: $(date)
 
 Domain: $DOMAIN_NAME
 Mail Server: $HOSTNAME
+Mail Subdomain: $MAIL_PREFIX
 Primary IP: $PRIMARY_IP
 
 RECORDS ADDED:
@@ -569,7 +574,7 @@ RECORDS ADDED:
    - $DOMAIN_NAME → $PRIMARY_IP
    - www.$DOMAIN_NAME → $PRIMARY_IP
 $(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "   - Additional IPs configured"
+    echo "   - Additional IPs configured with ${MAIL_PREFIX}N.$DOMAIN_NAME pattern"
 fi)
 
 2. MX Record:
@@ -613,11 +618,12 @@ print_header "DNS Configuration Complete!"
 
 echo ""
 echo "✅ All DNS records have been added to Cloudflare"
+echo "✅ Using mail subdomain: $MAIL_PREFIX (creates $HOSTNAME)"
 if [ ! -z "$DKIM_RECORD_VALUE" ]; then
     echo "✅ DKIM record has been added"
 fi
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "✅ Multiple IP addresses configured"
+    echo "✅ Multiple IP addresses configured with ${MAIL_PREFIX}N pattern"
 fi
 echo ""
 echo "⏱ DNS propagation typically takes:"
