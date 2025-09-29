@@ -344,23 +344,23 @@ if [ ! -z "$DKIM_RECORD_VALUE" ]; then
         print_warning "  Expected ~215 characters, got ${#DKIM_KEY}"
     fi
     
-# Add DKIM record with COMPLETE value
-add_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD_VALUE" "" "false"
-
-if [ $? -eq 0 ]; then
-    print_message "✓ DKIM record added successfully!"
-    echo ""
-    echo "VERIFY: The DKIM value should be approximately 215 characters for 1024-bit key"
-    echo "If it's ~390 characters, you still have a 2048-bit key"
-else
-    print_error "✗ Failed to add DKIM record"
-    echo ""
-    echo "You can add it manually in Cloudflare:"
-    echo "  Name: mail._domainkey"
-    echo "  Type: TXT"
-    echo "  Value: $DKIM_RECORD_VALUE"
-fi
-fi
+    # Add DKIM record with COMPLETE value
+    add_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD_VALUE" "" "false"
+    
+    if [ $? -eq 0 ]; then
+        print_message "✓ DKIM record added successfully!"
+        echo ""
+        echo "VERIFY: The DKIM value should be approximately 215 characters for 1024-bit key"
+        echo "If it's ~390 characters, you still have a 2048-bit key"
+    else
+        print_error "✗ Failed to add DKIM record"
+        echo ""
+        echo "You can add it manually in Cloudflare:"
+        echo "  Name: mail._domainkey"
+        echo "  Type: TXT"
+        echo "  Value: $DKIM_RECORD_VALUE"
+    fi
+fi  # FIXED: Added this missing fi to close the DKIM_RECORD_VALUE check
 
 # 9. Additional email authentication records
 echo ""
