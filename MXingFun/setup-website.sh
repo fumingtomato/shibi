@@ -2,9 +2,9 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE
-# Version: 17.0.0
+# Version: 17.0.1
 # Creates compliance website with privacy policy and unsubscribe
-# FIXED: Truncated HTML line, improved nginx configuration
+# FIXED: Complete file with all execution code
 # =================================================================
 
 # Colors
@@ -377,7 +377,7 @@ footer a:hover {
 }
 EOF
 
-# Homepage with professional design (FIXED TRUNCATION)
+# Homepage with professional design (COMPLETE VERSION)
 cat > "$WEB_ROOT/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -478,7 +478,7 @@ cat > "$WEB_ROOT/index.html" <<EOF
                         <li>• Manage frequency settings</li>
                     </ul>
                     <div class="notice">
-                        <strong>Important:</strong> To unsubscribe or manage your email preferences, please use the unsubscribe link provided in any email you've received from us. This ensures we can properly identify and update your preferences in our system.
+                        <strong>Important:</strong> To unsubscribe or manage your email preferences, please use the unsubscribe link provided in any email you've received from us. This ensures we can properly identify and update your preferences.
                     </div>
                     <a href="/unsubscribe" class="btn">Unsubscribe Center</a>
                 </div>
