@@ -345,9 +345,9 @@ if [ ! -z "$DKIM_RECORD_VALUE" ]; then
     fi
     
     # Add DKIM record with COMPLETE value
-    add_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD_VALUE" "" "false"
-    
-    if [ $? -eq 0 ]; then
+    RESPONSE=$(add_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD_VALUE" "" "false" 2>&1)
+
+    if echo "$RESPONSE" | grep -q "✓"; then
         print_message "✓ DKIM record added successfully!"
         echo ""
         echo "VERIFY: The DKIM value should be approximately 215 characters for 1024-bit key"
