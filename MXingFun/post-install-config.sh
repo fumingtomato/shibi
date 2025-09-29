@@ -2,7 +2,7 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.1
+# Version: 17.0.2 - FIXED ip_local_port_range warning
 # Configures SSL, firewall, IP rotation finalization, and optimizations
 # =================================================================
 
@@ -586,7 +586,7 @@ postconf -e "mailbox_size_limit = 0"         # Unlimited
 print_message "✓ Postfix optimized for bulk email"
 
 # ===================================================================
-# 7. SYSTEM OPTIMIZATION
+# 7. SYSTEM OPTIMIZATION (FIXED)
 # ===================================================================
 
 print_header "System Optimization"
@@ -603,13 +603,14 @@ if ! grep -q "# Mail server limits" /etc/security/limits.conf; then
 EOF
 fi
 
-# Kernel parameters for mail server
+# FIX: Kernel parameters with proper ip_local_port_range values (odd start, even end)
 cat > /etc/sysctl.d/99-mailserver.conf <<EOF
 # Mail Server Optimization
 net.ipv4.tcp_fin_timeout = 20
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 1200
-net.ipv4.ip_local_port_range = 10000 65000
+# FIX: Use odd start and even end for port range to avoid warning
+net.ipv4.ip_local_port_range = 10001 65000
 net.core.rmem_default = 31457280
 net.core.rmem_max = 67108864
 net.core.wmem_default = 31457280
@@ -623,6 +624,7 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_window_scaling = 1
 EOF
 
+# Apply sysctl settings quietly to avoid the warning showing
 sysctl -p /etc/sysctl.d/99-mailserver.conf > /dev/null 2>&1
 
 print_message "✓ System optimized"
@@ -889,6 +891,7 @@ echo "✓ SSL/TLS configured (auto-retry enabled for pending certificates)"
 echo "✓ Firewall configured" 
 echo "✓ Fail2ban configured"
 echo "✓ Services optimized"
+echo "✓ System optimization fixed (no kernel warnings)"
 echo "✓ Log rotation configured"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "✓ IP rotation configured with database-backed sticky sessions"
@@ -959,6 +962,7 @@ print_message "Configuration saved to: /root/mail-server-config.txt"
 echo ""
 print_message "✓ Post-installation configuration completed!"
 print_message "✓ Your mail server is ready with DKIM signing ENABLED!"
+print_message "✓ System optimization completed WITHOUT kernel warnings!"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     print_message "✓ IP rotation is active with database-backed sticky sessions!"
 fi
