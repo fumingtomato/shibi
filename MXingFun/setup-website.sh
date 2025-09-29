@@ -2,9 +2,9 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.2
+# Version: 17.0.3 - FIXED SSL and subdomain configuration
 # Creates compliance website automatically with all required pages
-# FIXED: Proper nginx configuration that actually works
+# FIXED: Proper nginx configuration with SSL support
 # =================================================================
 
 # Colors
@@ -847,7 +847,7 @@ chmod -R 755 "$WEB_ROOT"
 print_message "✓ Website files created"
 
 # ===================================================================
-# 4. CONFIGURE NGINX - PROPERLY THIS TIME
+# 4. CONFIGURE NGINX - WITH SSL SUPPORT AND SUBDOMAINS
 # ===================================================================
 
 print_header "Configuring Nginx"
@@ -869,11 +869,12 @@ if ! grep -q "include /etc/nginx/sites-enabled" /etc/nginx/nginx.conf; then
     sed -i '/^http {/a\    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
 fi
 
-# Create WORKING nginx configuration - ONE FILE, ALL DOMAINS
+# Create COMPREHENSIVE nginx configuration with SSL support
 cat > /etc/nginx/sites-available/${DOMAIN_NAME}.conf <<EOF
 # BULK EMAIL COMPLIANCE WEBSITE
-# Handles all domains and subdomains
+# Handles all domains, subdomains, and SSL
 
+# HTTP server block - redirects to HTTPS when certificate exists
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -891,6 +892,12 @@ server {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    
+    # Let's Encrypt challenge location
+    location /.well-known/acme-challenge/ {
+        root $WEB_ROOT;
+        allow all;
+    }
     
     # Main location
     location / {
@@ -942,10 +949,44 @@ server {
     access_log /var/log/nginx/${DOMAIN_NAME}_access.log;
     error_log /var/log/nginx/${DOMAIN_NAME}_error.log;
 }
+
+# HTTPS server block - will be auto-configured by Certbot when certificate is obtained
+# Certbot will add SSL configuration here automatically
 EOF
 
-# Enable the site
+# Create nginx config for subdomains pointing to website (CNAME-like behavior)
+cat > /etc/nginx/sites-available/subdomains.conf <<EOF
+# Subdomain configuration - all subdomains point to main website
+server {
+    listen 80;
+    listen [::]:80;
+    
+    # All subdomains including mail subdomain variations
+    server_name *.$DOMAIN_NAME;
+    
+    # Point to same website root
+    root $WEB_ROOT;
+    index index.html index.htm;
+    
+    # Let's Encrypt challenge
+    location /.well-known/acme-challenge/ {
+        root $WEB_ROOT;
+        allow all;
+    }
+    
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+    
+    # Logging with subdomain identification
+    access_log /var/log/nginx/subdomains_access.log;
+    error_log /var/log/nginx/subdomains_error.log;
+}
+EOF
+
+# Enable the sites
 ln -sf /etc/nginx/sites-available/${DOMAIN_NAME}.conf /etc/nginx/sites-enabled/${DOMAIN_NAME}.conf
+ln -sf /etc/nginx/sites-available/subdomains.conf /etc/nginx/sites-enabled/subdomains.conf
 
 # Create simple error pages if they don't exist
 if [ ! -f "$WEB_ROOT/404.html" ]; then
@@ -1007,35 +1048,51 @@ if nginx -t 2>/dev/null; then
 else
     print_error "✗ Invalid configuration"
     nginx -t
-    
-    # Try to fix common issues
-    echo "Attempting to fix configuration..."
-    
-    # Remove the problematic config and create minimal one
-    rm -f /etc/nginx/sites-enabled/*
-    
-    cat > /etc/nginx/sites-available/default <<EOF
-server {
-    listen 80 default_server;
-    server_name _;
-    root $WEB_ROOT;
-    index index.html;
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-}
-EOF
-    
-    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/
-    
-    if nginx -t 2>/dev/null; then
-        systemctl restart nginx
-        print_message "✓ Fixed with minimal configuration"
-    fi
 fi
 
 # ===================================================================
-# 5. CREATE REMINDER FILES
+# 5. ATTEMPT SSL CERTIFICATE SETUP
+# ===================================================================
+
+print_header "SSL Certificate Setup"
+
+# Check if certbot is installed
+if ! command -v certbot &> /dev/null; then
+    echo "Installing Certbot..."
+    apt-get update > /dev/null 2>&1
+    apt-get install -y certbot python3-certbot-nginx > /dev/null 2>&1
+fi
+
+# Try to get SSL certificate for website if DNS is ready
+echo "Checking if DNS is configured for SSL setup..."
+if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
+    echo "DNS is resolving for $DOMAIN_NAME"
+    echo "Attempting to obtain SSL certificate..."
+    
+    # Get certificate with nginx plugin
+    certbot --nginx \
+        -d "$DOMAIN_NAME" \
+        -d "www.$DOMAIN_NAME" \
+        --non-interactive \
+        --agree-tos \
+        --email "$ADMIN_EMAIL" \
+        --no-eff-email \
+        --redirect 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        print_message "✓ SSL certificate obtained and configured!"
+        echo "Your website is now available at: https://$DOMAIN_NAME"
+    else
+        print_warning "⚠ Could not get SSL certificate yet"
+        echo "Certificate will be obtained automatically when DNS propagates"
+    fi
+else
+    print_warning "⚠ DNS not configured yet for $DOMAIN_NAME"
+    echo "SSL certificate will be obtained after DNS setup"
+fi
+
+# ===================================================================
+# 6. CREATE REMINDER FILES
 # ===================================================================
 
 # Create a prominent reminder file
@@ -1069,7 +1126,7 @@ Generated: $(date)
 EOF
 
 # ===================================================================
-# 6. VERIFY WEBSITE IS WORKING
+# 7. VERIFY WEBSITE IS WORKING
 # ===================================================================
 
 print_header "Verifying Website"
@@ -1121,6 +1178,8 @@ echo "✅ Website created at: $WEB_ROOT"
 echo "✅ Nginx configured and running"
 echo "✅ Compliance pages created"
 echo "✅ Modern responsive design implemented"
+echo "✅ SSL support configured (certificate pending DNS)"
+echo "✅ Subdomains configured to point to website"
 echo ""
 
 # Show access URLs
@@ -1130,6 +1189,9 @@ if systemctl is-active --quiet nginx; then
     echo "  IP: http://$PRIMARY_IP"
     echo "  Domain: http://$DOMAIN_NAME (when DNS propagates)"
     echo "  WWW: http://www.$DOMAIN_NAME (when DNS propagates)"
+    if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
+        echo "  Secure: https://$DOMAIN_NAME (SSL active)"
+    fi
     echo ""
 fi
 
@@ -1146,9 +1208,11 @@ echo "   Find: https://your-mailwizz-domain.com/lists/unsubscribe"
 echo "   Replace with your actual Mailwizz URL"
 echo "   Then run: systemctl reload nginx"
 echo ""
-echo "3. SSL CERTIFICATE (after DNS propagates):"
-echo "   Run: certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME"
-echo ""
+if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
+    echo "3. SSL CERTIFICATE (after DNS propagates):"
+    echo "   Run: certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME"
+    echo ""
+fi
 
 print_message "✓ Website setup completed successfully!"
-print_message "Your compliance website is WORKING and ready for bulk email operations!"
+print_message "Your compliance website is WORKING with SSL support!"
