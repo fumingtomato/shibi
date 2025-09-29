@@ -5,7 +5,7 @@
 # Version: 17.0.0
 # Sets up MySQL/MariaDB with virtual users for Postfix/Dovecot
 # Creates first email account during installation
-# FIXED: Robust database connectivity for all MySQL/MariaDB versions
+# FIXED: Unclosed heredoc and syntax errors
 # =================================================================
 
 # Colors
@@ -147,11 +147,7 @@ if ! systemctl is-active --quiet $DB_SERVICE; then
     
     # Create required directories
     mkdir -p /var/run/mysqld
-    if [ "$DB_SERVICE" == "mysql" ]; then
-        chown mysql:mysql /var/run/mysqld
-    else
-        chown mysql:mysql /var/run/mysqld 2>/dev/null || true
-    fi
+    chown mysql:mysql /var/run/mysqld 2>/dev/null || true
     
     # Try starting again
     systemctl start $DB_SERVICE
@@ -276,8 +272,8 @@ EOF
 fi
 
 # Create tables
-mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'EOF' 2>/dev/null || \
-mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'EOF' 2>/dev/null || true
+mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'SQLTABLES' 2>/dev/null || \
+mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'SQLTABLES' 2>/dev/null || true
 -- Create domains table
 CREATE TABLE IF NOT EXISTS virtual_domains (
     id INT NOT NULL AUTO_INCREMENT,
@@ -331,7 +327,7 @@ CREATE TABLE IF NOT EXISTS ip_rotation_log (
 CREATE INDEX IF NOT EXISTS idx_email ON virtual_users(email);
 CREATE INDEX IF NOT EXISTS idx_domain ON virtual_domains(name);
 CREATE INDEX IF NOT EXISTS idx_sender ON ip_rotation_log(sender_email);
-EOF
+SQLTABLES
 
 # Verify tables were created
 TABLE_COUNT=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SHOW TABLES" 2>/dev/null | wc -l || \
@@ -349,11 +345,11 @@ fi
 
 echo "Adding primary domain: $DOMAIN_NAME"
 
-mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<EOF 2>/dev/null || \
-mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<EOF 2>/dev/null || true
+mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<ADDDOMAIN 2>/dev/null || \
+mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<ADDDOMAIN 2>/dev/null || true
 INSERT INTO virtual_domains (name) VALUES ('$DOMAIN_NAME')
 ON DUPLICATE KEY UPDATE name = name;
-EOF
+ADDDOMAIN
 
 if [ $? -eq 0 ]; then
     print_message "✓ Domain added to database"
@@ -396,8 +392,8 @@ if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
     fi
     
     # Add user to database
-    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<EOF 2>/dev/null || \
-    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<EOF 2>/dev/null || true
+    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<ADDUSER 2>/dev/null || \
+    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<ADDUSER 2>/dev/null || true
 -- Get domain ID
 SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN_NAME');
 
@@ -408,7 +404,7 @@ DELETE FROM virtual_users WHERE email = '$FIRST_EMAIL';
 INSERT INTO virtual_users (domain_id, email, password, quota, active)
 SELECT id, '$FIRST_EMAIL', '$PASS_HASH', 0, 1
 FROM virtual_domains WHERE name = '$DOMAIN_NAME';
-EOF
+ADDUSER
     
     # Check if user was created
     USER_EXISTS=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SELECT COUNT(*) FROM virtual_users WHERE email='$FIRST_EMAIL'" 2>/dev/null | tail -1 || \
@@ -447,41 +443,41 @@ print_header "Configuring Postfix for Virtual Users"
 mkdir -p /etc/postfix/mysql
 
 # Virtual domains lookup
-cat > /etc/postfix/mysql/virtual_domains.cf <<EOF
+cat > /etc/postfix/mysql/virtual_domains.cf <<VDOMAINS
 user = mailuser
 password = $DB_PASS
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT 1 FROM virtual_domains WHERE name='%s' AND name != ''
-EOF
+VDOMAINS
 
 # Virtual mailbox lookup
-cat > /etc/postfix/mysql/virtual_mailbox.cf <<EOF
+cat > /etc/postfix/mysql/virtual_mailbox.cf <<VMAILBOX
 user = mailuser
 password = $DB_PASS
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT CONCAT(SUBSTRING_INDEX(email,'@',-1),'/',SUBSTRING_INDEX(email,'@',1),'/') FROM virtual_users WHERE email='%s' AND active = 1
-EOF
+VMAILBOX
 
 # Virtual alias lookup
-cat > /etc/postfix/mysql/virtual_alias.cf <<EOF
+cat > /etc/postfix/mysql/virtual_alias.cf <<VALIAS
 user = mailuser
 password = $DB_PASS
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT destination FROM virtual_aliases WHERE source='%s' AND active = 1
-EOF
+VALIAS
 
 # Virtual email to transport lookup (for IP rotation)
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    cat > /etc/postfix/mysql/sender_transport.cf <<EOF
+    cat > /etc/postfix/mysql/sender_transport.cf <<STRANSPORT
 user = mailuser
 password = $DB_PASS
 hosts = 127.0.0.1
 dbname = mailserver
 query = SELECT CONCAT('smtp-ip', transport_id, ':') FROM ip_rotation_log WHERE sender_email='%s'
-EOF
+STRANSPORT
 fi
 
 # Set permissions
@@ -518,15 +514,15 @@ print_header "Configuring Dovecot"
 cp -n /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.conf.bak 2>/dev/null || true
 
 # Configure Dovecot authentication
-cat > /etc/dovecot/conf.d/10-auth.conf <<EOF
+cat > /etc/dovecot/conf.d/10-auth.conf <<DAUTH
 disable_plaintext_auth = yes
 auth_mechanisms = plain login
 
 !include auth-sql.conf.ext
-EOF
+DAUTH
 
 # Configure SQL authentication
-cat > /etc/dovecot/dovecot-sql.conf.ext <<EOF
+cat > /etc/dovecot/dovecot-sql.conf.ext <<DSQL
 driver = mysql
 connect = host=127.0.0.1 dbname=mailserver user=mailuser password=$DB_PASS
 
@@ -542,10 +538,10 @@ user_query = \\
   5000 AS uid, 5000 AS gid \\
   FROM virtual_users \\
   WHERE email = '%u' AND active = 1
-EOF
+DSQL
 
 # Configure mail location
-cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
+cat > /etc/dovecot/conf.d/10-mail.conf <<DMAIL
 mail_location = maildir:/var/vmail/%d/%n
 namespace inbox {
   inbox = yes
@@ -573,10 +569,10 @@ mail_gid = vmail
 first_valid_uid = 5000
 last_valid_uid = 5000
 mail_privileged_group = vmail
-EOF
+DMAIL
 
 # Configure master process
-cat > /etc/dovecot/conf.d/10-master.conf <<EOF
+cat > /etc/dovecot/conf.d/10-master.conf <<DMASTER
 service imap-login {
   inet_listener imap {
     port = 143
@@ -623,7 +619,7 @@ service auth {
 service auth-worker {
   user = vmail
 }
-EOF
+DMASTER
 
 # Set permissions
 chmod 600 /etc/dovecot/dovecot-sql.conf.ext
@@ -637,7 +633,7 @@ print_message "✓ Dovecot configured"
 
 echo "Creating database management utility..."
 
-cat > /usr/local/bin/maildb << 'EOF'
+cat > /usr/local/bin/maildb <<'MAILDBSCRIPT'
 #!/bin/bash
 
 # Mail Database Manager
@@ -715,7 +711,7 @@ case "$1" in
         echo "  backup   - Backup database"
         ;;
 esac
-EOF
+MAILDBSCRIPT
 
 chmod +x /usr/local/bin/maildb
 
