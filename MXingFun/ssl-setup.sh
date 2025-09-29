@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# LET'S ENCRYPT SSL SETUP - FOR MAIL SERVER AND WEBSITE
-# Version: 16.1.0
-# Gets SSL certificates for both mail.domain.com and domain.com
+# LET'S ENCRYPT SSL SETUP - AUTOMATIC, NO QUESTIONS
+# Version: 17.0.0
+# Gets SSL certificates automatically without any prompts
 # =================================================================
 
 # Load configuration
@@ -53,7 +53,7 @@ if ! command -v certbot &> /dev/null; then
 fi
 
 # ===================================================================
-# 1. GET SSL FOR MAIL SERVER (mail.domain.com)
+# 1. GET SSL FOR MAIL SERVER (mail.domain.com) - NO QUESTIONS
 # ===================================================================
 
 print_header "Mail Server SSL Certificate"
@@ -65,17 +65,12 @@ if [ -z "$DNS_IP" ]; then
     print_error "✗ DNS not found"
     echo ""
     echo "DNS A record for $HOSTNAME is not resolving."
-    echo "Skipping mail server SSL for now."
+    echo "Will retry later when DNS propagates."
     MAIL_SSL_SUCCESS=false
 elif [ "$DNS_IP" != "$PRIMARY_IP" ]; then
     print_warning "⚠ DNS points to $DNS_IP, expected $PRIMARY_IP"
-    echo "This might cause certificate validation to fail."
-    read -p "Continue anyway? (y/n): " cont
-    if [[ "${cont,,}" != "y" ]]; then
-        MAIL_SSL_SUCCESS=false
-    else
-        MAIL_SSL_SUCCESS=pending
-    fi
+    echo "Attempting anyway..."
+    MAIL_SSL_SUCCESS=pending
 else
     print_message "✓ DNS is correct ($DNS_IP)"
     MAIL_SSL_SUCCESS=pending
@@ -102,7 +97,8 @@ if [ "$MAIL_SSL_SUCCESS" == "pending" ]; then
             --non-interactive \
             --agree-tos \
             --email "$ADMIN_EMAIL" \
-            --no-eff-email
+            --no-eff-email \
+            --force-renewal 2>/dev/null
         
         if [ $? -eq 0 ]; then
             print_message "✓ Mail server SSL certificate obtained!"
@@ -123,7 +119,7 @@ if [ "$MAIL_SSL_SUCCESS" == "pending" ]; then
             
             # Generate DH parameters if not exists
             if [ ! -f /etc/dovecot/dh.pem ]; then
-                echo "Generating DH parameters..."
+                echo "Generating DH parameters (this may take a minute)..."
                 openssl dhparam -out /etc/dovecot/dh.pem 2048 2>/dev/null
             fi
             
@@ -142,7 +138,7 @@ EOF
             systemctl restart dovecot
             
         else
-            print_error "✗ Failed to obtain mail server SSL certificate"
+            print_warning "✗ Failed to obtain mail server SSL certificate (DNS may not be ready)"
             MAIL_SSL_SUCCESS=false
         fi
     fi
@@ -151,7 +147,7 @@ fi
 echo ""
 
 # ===================================================================
-# 2. GET SSL FOR WEBSITE (domain.com and www.domain.com)
+# 2. GET SSL FOR WEBSITE (domain.com and www.domain.com) - NO QUESTIONS
 # ===================================================================
 
 print_header "Website SSL Certificate"
@@ -163,17 +159,12 @@ if [ -z "$DNS_IP" ]; then
     print_error "✗ DNS not found"
     echo ""
     echo "DNS A record for $DOMAIN_NAME is not resolving."
-    echo "Skipping website SSL for now."
+    echo "Will retry later when DNS propagates."
     WEBSITE_SSL_SUCCESS=false
 elif [ "$DNS_IP" != "$PRIMARY_IP" ]; then
     print_warning "⚠ DNS points to $DNS_IP, expected $PRIMARY_IP"
-    echo "This might cause certificate validation to fail."
-    read -p "Continue anyway? (y/n): " cont
-    if [[ "${cont,,}" != "y" ]]; then
-        WEBSITE_SSL_SUCCESS=false
-    else
-        WEBSITE_SSL_SUCCESS=pending
-    fi
+    echo "Attempting anyway..."
+    WEBSITE_SSL_SUCCESS=pending
 else
     print_message "✓ DNS is correct ($DNS_IP)"
     WEBSITE_SSL_SUCCESS=pending
@@ -206,7 +197,8 @@ if [ "$WEBSITE_SSL_SUCCESS" == "pending" ]; then
                 --non-interactive \
                 --agree-tos \
                 --email "$ADMIN_EMAIL" \
-                --no-eff-email
+                --no-eff-email \
+                --force-renewal 2>/dev/null
             CERT_RESULT=$?
         else
             # Fall back to standalone if nginx not configured
@@ -217,7 +209,8 @@ if [ "$WEBSITE_SSL_SUCCESS" == "pending" ]; then
                 --non-interactive \
                 --agree-tos \
                 --email "$ADMIN_EMAIL" \
-                --no-eff-email
+                --no-eff-email \
+                --force-renewal 2>/dev/null
             CERT_RESULT=$?
         fi
         
@@ -280,7 +273,7 @@ EOF
                 fi
             fi
         else
-            print_error "✗ Failed to obtain website SSL certificate"
+            print_warning "✗ Failed to obtain website SSL certificate (DNS may not be ready)"
             WEBSITE_SSL_SUCCESS=false
         fi
     fi
@@ -330,8 +323,8 @@ if [ "$MAIL_SSL_SUCCESS" == "true" ]; then
     echo "  Certificate: /etc/letsencrypt/live/$HOSTNAME/"
     echo "  Services configured: Postfix, Dovecot"
 else
-    print_warning "⚠ Mail Server SSL: Not configured"
-    echo "  To retry later: certbot certonly --standalone -d $HOSTNAME"
+    print_warning "⚠ Mail Server SSL: Not configured yet"
+    echo "  DNS may not be propagated. Will retry automatically via cron."
 fi
 
 echo ""
@@ -342,8 +335,8 @@ if [ "$WEBSITE_SSL_SUCCESS" == "true" ]; then
     echo "  Certificate: /etc/letsencrypt/live/$DOMAIN_NAME/"
     echo "  URL: https://$DOMAIN_NAME"
 else
-    print_warning "⚠ Website SSL: Not configured"
-    echo "  To retry later: certbot certonly --standalone -d $DOMAIN_NAME -d www.$DOMAIN_NAME"
+    print_warning "⚠ Website SSL: Not configured yet"
+    echo "  DNS may not be propagated. Will retry automatically via cron."
 fi
 
 echo ""
@@ -354,73 +347,128 @@ if [ "$MAIL_SSL_SUCCESS" == "true" ] || [ "$WEBSITE_SSL_SUCCESS" == "true" ]; th
     echo "Auto-renewal is configured to run twice daily."
     echo "Certificates will renew automatically before expiration."
 else
-    print_warning "⚠ No SSL certificates were obtained"
+    print_warning "⚠ No SSL certificates were obtained yet"
     echo ""
-    echo "Common issues:"
-    echo "1. Port 80 is blocked by firewall"
-    echo "2. DNS not fully propagated (wait 5-30 minutes)"
-    echo "3. Domain doesn't point to this server ($PRIMARY_IP)"
+    echo "This is normal if DNS hasn't propagated yet."
+    echo "The system will automatically retry via cron."
     echo ""
-    echo "After DNS propagates, run this script again or use:"
-    echo "  For mail: certbot certonly --standalone -d $HOSTNAME"
-    echo "  For website: certbot certonly --standalone -d $DOMAIN_NAME -d www.$DOMAIN_NAME"
+    echo "To manually retry later, run: get-ssl-cert"
 fi
 
 echo ""
 
 # Create helper script for manual SSL
-cat > /usr/local/bin/get-ssl << 'EOF'
+cat > /usr/local/bin/get-ssl-cert <<'EOF'
 #!/bin/bash
 
-# SSL Certificate Helper Script
+# SSL Certificate Helper Script - AUTOMATIC VERSION
 
-echo "SSL Certificate Manager"
-echo "======================="
-echo ""
-echo "1. Get/Renew mail server certificate"
-echo "2. Get/Renew website certificate"
-echo "3. Get/Renew both certificates"
-echo "4. Check certificate status"
-echo ""
-read -p "Select option (1-4): " option
+GREEN='\033[38;5;208m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-case $option in
-    1)
-        echo "Getting mail server certificate..."
-        systemctl stop nginx 2>/dev/null
-        certbot certonly --standalone -d HOSTNAME_PLACEHOLDER --force-renewal
-        systemctl start nginx 2>/dev/null
-        systemctl reload postfix dovecot
-        ;;
-    2)
-        echo "Getting website certificate..."
-        certbot certonly --webroot -w /var/www/DOMAIN_PLACEHOLDER -d DOMAIN_PLACEHOLDER -d www.DOMAIN_PLACEHOLDER --force-renewal
-        systemctl reload nginx
-        ;;
-    3)
-        echo "Getting both certificates..."
-        systemctl stop nginx 2>/dev/null
-        certbot certonly --standalone -d HOSTNAME_PLACEHOLDER --force-renewal
-        certbot certonly --standalone -d DOMAIN_PLACEHOLDER -d www.DOMAIN_PLACEHOLDER --force-renewal
-        systemctl start nginx 2>/dev/null
-        systemctl reload postfix dovecot
-        ;;
-    4)
-        certbot certificates
-        ;;
-    *)
-        echo "Invalid option"
-        ;;
-esac
+echo "SSL Certificate Manager - Automatic Mode"
+echo "========================================"
+echo ""
+
+# Load config
+if [ -f /root/mail-installer/install.conf ]; then
+    source /root/mail-installer/install.conf
+fi
+
+echo "Attempting to get/renew all certificates..."
+echo ""
+
+# Mail server certificate
+echo "Getting mail server certificate for $HOSTNAME..."
+systemctl stop nginx 2>/dev/null
+certbot certonly --standalone \
+    -d "$HOSTNAME" \
+    --non-interactive \
+    --agree-tos \
+    --email "$ADMIN_EMAIL" \
+    --no-eff-email \
+    --force-renewal
+
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓ Mail server certificate obtained${NC}"
+    # Update Postfix
+    postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$HOSTNAME/fullchain.pem"
+    postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$HOSTNAME/privkey.pem"
+    systemctl reload postfix dovecot
+else
+    echo -e "${YELLOW}⚠ Mail server certificate failed (DNS may not be ready)${NC}"
+fi
+
+echo ""
+
+# Website certificate
+echo "Getting website certificate for $DOMAIN_NAME..."
+certbot certonly --standalone \
+    -d "$DOMAIN_NAME" \
+    -d "www.$DOMAIN_NAME" \
+    --non-interactive \
+    --agree-tos \
+    --email "$ADMIN_EMAIL" \
+    --no-eff-email \
+    --force-renewal
+
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓ Website certificate obtained${NC}"
+else
+    echo -e "${YELLOW}⚠ Website certificate failed (DNS may not be ready)${NC}"
+fi
+
+systemctl start nginx 2>/dev/null
+systemctl reload nginx 2>/dev/null
+
+echo ""
+echo "Certificate status:"
+certbot certificates
+
+echo ""
+echo -e "${GREEN}Done! Services reloaded.${NC}"
 EOF
 
 # Replace placeholders in helper script
-sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" /usr/local/bin/get-ssl
-sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/get-ssl
-chmod +x /usr/local/bin/get-ssl
+chmod +x /usr/local/bin/get-ssl-cert
 
-echo "Helper script created: get-ssl"
-echo "Use 'get-ssl' to manage certificates manually"
+# Also create an auto-retry script for cron
+cat > /usr/local/bin/ssl-auto-retry <<'EOF'
+#!/bin/bash
+
+# Auto-retry SSL certificates if they don't exist yet
+
+if [ -f /root/mail-installer/install.conf ]; then
+    source /root/mail-installer/install.conf
+fi
+
+# Check if mail cert exists
+if [ ! -d "/etc/letsencrypt/live/$HOSTNAME" ]; then
+    certbot certonly --standalone -d "$HOSTNAME" \
+        --non-interactive --agree-tos --email "$ADMIN_EMAIL" \
+        --no-eff-email 2>/dev/null && \
+    systemctl reload postfix dovecot 2>/dev/null
+fi
+
+# Check if website cert exists
+if [ ! -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
+    certbot certonly --standalone -d "$DOMAIN_NAME" -d "www.$DOMAIN_NAME" \
+        --non-interactive --agree-tos --email "$ADMIN_EMAIL" \
+        --no-eff-email 2>/dev/null && \
+    systemctl reload nginx 2>/dev/null
+fi
+EOF
+
+chmod +x /usr/local/bin/ssl-auto-retry
+
+# Add to cron to retry getting certs if they don't exist
+echo "*/30 * * * * root /usr/local/bin/ssl-auto-retry" >> /etc/cron.d/ssl-retry
+
+echo "Helper scripts created:"
+echo "  get-ssl-cert - Manually retry getting certificates"
+echo "  ssl-auto-retry - Automatically retries every 30 minutes until successful"
 echo ""
 
 print_message "✓ SSL setup completed!"
