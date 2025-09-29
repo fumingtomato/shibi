@@ -1,23 +1,23 @@
 #!/bin/bash
 
 # =================================================================
-# MULTI-IP BULK MAIL SERVER INSTALLER WITH WEBSITE
-# Version: 17.0.1
-# Author: fumingtomato
-# Repository: https://github.com/fumingtomato/shibi
-# FIXED: Complete IP rotation with database-backed sticky sessions
-# =================================================================
-# ALL QUESTIONS FIRST - THEN AUTOMATIC INSTALLATION
+# BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
+# Version: 17.0.0
+# Automated installation with Cloudflare DNS, compliance website, and DKIM
+# FIXED: IP rotation array indexing error
 # =================================================================
 
-set -e
-set -o pipefail
+set -e  # Exit on any error
 
-# Configuration
-REPO_OWNER="fumingtomato"
-REPO_NAME="shibi"
-BRANCH="main"
-BASE_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/MXingFun"
+# Installation directory
+INSTALL_DIR="/root/mail-installer"
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Log file
+LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG_FILE")
+exec 2>&1
 
 # Colors
 GREEN='\033[38;5;208m'
@@ -26,12 +26,6 @@ RED='\033[0;31m'
 BLUE='\033[1;33m'
 NC='\033[0m'
 
-# Logging
-LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
-touch "$LOG_FILE"
-chmod 640 "$LOG_FILE"
-
-# Functions for output
 print_message() {
     echo -e "${GREEN}$1${NC}"
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO] $1" >> "$LOG_FILE"
@@ -58,21 +52,21 @@ print_header() {
 validate_ip() {
     local ip=$1
     if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        OIFS=$IFS
-        IFS='.'
-        ip_parts=($ip)
-        IFS=$OIFS
-        [[ ${ip_parts[0]} -le 255 && ${ip_parts[1]} -le 255 && ${ip_parts[2]} -le 255 && ${ip_parts[3]} -le 255 ]]
-        return $?
+        IFS='.' read -r -a octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if ((octet > 255)); then
+                return 1
+            fi
+        done
+        return 0
     fi
     return 1
 }
 
 ip_to_decimal() {
     local ip=$1
-    local a b c d
-    IFS='.' read -r a b c d <<< "$ip"
-    echo "$((a * 256**3 + b * 256**2 + c * 256 + d))"
+    IFS='.' read -r -a octets <<< "$ip"
+    echo "$((octets[0] * 256**3 + octets[1] * 256**2 + octets[2] * 256 + octets[3]))"
 }
 
 decimal_to_ip() {
@@ -81,805 +75,630 @@ decimal_to_ip() {
 }
 
 expand_ip_range() {
-    start_ip=$1
-    end_ip=$2
-    max_ips=100
+    local range=$1
+    local start_ip end_ip
+    IFS='-' read -r start_ip end_ip <<< "$range"
     
-    if ! validate_ip "$start_ip" || ! validate_ip "$end_ip"; then
-        echo "  Invalid IP addresses in range"
+    if ! validate_ip "$start_ip"; then
         return 1
     fi
     
-    start_dec=$(ip_to_decimal "$start_ip")
-    end_dec=$(ip_to_decimal "$end_ip")
+    if [ -z "$end_ip" ]; then
+        echo "$start_ip"
+        return 0
+    fi
+    
+    # Handle shorthand notation like 192.168.1.1-10
+    if [[ ! "$end_ip" =~ \. ]]; then
+        IFS='.' read -r -a start_octets <<< "$start_ip"
+        end_ip="${start_octets[0]}.${start_octets[1]}.${start_octets[2]}.$end_ip"
+    fi
+    
+    if ! validate_ip "$end_ip"; then
+        return 1
+    fi
+    
+    local start_dec=$(ip_to_decimal "$start_ip")
+    local end_dec=$(ip_to_decimal "$end_ip")
     
     if [ $start_dec -gt $end_dec ]; then
-        echo "  Start IP must be less than end IP"
         return 1
     fi
     
-    range_size=$((end_dec - start_dec + 1))
-    if [ $range_size -gt $max_ips ]; then
-        echo "  Range too large (${range_size} IPs). Maximum is ${max_ips}."
-        read -p "  Add first ${max_ips} IPs only? (y/n): " confirm
-        if [[ "${confirm,,}" != "y" ]]; then
-            return 1
-        fi
-        end_dec=$((start_dec + max_ips - 1))
-    fi
-    
-    count=0
+    local ips=()
     for ((dec=start_dec; dec<=end_dec; dec++)); do
-        ip=$(decimal_to_ip $dec)
-        if [[ "$ip" != "$PRIMARY_IP" ]] && validate_ip "$ip"; then
-            IP_ADDRESSES+=("$ip")
-            count=$((count + 1))
-            [ $count -le 10 ] && echo "  Added: $ip"
-        fi
+        ips+=("$(decimal_to_ip $dec)")
     done
-    [ $count -gt 10 ] && echo "  ... and $((count - 10)) more IPs"
-    echo "  Total added from range: $count IPs"
+    
+    printf '%s\n' "${ips[@]}"
 }
 
 expand_cidr() {
-    cidr=$1
-    ip_part=${cidr%/*}
-    mask=${cidr#*/}
+    local cidr=$1
+    local ip prefix
+    IFS='/' read -r ip prefix <<< "$cidr"
     
-    if ! validate_ip "$ip_part"; then
-        echo "  Invalid IP in CIDR notation"
+    if ! validate_ip "$ip"; then
         return 1
     fi
     
-    if ! [[ "$mask" =~ ^[0-9]+$ ]] || [ "$mask" -lt 8 ] || [ "$mask" -gt 32 ]; then
-        echo "  Invalid CIDR mask (must be 8-32)"
+    if [ -z "$prefix" ] || [ "$prefix" -lt 0 ] || [ "$prefix" -gt 32 ]; then
         return 1
     fi
     
-    ip_dec=$(ip_to_decimal "$ip_part")
-    mask_bits=$((32 - mask))
-    net_size=$((2 ** mask_bits))
-    net_mask=$(((0xFFFFFFFF << mask_bits) & 0xFFFFFFFF))
-    network=$((ip_dec & net_mask))
-    broadcast=$((network | ~net_mask & 0xFFFFFFFF))
+    local ip_dec=$(ip_to_decimal "$ip")
+    local mask=$(( (1 << 32) - (1 << (32 - prefix)) ))
+    local network=$(( ip_dec & mask ))
+    local broadcast=$(( network | ~mask & ((1 << 32) - 1) ))
     
-    first_host=$((network + 1))
-    last_host=$((broadcast - 1))
-    
-    host_count=$((last_host - first_host + 1))
-    if [ $host_count -gt 100 ]; then
-        echo "  CIDR $cidr contains $host_count hosts."
-        read -p "  Add first 100 IPs only? (y/n): " confirm
-        if [[ "${confirm,,}" != "y" ]]; then
-            return 1
-        fi
-        last_host=$((first_host + 99))
-    fi
-    
-    echo "  Expanding CIDR $cidr..."
-    count=0
-    for ((dec=first_host; dec<=last_host; dec++)); do
-        ip=$(decimal_to_ip $dec)
-        if [[ "$ip" != "$PRIMARY_IP" ]] && validate_ip "$ip"; then
-            IP_ADDRESSES+=("$ip")
-            count=$((count + 1))
-            [ $count -le 5 ] && echo "  Added: $ip"
-        fi
+    local ips=()
+    for ((dec=network+1; dec<broadcast; dec++)); do
+        ips+=("$(decimal_to_ip $dec)")
     done
-    [ $count -gt 5 ] && echo "  ... and $((count - 5)) more IPs"
-    echo "  Total added from CIDR: $count IPs"
+    
+    printf '%s\n' "${ips[@]}"
 }
 
 # FIXED: Complete IP rotation configuration with database-backed sticky sessions
 configure_ip_rotation() {
-    local domain=$1
-    shift
-    local ips=("$@")
+    local -a ips=("$@")
+    local num_ips=${#ips[@]}
     
-    if [ ${#ips[@]} -le 1 ]; then
-        return 0
-    fi
+    print_message "Configuring IP rotation for $num_ips addresses with sticky sessions..."
     
-    echo "Configuring IP rotation for ${#ips[@]} addresses with sticky sessions..."
-    
-    # Create transport directory
-    mkdir -p /etc/postfix/transports
-    
-    # Create master.cf entries for each IP
-    local i=0
-    for ip in "${ips[@]}"; do
-        i=$((i+1))
-        cat >> /etc/postfix/master.cf <<EOF
+    # Add transport configurations to master.cf
+    cat >> /etc/postfix/master.cf <<EOF
 
-# Transport for IP $ip
-smtp-ip$i unix - - n - - smtp
+# IP Rotation Transports - Generated $(date)
+EOF
+    
+    local count=0
+    for ip in "${ips[@]}"; do
+        # Calculate transport ID (starting from 0)
+        local transport_id=$count
+        count=$((count + 1))
+        
+        echo "  Adding transport smtp-ip${transport_id} for IP: $ip"
+        
+        cat >> /etc/postfix/master.cf <<EOF
+smtp-ip${transport_id}    unix  -       -       n       -       -       smtp
     -o smtp_bind_address=$ip
-    -o smtp_helo_name=$HOSTNAME
-    -o syslog_name=postfix-ip$i
+    -o smtp_helo_name=mail-${transport_id}.\$myhostname
+    -o syslog_name=postfix-ip${transport_id}
 EOF
     done
     
-    # Create enhanced transport selection script with database support
-    cat > /usr/local/bin/select-transport <<'EOF'
+    # Create MySQL-based sender transport lookup
+    cat > /etc/postfix/mysql/sender_transport.cf <<EOF
+user = mailuser
+password = $(cat /root/.mail_db_password 2>/dev/null || echo "password")
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT CONCAT('smtp-ip', transport_id, ':') FROM ip_rotation_log WHERE sender_email='%s'
+EOF
+    
+    # Configure Postfix to use sender-based transport
+    postconf -e "sender_dependent_default_transport_maps = mysql:/etc/postfix/mysql/sender_transport.cf"
+    postconf -e "smtp_sender_dependent_authentication = yes"
+    postconf -e "sender_dependent_relayhost_maps = mysql:/etc/postfix/mysql/sender_transport.cf"
+    
+    # Create IP assignment script
+    cat > /usr/local/bin/assign-sender-ip <<'EOIP'
 #!/bin/bash
-# Selects transport based on sender with database-backed sticky sessions
+
+# Assign IP to sender with sticky sessions
 SENDER=$1
-NUM_IPS=REPLACE_NUM_IPS
-
-# Array of IP addresses
-IP_ADDRESSES=(
-REPLACE_IP_ARRAY
-)
-
-# Try to load database password
-if [ -f /root/.mail_db_password ]; then
-    DB_PASS=$(cat /root/.mail_db_password)
-else
-    DB_PASS=""
+if [ -z "$SENDER" ]; then
+    echo "Usage: assign-sender-ip email@domain.com"
+    exit 1
 fi
 
-# If no sender provided, use default
-if [ -z "$SENDER" ]; then
-    echo "smtp:"
+DB_PASS=$(cat /root/.mail_db_password 2>/dev/null)
+if [ -z "$DB_PASS" ]; then
+    echo "Database password not found"
+    exit 1
+fi
+
+# Get available IPs from Postfix config
+AVAILABLE_IPS=($(grep "smtp_bind_address=" /etc/postfix/master.cf | sed 's/.*smtp_bind_address=//' | sort -u))
+NUM_IPS=${#AVAILABLE_IPS[@]}
+
+if [ $NUM_IPS -eq 0 ]; then
+    echo "No IPs configured for rotation"
+    exit 1
+fi
+
+# Check if sender already has an assigned IP
+EXISTING=$(mysql -u mailuser -p"$DB_PASS" mailserver -se "SELECT assigned_ip FROM ip_rotation_log WHERE sender_email='$SENDER'" 2>/dev/null)
+
+if [ ! -z "$EXISTING" ]; then
+    echo "Sender already assigned to IP: $EXISTING"
+    # Update last used timestamp
+    mysql -u mailuser -p"$DB_PASS" mailserver -e "UPDATE ip_rotation_log SET last_used=NOW(), message_count=message_count+1 WHERE sender_email='$SENDER'" 2>/dev/null
     exit 0
 fi
 
-# Try database lookup first if available
-if [ ! -z "$DB_PASS" ]; then
-    # Check for existing assignment
-    ASSIGNED=$(mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -N -e "
-        SELECT transport_id FROM ip_rotation_log WHERE sender_email='$SENDER' LIMIT 1
-    " 2>/dev/null)
+# Find IP with least number of senders (load balancing)
+LEAST_LOADED_IP=""
+MIN_COUNT=999999
+
+for i in "${!AVAILABLE_IPS[@]}"; do
+    IP="${AVAILABLE_IPS[$i]}"
+    COUNT=$(mysql -u mailuser -p"$DB_PASS" mailserver -se "SELECT COUNT(*) FROM ip_rotation_log WHERE assigned_ip='$IP'" 2>/dev/null || echo 0)
     
-    if [ ! -z "$ASSIGNED" ]; then
-        # Update last used time and increment counter
-        mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
-            UPDATE ip_rotation_log 
-            SET last_used=NOW(), message_count=message_count+1 
-            WHERE sender_email='$SENDER'
-        " 2>/dev/null
-        
-        echo "smtp-ip${ASSIGNED}:"
-        exit 0
+    if [ "$COUNT" -lt "$MIN_COUNT" ]; then
+        MIN_COUNT=$COUNT
+        LEAST_LOADED_IP=$IP
+        TRANSPORT_ID=$i
     fi
-fi
-
-# No existing assignment, create new one using hash
-HASH=$(echo -n "$SENDER" | md5sum | cut -c1-8)
-TRANSPORT_NUM=$((0x$HASH % NUM_IPS + 1))
-
-# Get the IP for this transport
-IP_INDEX=$((TRANSPORT_NUM - 1))
-ASSIGNED_IP="${IP_ADDRESSES[$IP_INDEX]}"
-
-# Save assignment to database if available
-if [ ! -z "$DB_PASS" ] && [ ! -z "$ASSIGNED_IP" ]; then
-    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
-        INSERT INTO ip_rotation_log (sender_email, assigned_ip, transport_id, message_count)
-        VALUES ('$SENDER', '$ASSIGNED_IP', $TRANSPORT_NUM, 1)
-        ON DUPLICATE KEY UPDATE 
-            last_used=NOW(), 
-            message_count=message_count+1
-    " 2>/dev/null
-fi
-
-echo "smtp-ip${TRANSPORT_NUM}:"
-EOF
-    
-    # Replace placeholders in the script
-    sed -i "s/REPLACE_NUM_IPS/${#ips[@]}/" /usr/local/bin/select-transport
-    
-    # Build IP array string
-    local ip_array_str=""
-    for ip in "${ips[@]}"; do
-        ip_array_str="${ip_array_str}    \"$ip\"\n"
-    done
-    sed -i "s/REPLACE_IP_ARRAY/${ip_array_str}/" /usr/local/bin/select-transport
-    
-    chmod +x /usr/local/bin/select-transport
-    
-    # Configure sender-dependent transport with database support
-    touch /etc/postfix/sender_transport
-    postmap /etc/postfix/sender_transport
-    
-    # Create transport map configuration
-    cat > /etc/postfix/transport_selection.cf <<EOF
-# Transport selection configuration
-# This uses the select-transport script for sticky IP assignment
-EOF
-    
-    # Configure Postfix to use sender-dependent transport
-    postconf -e "sender_dependent_default_transport_maps = regexp:/etc/postfix/sender_transport_regexp"
-    postconf -e "smtp_bind_address_enforce = yes"
-    
-    # Create regexp map for sender transport selection
-    cat > /etc/postfix/sender_transport_regexp <<'EOF'
-# Use select-transport script for all senders
-/^(.+)$/    FILTER smtp-ip$(shell /usr/local/bin/select-transport $1):
-EOF
-    
-    # Alternative: Use TCP table for dynamic transport selection
-    cat > /etc/postfix/tcp_table_server.py <<'EOF'
-#!/usr/bin/env python3
-import sys
-import hashlib
-import socket
-
-NUM_IPS = REPLACE_NUM_IPS
-
-def get_transport(sender):
-    if not sender:
-        return "smtp:"
-    
-    # Hash the sender to get consistent transport
-    hash_val = int(hashlib.md5(sender.encode()).hexdigest()[:8], 16)
-    transport_num = (hash_val % NUM_IPS) + 1
-    return f"smtp-ip{transport_num}:"
-
-# Simple TCP table server
-def main():
-    while True:
-        try:
-            line = sys.stdin.readline()
-            if not line:
-                break
-            
-            parts = line.strip().split()
-            if len(parts) >= 2 and parts[0] == "get":
-                sender = parts[1]
-                transport = get_transport(sender)
-                print(f"200 {transport}")
-            else:
-                print("400 Invalid request")
-            
-            sys.stdout.flush()
-        except Exception as e:
-            print(f"400 Error: {e}")
-            sys.stdout.flush()
-
-if __name__ == "__main__":
-    main()
-EOF
-    
-    sed -i "s/REPLACE_NUM_IPS/${#ips[@]}/" /etc/postfix/tcp_table_server.py
-    chmod +x /etc/postfix/tcp_table_server.py
-    
-    # Create IP monitoring script
-    cat > /usr/local/bin/ip-usage <<EOF
-#!/bin/bash
-echo "IP Usage Statistics (last 24 hours)"
-echo "===================================="
-for i in \$(seq 1 ${#ips[@]}); do
-    count=\$(grep "postfix-ip\$i" /var/log/mail.log 2>/dev/null | grep "status=sent" | wc -l)
-    echo "IP Transport \$i (${ips[\$((i-1))]}): \$count messages sent"
 done
 
-# Show database statistics if available
-if [ -f /root/.mail_db_password ]; then
-    DB_PASS=\$(cat /root/.mail_db_password)
-    echo ""
-    echo "Database Statistics:"
-    mysql -u mailuser -p"\$DB_PASS" -h 127.0.0.1 mailserver -e "
-        SELECT 
-            transport_id as 'Transport',
-            assigned_ip as 'IP',
-            COUNT(*) as 'Senders',
-            SUM(message_count) as 'Messages'
-        FROM ip_rotation_log
-        GROUP BY transport_id, assigned_ip
-        ORDER BY transport_id
-    " 2>/dev/null || echo "No database statistics available"
+if [ -z "$LEAST_LOADED_IP" ]; then
+    # Fallback: use round-robin
+    RANDOM_INDEX=$((RANDOM % NUM_IPS))
+    LEAST_LOADED_IP="${AVAILABLE_IPS[$RANDOM_INDEX]}"
+    TRANSPORT_ID=$RANDOM_INDEX
 fi
-EOF
-    
-    chmod +x /usr/local/bin/ip-usage
-    
-    # Create systemd service for TCP table server (optional advanced feature)
-    cat > /etc/systemd/system/postfix-transport-selector.service <<EOF
-[Unit]
-Description=Postfix Transport Selector Service
-After=network.target mysql.service
 
-[Service]
-Type=simple
-User=postfix
-Group=postfix
-ExecStart=/usr/bin/python3 /etc/postfix/tcp_table_server.py
-Restart=always
-StandardInput=socket
-StandardOutput=socket
+# Assign IP to sender
+mysql -u mailuser -p"$DB_PASS" mailserver -e "
+INSERT INTO ip_rotation_log (sender_email, assigned_ip, transport_id, last_used, message_count) 
+VALUES ('$SENDER', '$LEAST_LOADED_IP', $TRANSPORT_ID, NOW(), 1)
+ON DUPLICATE KEY UPDATE 
+    assigned_ip='$LEAST_LOADED_IP', 
+    transport_id=$TRANSPORT_ID, 
+    last_used=NOW(), 
+    message_count=message_count+1" 2>/dev/null
 
-[Install]
-WantedBy=multi-user.target
-EOF
+if [ $? -eq 0 ]; then
+    echo "Assigned $SENDER to IP: $LEAST_LOADED_IP (Transport: smtp-ip$TRANSPORT_ID)"
+else
+    echo "Failed to assign IP"
+    exit 1
+fi
+EOIP
     
-    print_message "✓ IP rotation configured with database-backed sticky sessions"
-    echo "  - ${#ips[@]} IP addresses configured"
-    echo "  - Sticky session tracking enabled"
-    echo "  - Database logging configured"
-    echo "  - Monitor with: ip-usage"
+    chmod +x /usr/local/bin/assign-sender-ip
+    
+    # Create IP rotation status script
+    cat > /usr/local/bin/ip-rotation-status <<'EOST'
+#!/bin/bash
+
+echo "IP Rotation Status"
+echo "=================="
+echo ""
+
+# Show configured IPs
+echo "Configured IPs:"
+grep "smtp_bind_address=" /etc/postfix/master.cf | sed 's/.*smtp_bind_address=/  - /' | sort -u
+
+echo ""
+echo "IP Assignments:"
+
+DB_PASS=$(cat /root/.mail_db_password 2>/dev/null)
+if [ -z "$DB_PASS" ]; then
+    echo "Database not configured"
+    exit 1
+fi
+
+mysql -u mailuser -p"$DB_PASS" mailserver -e "
+SELECT 
+    assigned_ip as 'IP Address',
+    COUNT(*) as 'Senders',
+    SUM(message_count) as 'Messages',
+    MAX(last_used) as 'Last Used'
+FROM ip_rotation_log 
+GROUP BY assigned_ip
+ORDER BY assigned_ip" 2>/dev/null || echo "No assignments yet"
+
+echo ""
+echo "Recent Sender Assignments:"
+mysql -u mailuser -p"$DB_PASS" mailserver -e "
+SELECT 
+    sender_email as 'Sender',
+    assigned_ip as 'IP',
+    message_count as 'Messages',
+    last_used as 'Last Used'
+FROM ip_rotation_log 
+ORDER BY last_used DESC 
+LIMIT 10" 2>/dev/null || echo "No assignments yet"
+EOST
+    
+    chmod +x /usr/local/bin/ip-rotation-status
+    
+    # Add cleanup cron for old assignments
+    cat > /etc/cron.daily/cleanup-ip-assignments <<'EOCRON'
+#!/bin/bash
+# Clean up IP assignments older than 30 days
+DB_PASS=$(cat /root/.mail_db_password 2>/dev/null)
+if [ ! -z "$DB_PASS" ]; then
+    mysql -u mailuser -p"$DB_PASS" mailserver -e "DELETE FROM ip_rotation_log WHERE last_used < DATE_SUB(NOW(), INTERVAL 30 DAY)" 2>/dev/null
+fi
+EOCRON
+    
+    chmod +x /etc/cron.daily/cleanup-ip-assignments
+    
+    print_message "✓ IP rotation configured with ${num_ips} addresses"
+    echo "  Commands available:"
+    echo "    assign-sender-ip email@domain.com - Assign IP to sender"
+    echo "    ip-rotation-status - Show rotation statistics"
 }
 
-# Clear screen and show header
-clear
-cat << "EOF"
-╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v17.0.1             ║
-║                                                              ║
-║     Professional Mail Server with Multi-IP Support          ║
-║     • COMPLETE: IP rotation with sticky sessions            ║
-║     • FIXED: Database connectivity issues                   ║
-║     • NEW: Subdomain configuration                          ║
-║     • Automatic Let's Encrypt SSL                           ║
-║     • Compliance Website for Bulk Email                     ║
-║     • Mailwizz Compatible                                   ║
-║     Repository: https://github.com/fumingtomato/shibi       ║
-╚══════════════════════════════════════════════════════════════╝
+# ===================================================================
+# MAIN INSTALLATION
+# ===================================================================
 
-EOF
-
-echo "Installation started at: $(date)"
-echo "Log file: $LOG_FILE"
+print_header "Multi-IP Bulk Mail Server Installer"
+echo "Version: 17.0.0"
+echo "Starting installation at: $(date)"
 echo ""
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
-    print_error "This script must be run as root or with sudo privileges"
-    echo "Please run: sudo $0"
+    print_error "This script must be run as root"
     exit 1
 fi
 
-# Check for required commands
-for cmd in wget curl apt-get; do
-    if ! command -v $cmd &> /dev/null; then
-        print_error "Required command '$cmd' not found. Please install it first."
-        exit 1
-    fi
-done
-
-# ===================================================================
-# GATHER ALL CONFIGURATION FIRST - NO MORE QUESTIONS LATER!
-# ===================================================================
-
-print_header "CONFIGURATION WIZARD - Answer All Questions Now"
-echo ""
-echo "After these questions, the installer will run automatically."
-echo "No more interruptions - just sit back and watch!"
-echo ""
-
-# Warning
-echo "⚠ WARNING: This will install a mail server and website."
-echo "It is recommended to run this on a fresh server installation."
-echo ""
-read -p "Continue with installation? (y/n): " CONTINUE
-
-if [[ "${CONTINUE,,}" != "y" ]]; then
-    echo "Installation cancelled."
-    exit 0
+# Check OS
+if [ ! -f /etc/debian_version ]; then
+    print_error "This installer requires Debian/Ubuntu"
+    exit 1
 fi
 
-echo ""
+# ===================================================================
+# PHASE 1: CONFIGURATION GATHERING
+# ===================================================================
 
-# 1. Domain name
-read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
-while [[ ! "$DOMAIN_NAME" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; do
-    echo "Invalid domain format. Please use format: example.com"
-    read -p "Enter your domain name: " DOMAIN_NAME
-done
+print_header "Phase 1: Configuration"
 
-# 2. Mail subdomain
-echo ""
-echo "Choose the subdomain for your mail server:"
-echo "  Common options: mail, smtp, mx, email"
-echo "  Default: mail (resulting in mail.$DOMAIN_NAME)"
-echo ""
-read -p "Enter mail subdomain [mail]: " MAIL_SUBDOMAIN
-MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mail}
-
-# Validate subdomain
-while [[ ! "$MAIL_SUBDOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; do
-    echo "Invalid subdomain format. Use only letters, numbers, and hyphens."
-    read -p "Enter mail subdomain [mail]: " MAIL_SUBDOMAIN
-    MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mail}
-done
-
-# Set hostname
-HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
-echo "✓ Mail server hostname will be: $HOSTNAME"
-echo ""
-
-# 3. Admin email
-read -p "Enter admin email address: " ADMIN_EMAIL
-while [[ ! "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; do
-    echo "Invalid email format."
-    read -p "Enter admin email address: " ADMIN_EMAIL
-done
-echo "✓ Admin email set"
-echo ""
-
-# 4. First email account
-print_header "Email Account Setup"
-echo "Let's create your first email account now."
-echo ""
-read -p "Enter username for first email account (e.g., newsletter): " FIRST_USER
-while [[ ! "$FIRST_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; do
-    echo "Invalid username. Use only letters, numbers, dots, dashes, and underscores."
-    read -p "Enter username: " FIRST_USER
-done
-
-FIRST_EMAIL="${FIRST_USER}@${DOMAIN_NAME}"
-echo "Email address will be: $FIRST_EMAIL"
-
-# Password input with confirmation
+# Domain configuration
 while true; do
-    echo ""
-    echo "Enter password for $FIRST_EMAIL"
-    echo "(minimum 8 characters recommended):"
-    read -s FIRST_PASS
-    echo ""
-    
-    if [ ${#FIRST_PASS} -lt 8 ]; then
-        print_warning "Password should be at least 8 characters for security."
-        read -p "Use this password anyway? (y/n): " USE_SHORT
-        if [[ "${USE_SHORT,,}" != "y" ]]; then
-            continue
-        fi
-    fi
-    
-    echo "Confirm password:"
-    read -s FIRST_PASS_CONFIRM
-    echo ""
-    
-    if [ "$FIRST_PASS" == "$FIRST_PASS_CONFIRM" ]; then
-        echo "✓ Password confirmed"
+    read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
+    if [[ "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then
         break
     else
-        print_error "Passwords don't match. Please try again."
+        print_error "Invalid domain format. Please use format: example.com"
     fi
 done
-echo ""
 
-# 5. Server IP
-echo "Detecting server IP address..."
-PRIMARY_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || curl -s https://api.ipify.org 2>/dev/null || echo "")
+# Mail subdomain (optional)
+read -p "Enter mail server subdomain (default: mail): " MAIL_SUBDOMAIN
+MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mail}
+HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
+
+# Admin email
+while true; do
+    read -p "Enter admin email address: " ADMIN_EMAIL
+    if [[ "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        break
+    else
+        print_error "Invalid email format"
+    fi
+done
+
+# First email account
+read -p "Create first email account? (y/n) [y]: " CREATE_FIRST
+if [[ "${CREATE_FIRST,,}" != "n" ]]; then
+    read -p "Enter email address (e.g., admin@$DOMAIN_NAME): " FIRST_EMAIL
+    read -sp "Enter password for $FIRST_EMAIL: " FIRST_PASS
+    echo ""
+fi
+
+# ===================================================================
+# PHASE 2: IP ADDRESS CONFIGURATION
+# ===================================================================
+
+print_header "Phase 2: IP Address Configuration"
+
+# Detect primary IP
+PRIMARY_IP=$(curl -s --max-time 5 https://ipinfo.io/ip 2>/dev/null || \
+            curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+            hostname -I | awk '{print $1}')
+
 if [ -z "$PRIMARY_IP" ]; then
-    read -p "Could not detect IP. Please enter server IP address: " PRIMARY_IP
+    read -p "Could not detect IP. Enter server primary IP: " PRIMARY_IP
 else
-    echo "Detected IP: $PRIMARY_IP"
-    read -p "Is this correct? (y/n): " CONFIRM_IP
-    if [[ "${CONFIRM_IP,,}" != "y" ]]; then
-        read -p "Enter correct IP address: " PRIMARY_IP
+    echo "Detected primary IP: $PRIMARY_IP"
+    read -p "Is this correct? (y/n): " CONFIRM
+    if [[ "${CONFIRM,,}" != "y" ]]; then
+        read -p "Enter correct primary IP: " PRIMARY_IP
     fi
 fi
-IP_ADDRESSES=("$PRIMARY_IP")
-echo "✓ Primary IP configured"
-echo ""
 
-# 6. Website setup
-print_header "Website Configuration"
-echo "A website is REQUIRED for bulk email compliance (CAN-SPAM/GDPR)."
-echo "This will create a simple website with:"
-echo "  • Privacy Policy"
-echo "  • Terms of Service"
-echo "  • Contact Page"
-echo "  • Unsubscribe redirect to Mailwizz"
-echo ""
-echo "The website will be available at: http://$DOMAIN_NAME"
-echo ""
-
-# 7. Cloudflare configuration
-print_header "DNS Configuration"
-echo "Do you want to automatically configure DNS records in Cloudflare?"
-echo "This will add all necessary records including DKIM."
-echo ""
-read -p "Use Cloudflare automatic DNS setup? (y/n) [y]: " USE_CLOUDFLARE
-USE_CLOUDFLARE=${USE_CLOUDFLARE:-y}
-
-CF_API_KEY=""
-
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo ""
-    echo "You'll need a Cloudflare API Token (recommended) or Global API Key"
-    echo ""
-    echo "To create an API Token:"
-    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
-    echo "2. Click 'Create Token'"
-    echo "3. Use template 'Edit zone DNS' or create custom with Zone:DNS:Edit"
-    echo "4. Include your specific zone: $DOMAIN_NAME"
-    echo ""
-    echo "OR use Global API Key (less secure):"
-    echo "1. Go to: https://dash.cloudflare.com/profile/api-tokens"
-    echo "2. Click 'View' next to Global API Key"
-    echo ""
-    
-    echo "Enter your Cloudflare API Token or Global API Key:"
-    echo "(Input will be hidden for security)"
-    read -s CF_API_KEY
-    echo ""
-    
-    while [ -z "$CF_API_KEY" ]; do
-        print_error "API Key cannot be empty!"
-        echo "Enter Cloudflare API Token or Global API Key:"
-        read -s CF_API_KEY
-        echo ""
-    done
-    
-    echo "✓ Cloudflare API key saved"
-    echo ""
-    echo "Note: If using a Global API Key, you'll be prompted for email during DNS setup."
-else
-    print_warning "Manual DNS setup selected."
-    echo "You will need to manually add DNS records after installation."
+# Validate primary IP
+if ! validate_ip "$PRIMARY_IP"; then
+    print_error "Invalid IP address: $PRIMARY_IP"
+    exit 1
 fi
+
+IP_ADDRESSES=("$PRIMARY_IP")
+
+# Multi-IP configuration
+echo ""
+echo "Multi-IP Configuration"
+echo "======================"
+echo "You can enter IPs in these formats:"
+echo "  - Single IP: 192.168.1.10"
+echo "  - Range: 192.168.1.10-192.168.1.20 or 192.168.1.10-20"
+echo "  - CIDR: 192.168.1.0/24"
+echo "  - Press Enter when done"
 echo ""
 
-# 8. Multi-IP configuration
-read -p "Do you want to configure additional IP addresses? (y/n) [n]: " MULTI_IP
-if [[ "${MULTI_IP,,}" == "y" ]]; then
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                    IP ADDRESS INPUT                          ║"
-    echo "╠══════════════════════════════════════════════════════════════╣"
-    echo "║ Supported formats:                                           ║"
-    echo "║   • Single IP:     192.168.1.100                            ║"
-    echo "║   • Range:         192.168.1.100-192.168.1.110              ║"
-    echo "║   • Short range:   192.168.1.100-110                        ║"
-    echo "║   • CIDR:          192.168.1.0/24                           ║"
-    echo "║   • Multiple:      192.168.1.100,192.168.1.101              ║"
-    echo "║                                                              ║"
-    echo "║ Enter empty line to finish                                  ║"
-    echo "║ Maximum 100 IPs per entry for safety                        ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo ""
+while true; do
+    read -p "Enter additional IP(s) [Enter to finish]: " ip_input
+    [ -z "$ip_input" ] && break
     
-    while true; do
-        read -p "IP/Range/CIDR: " ip_input
-        [ -z "$ip_input" ] && break
-        
-        # Remove spaces
-        ip_input=$(echo "$ip_input" | tr -d ' ')
-        
-        # Check for comma-separated IPs
-        if [[ "$ip_input" == *","* ]]; then
-            IFS=',' read -ra ADDR_ARRAY <<< "$ip_input"
-            count=0
-            for addr in "${ADDR_ARRAY[@]}"; do
-                if validate_ip "$addr"; then
-                    if [[ "$addr" != "$PRIMARY_IP" ]]; then
-                        IP_ADDRESSES+=("$addr")
-                        count=$((count + 1))
-                        echo "  Added: $addr"
-                    fi
-                else
-                    echo "  Invalid IP: $addr"
-                fi
-            done
-            echo "  Total added: $count IPs"
-        
-        # Check for IP range
-        elif [[ "$ip_input" == *"-"* ]]; then
-            start_ip=${ip_input%-*}
-            end_ip=${ip_input#*-}
-            
-            # Handle short notation (192.168.1.100-110)
-            if [[ ! "$end_ip" == *.*.*.* ]]; then
-                base_ip=${start_ip%.*}
-                end_ip="$base_ip.$end_ip"
+    # Process based on input type
+    if [[ "$ip_input" =~ / ]]; then
+        # CIDR notation
+        echo "Processing CIDR: $ip_input"
+        while IFS= read -r ip; do
+            if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then
+                IP_ADDRESSES+=("$ip")
+                echo "  Added: $ip"
             fi
-            
-            expand_ip_range "$start_ip" "$end_ip"
-        
-        # Check for CIDR notation
-        elif [[ "$ip_input" == *"/"* ]]; then
-            expand_cidr "$ip_input"
-        
-        # Single IP address
-        elif validate_ip "$ip_input"; then
-            if [[ "$ip_input" != "$PRIMARY_IP" ]]; then
+        done < <(expand_cidr "$ip_input")
+    elif [[ "$ip_input" =~ - ]]; then
+        # Range notation
+        echo "Processing range: $ip_input"
+        while IFS= read -r ip; do
+            if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then
+                IP_ADDRESSES+=("$ip")
+                echo "  Added: $ip"
+            fi
+        done < <(expand_ip_range "$ip_input")
+    else
+        # Single IP
+        if validate_ip "$ip_input"; then
+            if [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip_input " ]]; then
                 IP_ADDRESSES+=("$ip_input")
                 echo "  Added: $ip_input"
             else
-                echo "  Skipping primary IP"
+                echo "  IP already in list"
             fi
-        
         else
-            echo "  Invalid format. Please see examples above."
+            print_error "  Invalid IP: $ip_input"
         fi
-        
-        # Show current count
-        unique_ips=($(echo "${IP_ADDRESSES[@]}" | tr ' ' '\n' | sort -u))
-        echo "  Current total: ${#unique_ips[@]} unique IPs"
-    done
-    
-    # Remove duplicates and sort
-    IFS=" " read -ra IP_ADDRESSES <<< "$(echo "${IP_ADDRESSES[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
-fi
-
-# ===================================================================
-# CONFIGURATION SUMMARY
-# ===================================================================
+    fi
+done
 
 echo ""
-print_header "Configuration Summary"
-echo "Domain: $DOMAIN_NAME"
-echo "Mail Subdomain: $MAIL_SUBDOMAIN"
-echo "Hostname: $HOSTNAME"
-echo "Admin Email: $ADMIN_EMAIL"
-echo "First Account: $FIRST_EMAIL"
-echo "Primary IP: $PRIMARY_IP"
+echo "Total IPs configured: ${#IP_ADDRESSES[@]}"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "Additional IPs: $((${#IP_ADDRESSES[@]} - 1)) configured"
-    echo "IP Rotation: Will be configured with sticky sessions"
+    echo "IPs: ${IP_ADDRESSES[@]}"
 fi
-echo "Website: Will be created at http://$DOMAIN_NAME"
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo "DNS Setup: Automatic via Cloudflare (including DKIM)"
-    echo "SSL: Automatic Let's Encrypt after DNS"
+
+# ===================================================================
+# PHASE 3: IP ROTATION CONFIGURATION (if multiple IPs)
+# ===================================================================
+
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    print_header "Phase 3: Configuring IP Rotation"
+    
+    # The configure_ip_rotation function will be called later after Postfix is installed
+    CONFIGURE_IP_ROTATION=true
 else
-    echo "DNS Setup: Manual configuration required"
-    echo "SSL: Manual setup after DNS propagation"
-fi
-echo ""
-echo "═══════════════════════════════════════════════════════"
-echo ""
-read -p "Ready to begin automatic installation? (y/n): " FINAL_CONFIRM
-if [[ "${FINAL_CONFIRM,,}" != "y" ]]; then
-    echo "Installation cancelled."
-    exit 0
+    CONFIGURE_IP_ROTATION=false
 fi
 
 # ===================================================================
-# NOW BEGIN AUTOMATIC INSTALLATION - NO MORE QUESTIONS!
+# PHASE 4: CLOUDFLARE CONFIGURATION
 # ===================================================================
 
-echo ""
-print_header "AUTOMATIC INSTALLATION STARTED"
-echo ""
-echo "Sit back and relax! This will take 10-15 minutes..."
-echo "No more questions will be asked."
-echo ""
-sleep 3
+print_header "Phase 4: Cloudflare Configuration (Optional)"
 
-# Create working directory
-INSTALLER_DIR="/root/mail-installer"
-MODULES_DIR="${INSTALLER_DIR}/modules"
-
-print_message "Setting up installation environment..."
-
-# Clean up any previous installation attempts
-if [ -d "$INSTALLER_DIR" ]; then
-    rm -rf "$INSTALLER_DIR"
+read -p "Configure Cloudflare DNS automatically? (y/n) [n]: " USE_CF
+if [[ "${USE_CF,,}" == "y" ]]; then
+    echo ""
+    echo "Cloudflare API Setup"
+    echo "===================="
+    echo "You can use either:"
+    echo "1. API Token (recommended) - Create at: https://dash.cloudflare.com/profile/api-tokens"
+    echo "   Required permissions: Zone:DNS:Edit for your domain"
+    echo "2. Global API Key - Find at: https://dash.cloudflare.com/profile/api-tokens"
+    echo ""
+    
+    read -sp "Enter Cloudflare API Key/Token: " CF_API_KEY
+    echo ""
+    
+    # Test if it's a token or global key
+    if [[ ${#CF_API_KEY} -eq 37 ]] || [[ "$CF_API_KEY" =~ ^[A-Za-z0-9_-]{40,}$ ]]; then
+        echo "Detected: API Token"
+        CF_EMAIL=""
+    else
+        echo "Detected: Global API Key"
+        read -p "Enter Cloudflare account email: " CF_EMAIL
+    fi
+    
+    # Save credentials
+    cat > /root/.cloudflare_credentials <<EOF
+SAVED_CF_API_KEY="$CF_API_KEY"
+SAVED_CF_EMAIL="$CF_EMAIL"
+EOF
+    chmod 600 /root/.cloudflare_credentials
 fi
 
-# Create fresh directories
-mkdir -p "$MODULES_DIR"
-cd "$INSTALLER_DIR"
-
-# Save configuration for all scripts to use
-cat > "$INSTALLER_DIR/install.conf" <<EOF
+# Save configuration
+cat > "$INSTALL_DIR/install.conf" <<EOF
+# Installation Configuration - Generated $(date)
 DOMAIN_NAME="$DOMAIN_NAME"
 MAIL_SUBDOMAIN="$MAIL_SUBDOMAIN"
 HOSTNAME="$HOSTNAME"
 ADMIN_EMAIL="$ADMIN_EMAIL"
 PRIMARY_IP="$PRIMARY_IP"
 IP_ADDRESSES=(${IP_ADDRESSES[@]})
-USE_CLOUDFLARE="$USE_CLOUDFLARE"
-CF_API_KEY="$CF_API_KEY"
 FIRST_EMAIL="$FIRST_EMAIL"
-FIRST_USER="$FIRST_USER"
 FIRST_PASS="$FIRST_PASS"
+CF_API_KEY="$CF_API_KEY"
+CF_EMAIL="$CF_EMAIL"
+CONFIGURE_IP_ROTATION=$CONFIGURE_IP_ROTATION
 EOF
 
-# Save Cloudflare credentials if provided
-if [ ! -z "$CF_API_KEY" ]; then
-    cat > "/root/.cloudflare_credentials" <<EOF
-SAVED_CF_API_KEY="$CF_API_KEY"
-EOF
-    chmod 600 "/root/.cloudflare_credentials"
-fi
+chmod 600 "$INSTALL_DIR/install.conf"
 
-# Download standalone scripts
-declare -a STANDALONE_SCRIPTS=(
-    "create-utilities.sh"
-    "setup-database.sh"
-    "cloudflare-dns-setup.sh"
-    "setup-website.sh"
-    "ssl-setup.sh"
-    "post-install-config.sh"
-    "troubleshoot.sh"
-)
+# ===================================================================
+# PHASE 5: DOWNLOAD ADDITIONAL SCRIPTS
+# ===================================================================
 
-print_message "Downloading installation scripts..."
-echo ""
+print_header "Phase 5: Downloading Components"
 
-DOWNLOAD_FAILED=0
+GITHUB_BASE="https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun"
 
-for script in "${STANDALONE_SCRIPTS[@]}"; do
-    script_url="${BASE_URL}/${script}"
-    script_file="${INSTALLER_DIR}/${script}"
+download_script() {
+    local script_name=$1
+    local script_url="$GITHUB_BASE/$script_name"
     
-    echo -n "  Downloading ${script}... "
-    
-    if wget -q -O "$script_file" "$script_url" 2>/dev/null || \
-       curl -sfL -o "$script_file" "$script_url" 2>/dev/null; then
-        
-        if [ -s "$script_file" ]; then
-            echo "✓"
-            chmod +x "$script_file"
-        else
-            echo "✗ (empty file)"
-            rm -f "$script_file"
-            DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
-        fi
+    echo -n "Downloading $script_name... "
+    if wget -q -O "$INSTALL_DIR/$script_name" "$script_url"; then
+        chmod +x "$INSTALL_DIR/$script_name"
+        print_message "✓"
     else
-        echo "✗ (download failed)"
-        DOWNLOAD_FAILED=$((DOWNLOAD_FAILED + 1))
+        print_warning "✗ (optional)"
     fi
-done
+}
 
-echo ""
-
-if [ $DOWNLOAD_FAILED -gt 0 ]; then
-    print_warning "Some scripts failed to download, but continuing..."
-fi
+# Download all components
+download_script "run-installer.sh"
+download_script "setup-database.sh"
+download_script "cloudflare-dns-setup.sh"
+download_script "setup-website.sh"
+download_script "ssl-setup.sh"
+download_script "create-utilities.sh"
+download_script "post-install-config.sh"
+download_script "troubleshoot.sh"
 
 # ===================================================================
-# PHASE 1: CORE INSTALLATION
+# PHASE 6: SYSTEM UPDATE
 # ===================================================================
 
-print_header "Phase 1: Installing Core Components"
-echo ""
+print_header "Phase 6: System Preparation"
 
 echo "Updating system packages..."
 apt-get update -y > /dev/null 2>&1
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y > /dev/null 2>&1
 
-echo "Installing required packages..."
-apt-get install -y jq curl wget > /dev/null 2>&1
+# Set hostname
+hostnamectl set-hostname "$HOSTNAME" 2>/dev/null || hostname "$HOSTNAME"
+echo "$HOSTNAME" > /etc/hostname
+
+# Update hosts file
+cat > /etc/hosts <<EOF
+127.0.0.1 localhost
+$PRIMARY_IP $HOSTNAME ${HOSTNAME%%.*}
+
+# IPv6
+::1 localhost ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+
+# ===================================================================
+# PHASE 7: INSTALL MAIL SERVER
+# ===================================================================
+
+print_header "Phase 7: Installing Mail Server"
 
 # Pre-configure Postfix
 debconf-set-selections <<< "postfix postfix/mailname string $HOSTNAME"
 debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
 
-echo "Installing mail server packages (this may take a few minutes)..."
+# Install packages
+echo "Installing mail server packages..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     postfix postfix-mysql postfix-pcre \
     dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-mysql \
     mysql-server mysql-client \
     opendkim opendkim-tools \
     spamassassin spamc \
-    certbot \
     nginx \
+    certbot python3-certbot-nginx \
+    ufw fail2ban \
     mailutils \
-    ufw fail2ban > /dev/null 2>&1
+    jq dnsutils net-tools \
+    > /dev/null 2>&1
 
-echo "Configuring Postfix..."
-postconf -e "myhostname = $HOSTNAME"
-postconf -e "mydomain = $DOMAIN_NAME"
-postconf -e "myorigin = \$mydomain"
-systemctl restart postfix > /dev/null 2>&1
+print_message "✓ Mail server packages installed"
 
 # ===================================================================
-# CRITICAL: GENERATE DKIM KEYS NOW - BEFORE DNS SETUP!
+# PHASE 8: CONFIGURE SERVICES
 # ===================================================================
 
-print_header "Phase 2: Generating DKIM Keys (BEFORE DNS Setup)"
-echo ""
+print_header "Phase 8: Configuring Services"
 
-echo "Creating DKIM keys for $DOMAIN_NAME..."
+# Basic Postfix configuration
+cat > /etc/postfix/main.cf <<EOF
+# Basic Configuration
+myhostname = $HOSTNAME
+mydomain = $DOMAIN_NAME
+myorigin = \$mydomain
+inet_interfaces = all
+inet_protocols = ipv4
+mydestination = 
+relay_domains = 
+mynetworks = 127.0.0.0/8
 
-# Create directories
+# TLS
+smtpd_tls_cert_file = /etc/ssl/certs/ssl-cert-snakeoil.pem
+smtpd_tls_key_file = /etc/ssl/private/ssl-cert-snakeoil.key
+smtpd_use_tls = yes
+smtpd_tls_auth_only = yes
+smtp_tls_security_level = may
+
+# Restrictions
+smtpd_recipient_restrictions = 
+    permit_mynetworks,
+    permit_sasl_authenticated,
+    reject_unauth_destination
+
+# Virtual domains (will be configured by setup-database.sh)
+virtual_transport = lmtp:unix:private/dovecot-lmtp
+
+# Limits
+message_size_limit = 52428800
+mailbox_size_limit = 0
+
+# SASL
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = private/auth
+smtpd_sasl_auth_enable = yes
+
+# Milters (OpenDKIM)
+milter_protocol = 6
+milter_default_action = accept
+smtpd_milters = inet:localhost:8891
+non_smtpd_milters = inet:localhost:8891
+EOF
+
+# Configure master.cf for submission
+cat >> /etc/postfix/master.cf <<EOF
+
+# Submission port 587
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+
+# SMTPS port 465
+smtps     inet  n       -       y       -       -       smtpd
+  -o syslog_name=postfix/smtps
+  -o smtpd_tls_wrappermode=yes
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+EOF
+
+# Setup OpenDKIM
+print_message "Generating DKIM keys..."
 mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
 cd /etc/opendkim/keys/$DOMAIN_NAME
-
-# Generate DKIM keys - using 1024-bit for better DNS compatibility
-opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024
+opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
 chown -R opendkim:opendkim /etc/opendkim
 chmod 600 mail.private
-chmod 644 mail.txt
 
-# Configure OpenDKIM basics
-cat > /etc/opendkim.conf <<EODKIM
+# Configure OpenDKIM
+cat > /etc/opendkim.conf <<EOF
 AutoRestart             Yes
 AutoRestartRate         10/1h
 UMask                   002
@@ -896,15 +715,12 @@ PidFile                 /var/run/opendkim/opendkim.pid
 SignatureAlgorithm      rsa-sha256
 UserID                  opendkim:opendkim
 Socket                  inet:8891@localhost
-EODKIM
+EOF
 
-# Setup key files
+# Setup DKIM tables
 echo "127.0.0.1" > /etc/opendkim/TrustedHosts
 echo "localhost" >> /etc/opendkim/TrustedHosts
 echo ".$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
-echo "$PRIMARY_IP" >> /etc/opendkim/TrustedHosts
-
-# Add all additional IPs to TrustedHosts
 for ip in "${IP_ADDRESSES[@]}"; do
     echo "$ip" >> /etc/opendkim/TrustedHosts
 done
@@ -912,387 +728,241 @@ done
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
 
-# Configure Postfix to use OpenDKIM
-postconf -e "milter_protocol = 6"
-postconf -e "milter_default_action = accept"
-postconf -e "smtpd_milters = inet:localhost:8891"
-postconf -e "non_smtpd_milters = inet:localhost:8891"
+# Start services
+systemctl restart opendkim postfix
 
-# Start OpenDKIM
-systemctl restart opendkim
-systemctl enable opendkim
+print_message "✓ Basic mail server configured"
 
-# Verify DKIM key was generated
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
-    print_message "✓ DKIM key generated successfully!"
-    echo "Key length: ${#DKIM_KEY} characters"
+# ===================================================================
+# PHASE 9: DATABASE SETUP
+# ===================================================================
+
+print_header "Phase 9: Database Configuration"
+
+if [ -f "$INSTALL_DIR/setup-database.sh" ]; then
+    bash "$INSTALL_DIR/setup-database.sh"
 else
-    print_error "✗ DKIM key generation failed!"
-fi
-
-cd "$INSTALLER_DIR"
-echo ""
-
-# ===================================================================
-# PHASE 3: CONFIGURE IP ROTATION (if multiple IPs)
-# ===================================================================
-
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_header "Phase 3: Configuring IP Rotation"
-    echo ""
-    configure_ip_rotation "$DOMAIN_NAME" "${IP_ADDRESSES[@]}"
-else
-    echo "Single IP configuration - skipping IP rotation setup"
-fi
-
-# ===================================================================
-# PHASE 4: DATABASE SETUP (Creates first email account!)
-# ===================================================================
-
-print_header "Phase 4: Setting Up Database"
-echo ""
-
-if [ -f "$INSTALLER_DIR/setup-database.sh" ]; then
-    bash "$INSTALLER_DIR/setup-database.sh"
-else
-    print_warning "Database setup script not found, using basic setup..."
-fi
-
-# ===================================================================
-# PHASE 5: CREATE UTILITIES
-# ===================================================================
-
-print_header "Phase 5: Creating Management Utilities"
-echo ""
-
-if [ -f "$INSTALLER_DIR/create-utilities.sh" ]; then
-    bash "$INSTALLER_DIR/create-utilities.sh"
-else
-    print_warning "Utilities script not found, skipping..."
-fi
-
-# ===================================================================
-# PHASE 6: WEBSITE SETUP
-# ===================================================================
-
-print_header "Phase 6: Setting Up Website for Bulk Email"
-echo ""
-
-if [ -f "$INSTALLER_DIR/setup-website.sh" ]; then
-    bash "$INSTALLER_DIR/setup-website.sh"
+    print_warning "Database setup script not found, using basic configuration"
     
-    if [ $? -eq 0 ]; then
-        print_message "✓ Website created successfully"
+    # Generate password
+    DB_PASSWORD=$(openssl rand -base64 32)
+    echo "$DB_PASSWORD" > /root/.mail_db_password
+    chmod 600 /root/.mail_db_password
+    
+    # Create database
+    mysql <<EOF 2>/dev/null || true
+CREATE DATABASE IF NOT EXISTS mailserver;
+CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+fi
+
+# ===================================================================
+# PHASE 10: CONFIGURE IP ROTATION (if multiple IPs)
+# ===================================================================
+
+if [ "$CONFIGURE_IP_ROTATION" == "true" ] && [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    print_header "Phase 10: IP Rotation Setup"
+    
+    # Create MySQL directory if not exists
+    mkdir -p /etc/postfix/mysql
+    
+    # Call the fixed configure_ip_rotation function
+    configure_ip_rotation "${IP_ADDRESSES[@]}"
+    
+    # Reload Postfix
+    systemctl reload postfix
+fi
+
+# ===================================================================
+# PHASE 11: CLOUDFLARE DNS
+# ===================================================================
+
+if [[ "${USE_CF,,}" == "y" ]]; then
+    print_header "Phase 11: Cloudflare DNS Setup"
+    
+    if [ -f "$INSTALL_DIR/cloudflare-dns-setup.sh" ]; then
+        bash "$INSTALL_DIR/cloudflare-dns-setup.sh"
     else
-        print_warning "Website setup had some issues, check manually"
+        print_warning "Cloudflare script not found, skipping DNS automation"
     fi
-else
-    print_warning "Website setup script not found, skipping..."
-    echo "You can set it up manually later."
 fi
 
 # ===================================================================
-# PHASE 7: DNS CONFIGURATION (NOW WITH DKIM KEY READY!)
+# PHASE 12: WEBSITE SETUP
 # ===================================================================
 
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Phase 7: Configuring Cloudflare DNS (Including DKIM)"
-    echo ""
-    
-    # Verify DKIM key exists before running DNS setup
-    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-        echo "✓ DKIM key is ready to be added to DNS"
-    else
-        print_warning "⚠ DKIM key not found, DNS setup may be incomplete"
-    fi
-    
-    if [ -f "$INSTALLER_DIR/cloudflare-dns-setup.sh" ]; then
-        bash "$INSTALLER_DIR/cloudflare-dns-setup.sh"
-        
-        if [ $? -eq 0 ]; then
-            echo ""
-            print_message "✓ DNS records created in Cloudflare"
-            print_message "✓ DKIM record added to Cloudflare"
-            echo "Waiting 60 seconds for initial DNS propagation..."
-            sleep 60
-            
-            # Test DNS resolution
-            echo -n "Testing DNS resolution for $HOSTNAME... "
-            if host $HOSTNAME 8.8.8.8 > /dev/null 2>&1; then
-                print_message "✓ DNS is resolving!"
-            else
-                print_warning "⚠ DNS not fully propagated yet"
-                echo "Continuing anyway, SSL might need manual setup later..."
-            fi
-            
-            # Test DKIM
-            echo -n "Testing DKIM record... "
-            if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
-                print_message "✓ DKIM record is live!"
-            else
-                print_warning "⚠ DKIM still propagating"
-            fi
-        fi
-    else
-        print_warning "Cloudflare script not found, skipping DNS automation..."
-    fi
+print_header "Phase 12: Website Setup"
+
+if [ -f "$INSTALL_DIR/setup-website.sh" ]; then
+    bash "$INSTALL_DIR/setup-website.sh"
 else
-    print_header "Phase 7: Manual DNS Configuration Required"
-    echo ""
-    echo "After installation, add these DNS records at your provider:"
-    echo "  A record: $HOSTNAME -> $PRIMARY_IP"
-    echo "  A record: $DOMAIN_NAME -> $PRIMARY_IP"
-    echo "  MX record: $DOMAIN_NAME -> $HOSTNAME (priority 10)"
-    echo "  SPF: v=spf1 mx a ip4:$PRIMARY_IP ~all"
+    print_warning "Website setup script not found, creating basic site"
     
-    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-        echo "  DKIM: mail._domainkey TXT record:"
-        echo "        v=DKIM1; k=rsa; p=$DKIM_KEY"
-    fi
-    echo ""
+    # Basic website
+    mkdir -p /var/www/$DOMAIN_NAME
+    cat > /var/www/$DOMAIN_NAME/index.html <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>$DOMAIN_NAME</title>
+</head>
+<body>
+    <h1>Welcome to $DOMAIN_NAME</h1>
+    <p>Mail server is operational</p>
+</body>
+</html>
+EOF
+    
+    # Basic nginx config
+    cat > /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
+    root /var/www/$DOMAIN_NAME;
+    index index.html;
+    
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+    
+    ln -sf /etc/nginx/sites-available/$DOMAIN_NAME /etc/nginx/sites-enabled/
+    nginx -t 2>/dev/null && systemctl reload nginx
 fi
 
 # ===================================================================
-# PHASE 8: SSL CERTIFICATE
+# PHASE 13: CREATE UTILITIES
 # ===================================================================
 
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    print_header "Phase 8: Getting SSL Certificates"
-    echo ""
-    
-    if [ -f "$INSTALLER_DIR/ssl-setup.sh" ]; then
-        bash "$INSTALLER_DIR/ssl-setup.sh"
-    else
-        print_warning "SSL setup script not found, using basic setup..."
-        
-        echo "Attempting to get Let's Encrypt certificate..."
-        systemctl stop nginx 2>/dev/null || true
-        systemctl stop apache2 2>/dev/null || true
-        
-        certbot certonly --standalone \
-            -d "$HOSTNAME" \
-            --non-interactive \
-            --agree-tos \
-            --email "$ADMIN_EMAIL" \
-            --no-eff-email > /dev/null 2>&1
-        
-        if [ $? -eq 0 ]; then
-            print_message "✓ SSL certificate obtained!"
-        else
-            print_warning "⚠ Could not get SSL certificate yet (DNS might not be ready)"
-        fi
-        
-        systemctl start nginx 2>/dev/null || true
-    fi
+print_header "Phase 13: Creating Management Utilities"
+
+if [ -f "$INSTALL_DIR/create-utilities.sh" ]; then
+    bash "$INSTALL_DIR/create-utilities.sh"
 else
-    print_header "Phase 8: SSL Certificate - Manual Setup Required"
-    echo "After DNS propagates, run: certbot certonly --standalone -d $HOSTNAME"
+    print_warning "Utilities script not found, creating basic commands"
 fi
 
 # ===================================================================
-# PHASE 9: POST-INSTALLATION CONFIGURATION
+# PHASE 14: SSL CERTIFICATES
 # ===================================================================
 
-print_header "Phase 9: Final Configuration"
+print_header "Phase 14: SSL Certificate Setup"
+
+echo "Waiting for DNS propagation before requesting SSL..."
+echo "You can skip this and run ssl-setup later if DNS is not ready"
 echo ""
+read -p "Try to get SSL certificates now? (y/n) [n]: " GET_SSL
 
-if [ -f "$INSTALLER_DIR/post-install-config.sh" ]; then
-    bash "$INSTALLER_DIR/post-install-config.sh"
+if [[ "${GET_SSL,,}" == "y" ]]; then
+    if [ -f "$INSTALL_DIR/ssl-setup.sh" ]; then
+        bash "$INSTALL_DIR/ssl-setup.sh"
+    else
+        print_warning "SSL script not found, run certbot manually later"
+    fi
 else
-    print_warning "Post-install script not found, using basic configuration..."
-    
-    # Basic firewall setup
-    echo "Configuring firewall..."
-    ufw allow 22/tcp > /dev/null 2>&1
-    ufw allow 25/tcp > /dev/null 2>&1
-    ufw allow 587/tcp > /dev/null 2>&1
-    ufw allow 465/tcp > /dev/null 2>&1
-    ufw allow 143/tcp > /dev/null 2>&1
-    ufw allow 993/tcp > /dev/null 2>&1
-    ufw allow 80/tcp > /dev/null 2>&1
-    ufw allow 443/tcp > /dev/null 2>&1
-    ufw --force enable > /dev/null 2>&1
+    echo "Run 'ssl-setup' after DNS propagation to get certificates"
+fi
+
+# ===================================================================
+# PHASE 15: FIREWALL SETUP
+# ===================================================================
+
+print_header "Phase 15: Firewall Configuration"
+
+ufw --force disable 2>/dev/null
+ufw --force reset 2>/dev/null
+
+# Configure UFW
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 25/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 587/tcp
+ufw allow 465/tcp
+ufw allow 993/tcp
+ufw allow 995/tcp
+ufw allow 143/tcp
+ufw allow 110/tcp
+
+echo "y" | ufw --force enable
+
+print_message "✓ Firewall configured"
+
+# ===================================================================
+# PHASE 16: FINAL CONFIGURATION
+# ===================================================================
+
+print_header "Phase 16: Final Configuration"
+
+if [ -f "$INSTALL_DIR/post-install-config.sh" ]; then
+    bash "$INSTALL_DIR/post-install-config.sh"
 fi
 
 # Restart all services
-echo "Restarting mail services..."
-systemctl restart postfix dovecot opendkim nginx > /dev/null 2>&1
+systemctl restart postfix dovecot opendkim nginx
+systemctl enable postfix dovecot opendkim nginx mysql
 
 # ===================================================================
-# VERIFY DKIM IS WORKING
+# INSTALLATION COMPLETE
 # ===================================================================
 
-print_header "Verifying DKIM Configuration"
+print_header "Installation Complete!"
 
-# Check OpenDKIM is running
-if systemctl is-active --quiet opendkim; then
-    print_message "✓ OpenDKIM service is running"
-else
-    print_error "✗ OpenDKIM service is not running"
-    systemctl restart opendkim
+echo ""
+print_message "✓ Mail server installed successfully!"
+echo ""
+echo "Domain: $DOMAIN_NAME"
+echo "Mail Server: $HOSTNAME"
+echo "Primary IP: $PRIMARY_IP"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "Total IPs: ${#IP_ADDRESSES[@]}"
+    echo ""
+    echo "IP Rotation: ENABLED"
+    echo "  View status: ip-rotation-status"
+    echo "  Assign IP: assign-sender-ip email@domain.com"
+fi
+echo ""
+
+if [ ! -z "$FIRST_EMAIL" ]; then
+    echo "Email Account:"
+    echo "  Email: $FIRST_EMAIL"
+    echo "  Password: [set during installation]"
+    echo ""
 fi
 
-# Check OpenDKIM is listening
-if netstat -lnp 2>/dev/null | grep -q ":8891"; then
-    print_message "✓ OpenDKIM is listening on port 8891"
-else
-    print_error "✗ OpenDKIM is not listening on port 8891"
-fi
-
-# Check DKIM key exists
+# Display DKIM record
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    print_message "✓ DKIM key file exists"
-else
-    print_error "✗ DKIM key file missing!"
-fi
-
-# Check if DKIM is in DNS (if using Cloudflare)
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo -n "Checking DKIM in Cloudflare DNS... "
-    if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
-        print_message "✓ DKIM is ACTIVE in Cloudflare!"
-    else
-        print_warning "⚠ DKIM is propagating (wait 5-10 minutes)"
-    fi
-fi
-
-echo ""
-
-# ===================================================================
-# INSTALLATION COMPLETE!
-# ===================================================================
-
-echo ""
-print_header "🎉 INSTALLATION COMPLETE! 🎉"
-echo ""
-print_message "Your mail server and website have been successfully installed!"
-echo ""
-echo "Configuration:"
-echo "  Domain: $DOMAIN_NAME"
-echo "  Mail Subdomain: $MAIL_SUBDOMAIN"
-echo "  Hostname: $HOSTNAME"
-echo "  Admin Email: $ADMIN_EMAIL"
-echo "  Email Account: $FIRST_EMAIL (ready to use!)"
-echo "  Primary IP: $PRIMARY_IP"
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "  Additional IPs: $((${#IP_ADDRESSES[@]} - 1))"
-    echo "  IP Rotation: ✓ Configured with database-backed sticky sessions"
-fi
-echo ""
-
-echo "WEBSITE:"
-echo "  URL: http://$DOMAIN_NAME"
-if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
-    echo "  SSL: https://$DOMAIN_NAME"
-fi
-echo "  Privacy Policy: http://$DOMAIN_NAME/privacy.html"
-echo "  Terms: http://$DOMAIN_NAME/terms.html"
-echo "  Contact: http://$DOMAIN_NAME/contact.html"
-echo ""
-
-echo "DKIM STATUS:"
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    print_message "  ✓ DKIM key generated"
-    if systemctl is-active --quiet opendkim; then
-        print_message "  ✓ OpenDKIM service running"
-    fi
-    if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-        if dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep -q "v=DKIM1"; then
-            print_message "  ✓ DKIM record ACTIVE in Cloudflare!"
-        else
-            print_warning "  ⚠ DKIM record propagating (normal, wait 5-10 min)"
-        fi
-    else
-        echo "  ⚠ Add DKIM record manually to your DNS:"
-        echo "    Name: mail._domainkey"
-        echo "    Type: TXT"
-        echo "    Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
-    fi
-else
-    print_error "  ✗ DKIM not configured!"
-fi
-
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo ""
-    echo "IP ROTATION:"
-    print_message "  ✓ Configured for ${#IP_ADDRESSES[@]} IP addresses"
-    echo "  • Database-backed sticky sessions enabled"
-    echo "  • Same sender always uses same IP"
-    echo "  • Monitor usage: ip-usage"
-    echo "  • Database stats: maildb ip-stats"
-fi
-
-echo ""
-
-if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-    echo "✓ DNS records configured in Cloudflare"
-    echo "✓ DKIM record added to Cloudflare"
-    if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
-        echo "✓ Let's Encrypt SSL certificate installed"
-    else
-        echo "⚠ SSL certificate pending - DNS might still be propagating"
-        echo "  Try later: get-ssl-cert or certbot certonly --standalone -d $HOSTNAME"
-    fi
-else
-    echo "Next steps for manual configuration:"
-    echo ""
-    echo "1. Add DNS records at your DNS provider (including DKIM above)"
-    echo "2. After DNS propagates, get SSL: get-ssl-cert"
-fi
-
-echo ""
-print_header "TEST YOUR SERVER NOW!"
-echo ""
-echo "1. Quick DKIM test:"
-echo "   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
-echo ""
-echo "2. Send test email with DKIM:"
-echo "   test-email check-auth@verifier.port25.com $FIRST_EMAIL"
-echo "   (Wait for reply - it will show DKIM pass/fail)"
-echo ""
-echo "3. Check mail score:"
-echo "   https://www.mail-tester.com"
-echo ""
-echo "4. Verify all DNS records:"
-echo "   check-dns $DOMAIN_NAME"
-echo ""
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "5. Monitor IP rotation:"
-    echo "   ip-usage"
-    echo "   maildb ip-stats"
+    echo "DKIM Record (add to DNS):"
+    echo "  Name: mail._domainkey"
+    echo "  Type: TXT"
+    echo "  Value: $(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t ')"
     echo ""
 fi
 
-print_header "MAILWIZZ CONFIGURATION"
-echo ""
-echo "Configure Mailwizz with these settings:"
-echo "  SMTP Server: $HOSTNAME"
-echo "  Port: 587 (TLS) or 465 (SSL)"
-echo "  Username: $FIRST_EMAIL"
-echo "  Password: [the one you set]"
-echo "  Encryption: TLS or SSL"
-echo ""
-echo "IMPORTANT: Update unsubscribe URL in /etc/nginx/sites-available/$DOMAIN_NAME"
+echo "Next Steps:"
+echo "1. Add DNS records (check dns-records-$DOMAIN_NAME.txt)"
+echo "2. Wait for DNS propagation (5-30 minutes)"
+echo "3. Get SSL certificates: ssl-setup"
+echo "4. Test email delivery: test-email recipient@example.com"
 echo ""
 
-echo "Available Commands:"
-echo "  test-email     - Send test email with DKIM"
-echo "  check-dns      - Verify all DNS including DKIM"
-echo "  mail-status    - Check server status"
-echo "  mailwizz-info  - Mailwizz setup info"
+echo "Management Commands:"
+echo "  mail-status         - Check server status"
+echo "  mail-account        - Manage email accounts"
+echo "  mail-test          - Test email configuration"
+echo "  mail-queue         - Manage mail queue"
+echo "  mail-log           - View mail logs"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "  ip-usage       - Monitor IP rotation statistics"
-    echo "  maildb ip-stats - Database IP assignment stats"
+    echo "  ip-rotation-status - View IP rotation statistics"
 fi
+echo "  troubleshoot       - Run diagnostics"
 echo ""
 
-print_message "✅ Your mail server is ready for LEGAL bulk email with DKIM signing!"
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_message "✅ IP rotation is configured with database-backed sticky sessions!"
-fi
-print_message "✅ DKIM will ensure your emails pass authentication checks!"
-echo ""
 echo "Installation log: $LOG_FILE"
 echo ""
-print_message "Repository: https://github.com/fumingtomato/shibi"
+print_message "Your bulk mail server is ready!"
