@@ -4,7 +4,7 @@
 # BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
 # Version: 17.0.0
 # Automated installation with Cloudflare DNS, compliance website, and DKIM
-# FIXED: IP rotation array indexing error
+# FIXED: All questions moved to beginning, no questions during execution
 # =================================================================
 
 set -e  # Exit on any error
@@ -346,10 +346,12 @@ if [ ! -f /etc/debian_version ]; then
 fi
 
 # ===================================================================
-# PHASE 1: CONFIGURATION GATHERING
+# PHASE 1: ALL CONFIGURATION GATHERING (ALL QUESTIONS HERE)
 # ===================================================================
 
-print_header "Phase 1: Configuration"
+print_header "Phase 1: Complete Configuration"
+echo "Answer all questions now. Installation will then proceed automatically."
+echo ""
 
 # Domain configuration
 while true; do
@@ -361,7 +363,7 @@ while true; do
     fi
 done
 
-# Mail subdomain (optional)
+# Mail subdomain
 read -p "Enter mail server subdomain (default: mail): " MAIL_SUBDOMAIN
 MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mail}
 HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
@@ -377,18 +379,9 @@ while true; do
 done
 
 # First email account
-read -p "Create first email account? (y/n) [y]: " CREATE_FIRST
-if [[ "${CREATE_FIRST,,}" != "n" ]]; then
-    read -p "Enter email address (e.g., admin@$DOMAIN_NAME): " FIRST_EMAIL
-    read -sp "Enter password for $FIRST_EMAIL: " FIRST_PASS
-    echo ""
-fi
-
-# ===================================================================
-# PHASE 2: IP ADDRESS CONFIGURATION
-# ===================================================================
-
-print_header "Phase 2: IP Address Configuration"
+read -p "Email address for first account (e.g., admin@$DOMAIN_NAME): " FIRST_EMAIL
+read -sp "Password for $FIRST_EMAIL: " FIRST_PASS
+echo ""
 
 # Detect primary IP
 PRIMARY_IP=$(curl -s --max-time 5 https://ipinfo.io/ip 2>/dev/null || \
@@ -399,9 +392,9 @@ if [ -z "$PRIMARY_IP" ]; then
     read -p "Could not detect IP. Enter server primary IP: " PRIMARY_IP
 else
     echo "Detected primary IP: $PRIMARY_IP"
-    read -p "Is this correct? (y/n): " CONFIRM
-    if [[ "${CONFIRM,,}" != "y" ]]; then
-        read -p "Enter correct primary IP: " PRIMARY_IP
+    read -p "Press Enter if correct, or type the correct IP: " USER_IP
+    if [ ! -z "$USER_IP" ]; then
+        PRIMARY_IP="$USER_IP"
     fi
 fi
 
@@ -415,11 +408,10 @@ IP_ADDRESSES=("$PRIMARY_IP")
 
 # Multi-IP configuration
 echo ""
-echo "Multi-IP Configuration"
-echo "======================"
+echo "Multi-IP Configuration (optional)"
 echo "You can enter IPs in these formats:"
 echo "  - Single IP: 192.168.1.10"
-echo "  - Range: 192.168.1.10-192.168.1.20 or 192.168.1.10-20"
+echo "  - Range: 192.168.1.10-192.168.1.20"
 echo "  - CIDR: 192.168.1.0/24"
 echo "  - Press Enter when done"
 echo ""
@@ -464,49 +456,21 @@ done
 
 echo ""
 echo "Total IPs configured: ${#IP_ADDRESSES[@]}"
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "IPs: ${IP_ADDRESSES[@]}"
-fi
 
-# ===================================================================
-# PHASE 3: IP ROTATION CONFIGURATION (if multiple IPs)
-# ===================================================================
+# Cloudflare configuration
+echo ""
+echo "Cloudflare DNS Configuration (optional)"
+echo "Leave blank to skip automatic DNS setup"
+read -sp "Enter Cloudflare API Key/Token (or press Enter to skip): " CF_API_KEY
+echo ""
 
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_header "Phase 3: Configuring IP Rotation"
-    
-    # The configure_ip_rotation function will be called later after Postfix is installed
-    CONFIGURE_IP_ROTATION=true
-else
-    CONFIGURE_IP_ROTATION=false
-fi
-
-# ===================================================================
-# PHASE 4: CLOUDFLARE CONFIGURATION
-# ===================================================================
-
-print_header "Phase 4: Cloudflare Configuration (Optional)"
-
-read -p "Configure Cloudflare DNS automatically? (y/n) [n]: " USE_CF
-if [[ "${USE_CF,,}" == "y" ]]; then
-    echo ""
-    echo "Cloudflare API Setup"
-    echo "===================="
-    echo "You can use either:"
-    echo "1. API Token (recommended) - Create at: https://dash.cloudflare.com/profile/api-tokens"
-    echo "   Required permissions: Zone:DNS:Edit for your domain"
-    echo "2. Global API Key - Find at: https://dash.cloudflare.com/profile/api-tokens"
-    echo ""
-    
-    read -sp "Enter Cloudflare API Key/Token: " CF_API_KEY
-    echo ""
-    
+if [ ! -z "$CF_API_KEY" ]; then
     # Test if it's a token or global key
     if [[ ${#CF_API_KEY} -eq 37 ]] || [[ "$CF_API_KEY" =~ ^[A-Za-z0-9_-]{40,}$ ]]; then
-        echo "Detected: API Token"
+        echo "Using API Token"
         CF_EMAIL=""
     else
-        echo "Detected: Global API Key"
+        echo "Using Global API Key"
         read -p "Enter Cloudflare account email: " CF_EMAIL
     fi
     
@@ -516,6 +480,16 @@ SAVED_CF_API_KEY="$CF_API_KEY"
 SAVED_CF_EMAIL="$CF_EMAIL"
 EOF
     chmod 600 /root/.cloudflare_credentials
+    USE_CF="y"
+else
+    USE_CF="n"
+fi
+
+# Configuration for IP rotation
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    CONFIGURE_IP_ROTATION=true
+else
+    CONFIGURE_IP_ROTATION=false
 fi
 
 # Save configuration
@@ -531,16 +505,26 @@ FIRST_EMAIL="$FIRST_EMAIL"
 FIRST_PASS="$FIRST_PASS"
 CF_API_KEY="$CF_API_KEY"
 CF_EMAIL="$CF_EMAIL"
+USE_CF="$USE_CF"
 CONFIGURE_IP_ROTATION=$CONFIGURE_IP_ROTATION
 EOF
 
 chmod 600 "$INSTALL_DIR/install.conf"
 
 # ===================================================================
-# PHASE 5: DOWNLOAD ADDITIONAL SCRIPTS
+# NO MORE QUESTIONS FROM HERE ON - JUST EXECUTION
 # ===================================================================
 
-print_header "Phase 5: Downloading Components"
+print_header "Starting Automated Installation"
+echo "All configuration collected. Installation will now proceed automatically."
+echo "This will take approximately 10-15 minutes."
+echo ""
+
+# ===================================================================
+# PHASE 2: DOWNLOAD ADDITIONAL SCRIPTS
+# ===================================================================
+
+print_header "Phase 2: Downloading Components"
 
 GITHUB_BASE="https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun"
 
@@ -568,10 +552,10 @@ download_script "post-install-config.sh"
 download_script "troubleshoot.sh"
 
 # ===================================================================
-# PHASE 6: SYSTEM UPDATE
+# PHASE 3: SYSTEM UPDATE
 # ===================================================================
 
-print_header "Phase 6: System Preparation"
+print_header "Phase 3: System Preparation"
 
 echo "Updating system packages..."
 apt-get update -y > /dev/null 2>&1
@@ -595,10 +579,10 @@ ff02::2 ip6-allrouters
 EOF
 
 # ===================================================================
-# PHASE 7: INSTALL MAIL SERVER
+# PHASE 4: INSTALL MAIL SERVER
 # ===================================================================
 
-print_header "Phase 7: Installing Mail Server"
+print_header "Phase 4: Installing Mail Server"
 
 # Pre-configure Postfix
 debconf-set-selections <<< "postfix postfix/mailname string $HOSTNAME"
@@ -622,10 +606,10 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 print_message "✓ Mail server packages installed"
 
 # ===================================================================
-# PHASE 8: CONFIGURE SERVICES
+# PHASE 5: CONFIGURE SERVICES
 # ===================================================================
 
-print_header "Phase 8: Configuring Services"
+print_header "Phase 5: Configuring Services"
 
 # Basic Postfix configuration
 cat > /etc/postfix/main.cf <<EOF
@@ -734,10 +718,10 @@ systemctl restart opendkim postfix
 print_message "✓ Basic mail server configured"
 
 # ===================================================================
-# PHASE 9: DATABASE SETUP
+# PHASE 6: DATABASE SETUP
 # ===================================================================
 
-print_header "Phase 9: Database Configuration"
+print_header "Phase 6: Database Configuration"
 
 if [ -f "$INSTALL_DIR/setup-database.sh" ]; then
     bash "$INSTALL_DIR/setup-database.sh"
@@ -759,11 +743,11 @@ EOF
 fi
 
 # ===================================================================
-# PHASE 10: CONFIGURE IP ROTATION (if multiple IPs)
+# PHASE 7: CONFIGURE IP ROTATION (if multiple IPs)
 # ===================================================================
 
 if [ "$CONFIGURE_IP_ROTATION" == "true" ] && [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_header "Phase 10: IP Rotation Setup"
+    print_header "Phase 7: IP Rotation Setup"
     
     # Create MySQL directory if not exists
     mkdir -p /etc/postfix/mysql
@@ -776,11 +760,11 @@ if [ "$CONFIGURE_IP_ROTATION" == "true" ] && [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
 fi
 
 # ===================================================================
-# PHASE 11: CLOUDFLARE DNS
+# PHASE 8: CLOUDFLARE DNS (AUTOMATIC IF CONFIGURED)
 # ===================================================================
 
-if [[ "${USE_CF,,}" == "y" ]]; then
-    print_header "Phase 11: Cloudflare DNS Setup"
+if [[ "$USE_CF" == "y" ]]; then
+    print_header "Phase 8: Cloudflare DNS Setup"
     
     if [ -f "$INSTALL_DIR/cloudflare-dns-setup.sh" ]; then
         bash "$INSTALL_DIR/cloudflare-dns-setup.sh"
@@ -790,10 +774,10 @@ if [[ "${USE_CF,,}" == "y" ]]; then
 fi
 
 # ===================================================================
-# PHASE 12: WEBSITE SETUP
+# PHASE 9: WEBSITE SETUP
 # ===================================================================
 
-print_header "Phase 12: Website Setup"
+print_header "Phase 9: Website Setup"
 
 if [ -f "$INSTALL_DIR/setup-website.sh" ]; then
     bash "$INSTALL_DIR/setup-website.sh"
@@ -834,10 +818,10 @@ EOF
 fi
 
 # ===================================================================
-# PHASE 13: CREATE UTILITIES
+# PHASE 10: CREATE UTILITIES
 # ===================================================================
 
-print_header "Phase 13: Creating Management Utilities"
+print_header "Phase 10: Creating Management Utilities"
 
 if [ -f "$INSTALL_DIR/create-utilities.sh" ]; then
     bash "$INSTALL_DIR/create-utilities.sh"
@@ -846,31 +830,53 @@ else
 fi
 
 # ===================================================================
-# PHASE 14: SSL CERTIFICATES
+# PHASE 11: SSL CERTIFICATES (AUTOMATIC ATTEMPT)
 # ===================================================================
 
-print_header "Phase 14: SSL Certificate Setup"
+print_header "Phase 11: SSL Certificate Setup"
 
-echo "Waiting for DNS propagation before requesting SSL..."
-echo "You can skip this and run ssl-setup later if DNS is not ready"
-echo ""
-read -p "Try to get SSL certificates now? (y/n) [n]: " GET_SSL
+echo "Attempting to obtain SSL certificates..."
+echo "Note: This will work if DNS is already propagated"
 
-if [[ "${GET_SSL,,}" == "y" ]]; then
-    if [ -f "$INSTALL_DIR/ssl-setup.sh" ]; then
-        bash "$INSTALL_DIR/ssl-setup.sh"
-    else
-        print_warning "SSL script not found, run certbot manually later"
-    fi
+if [ -f "$INSTALL_DIR/ssl-setup.sh" ]; then
+    # Modify ssl-setup.sh to run automatically
+    sed -i 's/read -p.*Continue anyway.*cont/cont=y/' "$INSTALL_DIR/ssl-setup.sh" 2>/dev/null || true
+    bash "$INSTALL_DIR/ssl-setup.sh"
 else
-    echo "Run 'ssl-setup' after DNS propagation to get certificates"
+    # Try to get certificates directly
+    echo "Getting SSL certificates..."
+    
+    # Stop services for standalone mode
+    systemctl stop nginx 2>/dev/null || true
+    
+    # Try mail server certificate
+    certbot certonly --standalone \
+        -d "$HOSTNAME" \
+        --non-interactive \
+        --agree-tos \
+        --email "$ADMIN_EMAIL" \
+        --no-eff-email 2>/dev/null || \
+    echo "Mail SSL pending DNS propagation"
+    
+    # Try website certificate  
+    certbot certonly --standalone \
+        -d "$DOMAIN_NAME" \
+        -d "www.$DOMAIN_NAME" \
+        --non-interactive \
+        --agree-tos \
+        --email "$ADMIN_EMAIL" \
+        --no-eff-email 2>/dev/null || \
+    echo "Website SSL pending DNS propagation"
+    
+    # Restart nginx
+    systemctl start nginx 2>/dev/null || true
 fi
 
 # ===================================================================
-# PHASE 15: FIREWALL SETUP
+# PHASE 12: FIREWALL SETUP
 # ===================================================================
 
-print_header "Phase 15: Firewall Configuration"
+print_header "Phase 12: Firewall Configuration"
 
 ufw --force disable 2>/dev/null
 ufw --force reset 2>/dev/null
@@ -894,10 +900,10 @@ echo "y" | ufw --force enable
 print_message "✓ Firewall configured"
 
 # ===================================================================
-# PHASE 16: FINAL CONFIGURATION
+# PHASE 13: FINAL CONFIGURATION
 # ===================================================================
 
-print_header "Phase 16: Final Configuration"
+print_header "Phase 13: Final Configuration"
 
 if [ -f "$INSTALL_DIR/post-install-config.sh" ]; then
     bash "$INSTALL_DIR/post-install-config.sh"
@@ -947,7 +953,7 @@ fi
 echo "Next Steps:"
 echo "1. Add DNS records (check dns-records-$DOMAIN_NAME.txt)"
 echo "2. Wait for DNS propagation (5-30 minutes)"
-echo "3. Get SSL certificates: ssl-setup"
+echo "3. Get SSL certificates: get-ssl-cert"
 echo "4. Test email delivery: test-email recipient@example.com"
 echo ""
 
