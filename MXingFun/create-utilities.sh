@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# CREATE MAIL SERVER UTILITIES AND MANAGEMENT COMMANDS
+# CREATE MAIL SERVER UTILITIES - AUTOMATIC, NO QUESTIONS
 # Version: 17.0.0
 # Creates helper scripts for managing the mail server
-# FIXED: IP rotation commands, subdomain support, database connectivity
 # =================================================================
 
 # Colors
