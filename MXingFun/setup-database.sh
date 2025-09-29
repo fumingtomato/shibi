@@ -739,7 +739,6 @@ cat > /etc/opendkim/SigningTable <<EOF
 *@localhost mail._domainkey.$DOMAIN_NAME
 *@localhost.localdomain mail._domainkey.$DOMAIN_NAME
 $DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
-*@* mail._domainkey.$DOMAIN_NAME
 EOF
 
 # Ensure KeyTable is correct
