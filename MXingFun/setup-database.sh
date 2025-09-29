@@ -849,7 +849,7 @@ MAILDBSCRIPT
 chmod +x /usr/local/bin/maildb
 
 # ===================================================================
-# 9. RESTART SERVICES
+# 10. RESTART SERVICES
 # ===================================================================
 
 print_header "Restarting Services"
@@ -864,7 +864,7 @@ echo -n "Restarting OpenDKIM... "
 systemctl restart opendkim 2>/dev/null && echo "✓" || echo "✗"
 
 # ===================================================================
-# 10. TEST DATABASE CONNECTION
+# 11. TEST DATABASE CONNECTION
 # ===================================================================
 
 echo ""
@@ -916,7 +916,7 @@ echo "DKIM KEY STATUS:"
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     echo "  ✓ 1024-bit key generated"
     echo "  ✓ Public key length: ${#DKIM_KEY} characters"
-if [ ${#DKIM_KEY} -gt 250 ]; then
+    if [ ${#DKIM_KEY} -gt 250 ]; then
         print_warning "  ⚠ WARNING: Key seems too long, may still be 2048-bit!"
     fi
 fi
