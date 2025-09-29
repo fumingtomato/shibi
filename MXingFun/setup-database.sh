@@ -1,11 +1,10 @@
 #!/bin/bash
 
 # =================================================================
-# DATABASE SETUP FOR MAIL SERVER
+# DATABASE SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
 # Version: 17.0.0
-# Sets up MySQL/MariaDB with virtual users for Postfix/Dovecot
-# Creates first email account during installation
-# FIXED: Unclosed heredoc and syntax errors
+# Sets up MySQL/MariaDB with virtual users automatically
+# Creates first email account from configuration
 # =================================================================
 
 # Colors
@@ -358,7 +357,7 @@ else
 fi
 
 # ===================================================================
-# 5. CREATE FIRST EMAIL ACCOUNT
+# 5. CREATE FIRST EMAIL ACCOUNT (AUTOMATIC)
 # ===================================================================
 
 if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
@@ -429,7 +428,7 @@ ADDUSER
     fi
 else
     echo ""
-    echo "No initial email account specified"
+    echo "No initial email account configured"
     echo "You can add accounts later with: mail-account add user@$DOMAIN_NAME password"
 fi
 
