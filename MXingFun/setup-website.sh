@@ -2,8 +2,9 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.0
+# Version: 17.0.1
 # Creates compliance website automatically with all required pages
+# FIXED: Removed duplicate server block that prevents nginx from starting
 # =================================================================
 
 # Colors
@@ -852,7 +853,7 @@ chmod -R 755 "$WEB_ROOT"
 print_message "✓ Website files created"
 
 # ===================================================================
-# 4. CONFIGURE NGINX
+# 4. CONFIGURE NGINX - FIXED: NO DUPLICATE SERVER BLOCKS
 # ===================================================================
 
 print_header "Configuring Nginx"
@@ -869,9 +870,9 @@ fi
 # Remove default site if it exists
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null
 
-# Create Nginx server block
+# FIX: Create Nginx server block WITHOUT duplicate - SINGLE SERVER BLOCK FOR BOTH DOMAINS
 cat > /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
-# HTTP Server Block
+# HTTP Server Block - Handles both domain.com and www.domain.com
 server {
     listen 80;
     listen [::]:80;
