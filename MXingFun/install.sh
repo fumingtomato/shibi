@@ -871,7 +871,7 @@ if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     echo "DKIM Record (add to DNS if not using Cloudflare):"
     echo "  Name: mail._domainkey"
     echo "  Type: TXT"
-    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=/p=/' | sed 's/".*//' | tr -d '\n\t\r ' | sed 's/p=//')
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=//' | sed 's/".*//' | tr -d '\n\t\r ')
     echo "  Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
     echo ""
     echo "  Key length: ${#DKIM_KEY} characters (should be ~215 for 1024-bit)"
