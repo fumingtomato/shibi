@@ -669,8 +669,8 @@ fi
 
 # Verify key length
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    DKIM_PUB_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=//' | sed 's/".*//' | tr -d '\n\t\r ')
-    echo "DKIM public key length: ${#DKIM_PUB_KEY} characters (should be ~215 for 1024-bit)"
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=//' | sed 's/".*//' | tr -d '\n\t\r ')
+    echo "DKIM public key length: ${#DKIM_KEY} characters (should be ~215 for 1024-bit)"
 fi
 
 # Configure OpenDKIM properly
@@ -915,8 +915,8 @@ echo ""
 echo "DKIM KEY STATUS:"
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     echo "  ✓ 1024-bit key generated"
-    echo "  ✓ Public key length: ${#DKIM_PUB_KEY} characters"
-    if [ ${#DKIM_PUB_KEY} -gt 250 ]; then
+    echo "  ✓ Public key length: ${#DKIM_KEY} characters"
+if [ ${#DKIM_KEY} -gt 250 ]; then
         print_warning "  ⚠ WARNING: Key seems too long, may still be 2048-bit!"
     fi
 fi
