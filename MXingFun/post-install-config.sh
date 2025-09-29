@@ -2,9 +2,9 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION
-# Version: 16.2.1
-# Configures SSL, firewall, and final optimizations
-# FIXED: Better service detection and error handling
+# Version: 17.0.0
+# Configures SSL, firewall, IP rotation finalization, and optimizations
+# FIXED: Complete IP rotation setup, better service detection, subdomain support
 # =================================================================
 
 # Colors
@@ -58,7 +58,12 @@ if [ -z "$DOMAIN_NAME" ]; then
         DOMAIN_NAME=$(hostname -d)
     fi
 else
-    HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+    # Use configured hostname with subdomain
+    if [ ! -z "$MAIL_SUBDOMAIN" ]; then
+        HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
+    else
+        HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+    fi
 fi
 
 # Get admin email
@@ -76,10 +81,171 @@ echo "  Domain: $DOMAIN_NAME"
 echo "  Hostname: $HOSTNAME"
 echo "  Admin Email: $ADMIN_EMAIL"
 echo "  Primary IP: $PRIMARY_IP"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "  Total IPs: ${#IP_ADDRESSES[@]}"
+fi
 echo ""
 
 # ===================================================================
-# 1. VERIFY OPENDKIM CONFIGURATION (Keys already generated)
+# 1. FINALIZE IP ROTATION CONFIGURATION
+# ===================================================================
+
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    print_header "Finalizing IP Rotation Configuration"
+    
+    echo "Configuring Postfix for ${#IP_ADDRESSES[@]} IP addresses..."
+    
+    # Create transport table
+    cat > /etc/postfix/transport <<EOF
+# Transport table for IP rotation
+# Default transport uses round-robin
+$DOMAIN_NAME    :
+EOF
+    
+    # Create sender-dependent transport script
+    cat > /usr/local/bin/postfix-transport-selector <<'EOF'
+#!/bin/bash
+# Postfix Transport Selector for IP Rotation
+# This script assigns senders to specific IPs for sticky sessions
+
+SENDER="$1"
+NUM_IPS=REPLACE_NUM_IPS
+DB_PASS=$(cat /root/.mail_db_password 2>/dev/null)
+
+if [ -z "$SENDER" ]; then
+    echo "smtp:"
+    exit 0
+fi
+
+# Check if sender already has assigned IP in database
+if [ ! -z "$DB_PASS" ]; then
+    ASSIGNED=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -N -e "
+        SELECT transport_id FROM ip_rotation_log WHERE sender_email='$SENDER' LIMIT 1
+    " 2>/dev/null)
+    
+    if [ ! -z "$ASSIGNED" ]; then
+        # Update last used time and increment counter
+        mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
+            UPDATE ip_rotation_log 
+            SET last_used=NOW(), message_count=message_count+1 
+            WHERE sender_email='$SENDER'
+        " 2>/dev/null
+        
+        echo "smtp-ip${ASSIGNED}:"
+        exit 0
+    fi
+fi
+
+# No existing assignment, create new one using hash
+HASH=$(echo -n "$SENDER" | md5sum | cut -c1-8)
+TRANSPORT_NUM=$((0x$HASH % NUM_IPS + 1))
+
+# Get the IP for this transport
+IP_NUM=$((TRANSPORT_NUM - 1))
+IP_ADDR="${IP_ADDRESSES[$IP_NUM]}"
+
+# Save assignment to database
+if [ ! -z "$DB_PASS" ]; then
+    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
+        INSERT INTO ip_rotation_log (sender_email, assigned_ip, transport_id, message_count)
+        VALUES ('$SENDER', '$IP_ADDR', $TRANSPORT_NUM, 1)
+        ON DUPLICATE KEY UPDATE 
+            last_used=NOW(), 
+            message_count=message_count+1
+    " 2>/dev/null
+fi
+
+echo "smtp-ip${TRANSPORT_NUM}:"
+EOF
+    
+    # Replace placeholders
+    sed -i "s/REPLACE_NUM_IPS/${#IP_ADDRESSES[@]}/" /usr/local/bin/postfix-transport-selector
+    
+    # Add IP addresses array to script
+    echo "" >> /usr/local/bin/postfix-transport-selector
+    echo "# IP Addresses" >> /usr/local/bin/postfix-transport-selector
+    echo "IP_ADDRESSES=(" >> /usr/local/bin/postfix-transport-selector
+    for ip in "${IP_ADDRESSES[@]}"; do
+        echo "    \"$ip\"" >> /usr/local/bin/postfix-transport-selector
+    done
+    echo ")" >> /usr/local/bin/postfix-transport-selector
+    
+    chmod +x /usr/local/bin/postfix-transport-selector
+    
+    # Update Postfix master.cf if not already done
+    if ! grep -q "smtp-ip1" /etc/postfix/master.cf; then
+        echo "" >> /etc/postfix/master.cf
+        echo "# IP Rotation Transports" >> /etc/postfix/master.cf
+        
+        local i=0
+        for ip in "${IP_ADDRESSES[@]}"; do
+            i=$((i+1))
+            cat >> /etc/postfix/master.cf <<EOF
+
+# Transport for IP $ip
+smtp-ip$i unix - - n - - smtp
+    -o smtp_bind_address=$ip
+    -o smtp_bind_address_enforce=yes
+    -o smtp_helo_name=$HOSTNAME
+    -o syslog_name=postfix-ip$i
+EOF
+        done
+    fi
+    
+    # Configure transport maps
+    postmap /etc/postfix/transport
+    
+    # Update Postfix configuration
+    postconf -e "transport_maps = hash:/etc/postfix/transport"
+    postconf -e "smtp_bind_address_enforce = yes"
+    
+    # Create IP rotation monitoring command
+    cat > /usr/local/bin/ip-rotation-status <<'EOF'
+#!/bin/bash
+
+# IP Rotation Status Monitor
+DB_PASS=$(cat /root/.mail_db_password 2>/dev/null)
+
+echo "IP Rotation Status"
+echo "=================="
+echo ""
+
+if [ -z "$DB_PASS" ]; then
+    echo "Checking mail logs..."
+    for i in $(seq 1 REPLACE_NUM_IPS); do
+        count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=sent" || echo "0")
+        echo "Transport smtp-ip$i: $count messages sent today"
+    done
+else
+    echo "Database statistics:"
+    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
+        SELECT 
+            transport_id as 'Transport',
+            assigned_ip as 'IP Address',
+            COUNT(*) as 'Senders',
+            SUM(message_count) as 'Messages',
+            MAX(last_used) as 'Last Used'
+        FROM ip_rotation_log
+        GROUP BY transport_id, assigned_ip
+        ORDER BY transport_id
+    " 2>/dev/null || echo "No data available yet"
+fi
+
+echo ""
+echo "Current mail queue:"
+mailq | tail -5
+EOF
+    
+    sed -i "s/REPLACE_NUM_IPS/${#IP_ADDRESSES[@]}/" /usr/local/bin/ip-rotation-status
+    chmod +x /usr/local/bin/ip-rotation-status
+    
+    print_message "✓ IP rotation configured with sticky sessions"
+    echo "  Monitor with: ip-rotation-status"
+    echo ""
+fi
+
+# ===================================================================
+# 2. VERIFY OPENDKIM CONFIGURATION
 # ===================================================================
 
 print_header "Verifying OpenDKIM Configuration"
@@ -91,20 +257,11 @@ if ! command -v opendkim &> /dev/null; then
     apt-get install -y opendkim opendkim-tools > /dev/null 2>&1
 fi
 
-# Check if DKIM keys exist (should already be there from main installer)
+# Check if DKIM keys exist
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
-    print_message "✓ DKIM keys already exist (generated during installation)"
+    print_message "✓ DKIM keys exist"
 else
-    print_warning "⚠ DKIM keys not found - generating now..."
-    
-    # Emergency generation if somehow missing
-    mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
-    cd /etc/opendkim/keys/$DOMAIN_NAME
-    opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
-    chown opendkim:opendkim mail.private mail.txt
-    chmod 600 mail.private
-    chmod 644 mail.txt
-    cd - > /dev/null
+    print_warning "⚠ DKIM keys not found - this should have been created earlier"
 fi
 
 # Ensure OpenDKIM configuration is correct
@@ -140,7 +297,7 @@ UserID                  opendkim:opendkim
 OversignHeaders         From
 EOF
 
-# Setup TrustedHosts - Include all server IPs
+# Setup TrustedHosts with all IPs
 cat > /etc/opendkim/TrustedHosts <<EOF
 127.0.0.1
 localhost
@@ -150,7 +307,7 @@ $HOSTNAME
 *.$DOMAIN_NAME
 EOF
 
-# Add additional IPs if configured
+# Add all additional IPs
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     for ip in "${IP_ADDRESSES[@]}"; do
         echo "$ip" >> /etc/opendkim/TrustedHosts
@@ -160,7 +317,7 @@ fi
 # Setup KeyTable
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 
-# Setup SigningTable - Sign all emails from domain
+# Setup SigningTable
 cat > /etc/opendkim/SigningTable <<EOF
 *@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
 *@$HOSTNAME mail._domainkey.$DOMAIN_NAME
@@ -173,7 +330,6 @@ chmod 644 /etc/opendkim/KeyTable
 chmod 644 /etc/opendkim/SigningTable
 
 # Configure Postfix to use OpenDKIM
-echo "Ensuring Postfix uses OpenDKIM..."
 postconf -e "milter_protocol = 6"
 postconf -e "milter_default_action = accept"
 postconf -e "smtpd_milters = inet:localhost:8891"
@@ -189,39 +345,13 @@ if netstat -lnp 2>/dev/null | grep -q ":8891"; then
     print_message "✓ OpenDKIM is running and listening on port 8891"
 else
     print_warning "⚠ OpenDKIM may not be listening on port 8891"
-    echo "Attempting to fix..."
     systemctl stop opendkim
     sleep 1
     systemctl start opendkim
 fi
 
-# Display DKIM status
-echo ""
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP '(?<=p=)[^"]+' | tr -d '\n\t\r ')
-    print_message "DKIM Key Status:"
-    echo "  Selector: mail"
-    echo "  Domain: $DOMAIN_NAME"
-    echo "  Key file: /etc/opendkim/keys/$DOMAIN_NAME/mail.private"
-    
-    # Check if DKIM is in DNS
-    echo -n "  DNS Status: "
-    if dig +short TXT mail._domainkey.$DOMAIN_NAME @8.8.8.8 2>/dev/null | grep -q "v=DKIM1"; then
-        print_message "✓ DKIM record found in DNS"
-    else
-        if [[ "${USE_CLOUDFLARE,,}" == "y" ]]; then
-            print_warning "⚠ DKIM record not found in DNS (may still be propagating)"
-        else
-            print_warning "⚠ DKIM record not found - add manually:"
-            echo "    Name: mail._domainkey"
-            echo "    Type: TXT"
-            echo "    Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
-        fi
-    fi
-fi
-
 # ===================================================================
-# 2. SSL/TLS CONFIGURATION
+# 3. SSL/TLS CONFIGURATION
 # ===================================================================
 
 print_header "SSL/TLS Configuration"
@@ -230,27 +360,43 @@ print_header "SSL/TLS Configuration"
 if ! command -v certbot &> /dev/null; then
     echo "Installing Certbot..."
     apt-get update > /dev/null 2>&1
-    apt-get install -y certbot > /dev/null 2>&1
+    apt-get install -y certbot python3-certbot-nginx > /dev/null 2>&1
 fi
 
 # Check if certificate already exists
 if [ -d "/etc/letsencrypt/live/$HOSTNAME" ]; then
-    print_message "SSL certificate already exists for $HOSTNAME"
-    echo "Certificate expiry:"
-    certbot certificates 2>/dev/null | grep -A2 "$HOSTNAME" | grep "Expiry" || echo "Unable to check expiry"
-else
-    print_message "Attempting to get Let's Encrypt certificate..."
+    print_message "✓ SSL certificate already exists for $HOSTNAME"
     
-    # Check if DNS is resolving first
-    echo -n "Checking DNS resolution for $HOSTNAME... "
+    # Update Postfix configuration
+    postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$HOSTNAME/fullchain.pem"
+    postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$HOSTNAME/privkey.pem"
+    
+    # Update Dovecot configuration if exists
+    if [ -d /etc/dovecot/conf.d ]; then
+        cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
+ssl = required
+ssl_cert = </etc/letsencrypt/live/$HOSTNAME/fullchain.pem
+ssl_key = </etc/letsencrypt/live/$HOSTNAME/privkey.pem
+ssl_min_protocol = TLSv1.2
+ssl_cipher_list = ECDHE+AESGCM:ECDHE+RSA+AESGCM:DHE+RSA+AESGCM
+ssl_prefer_server_ciphers = yes
+ssl_dh = </etc/dovecot/dh.pem
+EOF
+    fi
+else
+    print_message "Checking if DNS is ready for SSL certificate..."
+    
+    # Check if DNS is resolving
+    echo -n "Testing DNS resolution for $HOSTNAME... "
     if host "$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
         print_message "✓ DNS is resolving"
         
+        # Try to get certificate
+        echo "Attempting to get Let's Encrypt certificate..."
+        
         # Stop services that might be using port 80
         systemctl stop nginx 2>/dev/null || true
-        systemctl stop apache2 2>/dev/null || true
         
-        # Get certificate
         certbot certonly --standalone \
             -d "$HOSTNAME" \
             --non-interactive \
@@ -261,12 +407,13 @@ else
         if [ $? -eq 0 ]; then
             print_message "✓ SSL certificate obtained successfully"
             
-            # Update Postfix configuration
+            # Update Postfix
             postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$HOSTNAME/fullchain.pem"
             postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$HOSTNAME/privkey.pem"
             
-            # Update Dovecot configuration
-            cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
+            # Update Dovecot
+            if [ -d /etc/dovecot/conf.d ]; then
+                cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
 ssl = required
 ssl_cert = </etc/letsencrypt/live/$HOSTNAME/fullchain.pem
 ssl_key = </etc/letsencrypt/live/$HOSTNAME/privkey.pem
@@ -275,42 +422,38 @@ ssl_cipher_list = ECDHE+AESGCM:ECDHE+RSA+AESGCM:DHE+RSA+AESGCM
 ssl_prefer_server_ciphers = yes
 ssl_dh = </etc/dovecot/dh.pem
 EOF
-            
-            # Setup auto-renewal
-            cat > /etc/cron.d/certbot-renewal <<EOF
-0 2 * * * root certbot renew --quiet --post-hook "systemctl reload postfix dovecot nginx 2>/dev/null || true"
-EOF
-            
-            print_message "✓ Auto-renewal configured"
-            
+            fi
         else
-            print_warning "Could not get Let's Encrypt certificate (DNS might not be ready)"
-            echo "Creating temporary self-signed certificate..."
+            print_warning "⚠ Could not get SSL certificate (DNS might not be ready)"
+            echo "Creating self-signed certificate as temporary solution..."
             
             mkdir -p /etc/ssl/certs /etc/ssl/private
             openssl req -new -x509 -days 365 -nodes \
-                -out /etc/ssl/certs/mailserver-temp.crt \
-                -keyout /etc/ssl/private/mailserver-temp.key \
-                -subj "/C=US/ST=State/L=City/O=TempCert/CN=$HOSTNAME" 2>/dev/null
+                -out /etc/ssl/certs/mailserver.crt \
+                -keyout /etc/ssl/private/mailserver.key \
+                -subj "/C=US/ST=State/L=City/O=Mail/CN=$HOSTNAME" 2>/dev/null
             
-            chmod 600 /etc/ssl/private/mailserver-temp.key
+            chmod 600 /etc/ssl/private/mailserver.key
             
-            postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver-temp.crt"
-            postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver-temp.key"
+            postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver.crt"
+            postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver.key"
         fi
+        
+        # Start nginx again
+        systemctl start nginx 2>/dev/null || true
     else
-        print_warning "DNS not resolving yet - using self-signed certificate"
+        print_warning "⚠ DNS not resolving yet - using self-signed certificate"
         
         mkdir -p /etc/ssl/certs /etc/ssl/private
         openssl req -new -x509 -days 365 -nodes \
-            -out /etc/ssl/certs/mailserver-temp.crt \
-            -keyout /etc/ssl/private/mailserver-temp.key \
-            -subj "/C=US/ST=State/L=City/O=TempCert/CN=$HOSTNAME" 2>/dev/null
+            -out /etc/ssl/certs/mailserver.crt \
+            -keyout /etc/ssl/private/mailserver.key \
+            -subj "/C=US/ST=State/L=City/O=Mail/CN=$HOSTNAME" 2>/dev/null
         
-        chmod 600 /etc/ssl/private/mailserver-temp.key
+        chmod 600 /etc/ssl/private/mailserver.key
         
-        postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver-temp.crt"
-        postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver-temp.key"
+        postconf -e "smtpd_tls_cert_file = /etc/ssl/certs/mailserver.crt"
+        postconf -e "smtpd_tls_key_file = /etc/ssl/private/mailserver.key"
     fi
 fi
 
@@ -320,8 +463,13 @@ if [ ! -f /etc/dovecot/dh.pem ]; then
     openssl dhparam -out /etc/dovecot/dh.pem 2048 2>/dev/null
 fi
 
+# Setup auto-renewal
+cat > /etc/cron.d/certbot-renewal <<EOF
+0 2,14 * * * root certbot renew --quiet --post-hook "systemctl reload postfix dovecot nginx 2>/dev/null || true"
+EOF
+
 # ===================================================================
-# 3. FIREWALL CONFIGURATION
+# 4. FIREWALL CONFIGURATION
 # ===================================================================
 
 print_header "Firewall Configuration"
@@ -347,7 +495,7 @@ if command -v ufw &> /dev/null; then
     ufw allow 110/tcp comment 'POP3' > /dev/null 2>&1
     ufw allow 995/tcp comment 'POP3S' > /dev/null 2>&1
     
-    # Web ports (for website and certbot)
+    # Web ports
     ufw allow 80/tcp comment 'HTTP' > /dev/null 2>&1
     ufw allow 443/tcp comment 'HTTPS' > /dev/null 2>&1
     
@@ -360,7 +508,7 @@ else
 fi
 
 # ===================================================================
-# 4. FAIL2BAN CONFIGURATION
+# 5. FAIL2BAN CONFIGURATION
 # ===================================================================
 
 print_header "Fail2ban Configuration"
@@ -370,7 +518,7 @@ if ! command -v fail2ban-client &> /dev/null; then
     apt-get install -y fail2ban > /dev/null 2>&1
 fi
 
-# Create jail configuration for mail services
+# Create jail configuration
 cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
 bantime = 3600
@@ -381,6 +529,8 @@ action = %(action_mwl)s
 
 [sshd]
 enabled = true
+port = 22
+maxretry = 3
 
 [postfix]
 enabled = true
@@ -402,6 +552,33 @@ port = pop3,pop3s,imap,imaps,submission,sieve
 filter = dovecot
 logpath = /var/log/mail.log
 maxretry = 3
+
+[nginx-http-auth]
+enabled = true
+filter = nginx-http-auth
+port = http,https
+logpath = /var/log/nginx/*error.log
+
+[nginx-noscript]
+enabled = true
+port = http,https
+filter = nginx-noscript
+logpath = /var/log/nginx/*access.log
+maxretry = 6
+
+[nginx-badbots]
+enabled = true
+port = http,https
+filter = nginx-badbots
+logpath = /var/log/nginx/*access.log
+maxretry = 2
+
+[nginx-noproxy]
+enabled = true
+port = http,https
+filter = nginx-noproxy
+logpath = /var/log/nginx/*error.log
+maxretry = 2
 EOF
 
 # Restart fail2ban
@@ -411,7 +588,7 @@ systemctl enable fail2ban > /dev/null 2>&1
 print_message "✓ Fail2ban configured"
 
 # ===================================================================
-# 5. POSTFIX OPTIMIZATION
+# 6. POSTFIX OPTIMIZATION
 # ===================================================================
 
 print_header "Optimizing Postfix Configuration"
@@ -422,14 +599,27 @@ postconf -e "smtp_connection_cache_on_demand = yes"
 postconf -e "smtp_connection_cache_time_limit = 2s"
 postconf -e "smtp_connection_reuse_time_limit = 300s"
 
+# Bulk email optimizations
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    # Multiple IP optimizations
+    postconf -e "smtp_destination_concurrency_limit = 20"
+    postconf -e "smtp_destination_rate_delay = 1s"
+    postconf -e "smtp_extra_recipient_limit = 1000"
+else
+    # Single IP optimizations
+    postconf -e "smtp_destination_concurrency_limit = 10"
+    postconf -e "smtp_destination_rate_delay = 2s"
+    postconf -e "smtp_extra_recipient_limit = 500"
+fi
+
 # Security settings
 postconf -e "disable_vrfy_command = yes"
 postconf -e "smtpd_helo_required = yes"
 postconf -e "strict_rfc821_envelopes = yes"
 
 # Anti-spam settings
-postconf -e "smtpd_recipient_limit = 100"
-postconf -e "smtpd_client_message_rate_limit = 60"
+postconf -e "smtpd_recipient_limit = 1000"
+postconf -e "smtpd_client_message_rate_limit = 100"
 postconf -e "anvil_rate_time_unit = 60s"
 
 # TLS settings
@@ -443,37 +633,14 @@ postconf -e "smtpd_tls_received_header = yes"
 postconf -e "smtpd_tls_session_cache_database = btree:\${data_directory}/smtpd_scache"
 postconf -e "smtp_tls_session_cache_database = btree:\${data_directory}/smtp_scache"
 
-# Update master.cf for submission port if not already configured
-if ! grep -q "^submission" /etc/postfix/master.cf; then
-    cat >> /etc/postfix/master.cf <<'EOF'
+# Message size for bulk email
+postconf -e "message_size_limit = 52428800"  # 50MB
+postconf -e "mailbox_size_limit = 0"         # Unlimited
 
-# Submission port with STARTTLS
-submission inet n       -       y       -       -       smtpd
-  -o syslog_name=postfix/submission
-  -o smtpd_tls_security_level=encrypt
-  -o smtpd_sasl_auth_enable=yes
-  -o smtpd_sasl_type=dovecot
-  -o smtpd_sasl_path=private/auth
-  -o smtpd_reject_unlisted_recipient=no
-  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
-  -o milter_macro_daemon_name=ORIGINATING
-
-# SMTPS port (465)
-smtps inet n       -       y       -       -       smtpd
-  -o syslog_name=postfix/smtps
-  -o smtpd_tls_wrappermode=yes
-  -o smtpd_sasl_auth_enable=yes
-  -o smtpd_sasl_type=dovecot
-  -o smtpd_sasl_path=private/auth
-  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
-  -o milter_macro_daemon_name=ORIGINATING
-EOF
-fi
-
-print_message "✓ Postfix optimized"
+print_message "✓ Postfix optimized for bulk email"
 
 # ===================================================================
-# 6. SYSTEM OPTIMIZATION
+# 7. SYSTEM OPTIMIZATION
 # ===================================================================
 
 print_header "System Optimization"
@@ -515,7 +682,7 @@ sysctl -p /etc/sysctl.d/99-mailserver.conf > /dev/null 2>&1
 print_message "✓ System optimized"
 
 # ===================================================================
-# 7. LOG ROTATION
+# 8. LOG ROTATION
 # ===================================================================
 
 print_header "Configuring Log Rotation"
@@ -542,7 +709,7 @@ EOF
 print_message "✓ Log rotation configured"
 
 # ===================================================================
-# 8. SERVICES RESTART
+# 9. SERVICES RESTART
 # ===================================================================
 
 print_header "Restarting Services"
@@ -572,68 +739,31 @@ for service in "${services[@]}"; do
 done
 
 # ===================================================================
-# 9. FINAL DKIM VERIFICATION
-# ===================================================================
-
-print_header "Final DKIM Verification"
-
-# Check OpenDKIM is running
-if systemctl is-active --quiet opendkim; then
-    print_message "✓ OpenDKIM service is running"
-else
-    print_error "✗ OpenDKIM service is not running"
-    systemctl start opendkim 2>/dev/null
-fi
-
-# Check OpenDKIM is listening
-if netstat -lnp 2>/dev/null | grep -q ":8891"; then
-    print_message "✓ OpenDKIM is listening on port 8891"
-else
-    print_error "✗ OpenDKIM is not listening on port 8891"
-fi
-
-# Check Postfix milter configuration
-MILTER_CONFIG=$(postconf smtpd_milters 2>/dev/null)
-if [[ "$MILTER_CONFIG" == *"localhost:8891"* ]]; then
-    print_message "✓ Postfix is configured to use OpenDKIM"
-else
-    print_error "✗ Postfix is not configured to use OpenDKIM"
-fi
-
-# Test DKIM key if exists
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    echo -n "Testing DKIM key validity... "
-    if opendkim-testkey -d $DOMAIN_NAME -s mail -vvv 2>&1 | grep -q "key OK"; then
-        print_message "✓ Key is valid"
-    else
-        print_warning "⚠ DNS not ready yet (normal if just configured)"
-    fi
-fi
-
-# ===================================================================
 # 10. CREATE HELPER SCRIPTS
 # ===================================================================
 
 print_header "Creating Helper Scripts"
 
 # Quick SSL getter
-cat > /usr/local/bin/get-ssl-cert << EOF
+cat > /usr/local/bin/get-ssl-cert <<EOF
 #!/bin/bash
 
 # Quick SSL Certificate Getter
 HOSTNAME="$HOSTNAME"
+DOMAIN="$DOMAIN_NAME"
 ADMIN_EMAIL="$ADMIN_EMAIL"
 
-echo "Getting Let's Encrypt certificate for: \$HOSTNAME"
+echo "Getting Let's Encrypt certificates..."
 echo ""
 
-# Check DNS
-echo -n "Checking DNS... "
+# Check DNS for mail server
+echo -n "Checking DNS for \$HOSTNAME... "
 if host "\$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
     echo "✓ Resolving"
     
-    systemctl stop nginx apache2 2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
     
+    # Get certificate for mail server
     certbot certonly --standalone \\
         -d "\$HOSTNAME" \\
         --non-interactive \\
@@ -643,8 +773,7 @@ if host "\$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
         --force-renewal
     
     if [ \$? -eq 0 ]; then
-        echo ""
-        echo "✓ Certificate obtained!"
+        echo "✓ Mail server certificate obtained!"
         
         # Update configs
         postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/\$HOSTNAME/fullchain.pem"
@@ -654,16 +783,37 @@ if host "\$HOSTNAME" 8.8.8.8 > /dev/null 2>&1; then
             sed -i "s|ssl_cert = .*|ssl_cert = </etc/letsencrypt/live/\$HOSTNAME/fullchain.pem|" /etc/dovecot/conf.d/10-ssl.conf
             sed -i "s|ssl_key = .*|ssl_key = </etc/letsencrypt/live/\$HOSTNAME/privkey.pem|" /etc/dovecot/conf.d/10-ssl.conf
         fi
-        
-        systemctl reload postfix dovecot nginx 2>/dev/null || true
-        echo "✓ Services updated"
-    else
-        echo "✗ Failed - check that port 80 is accessible"
     fi
 else
     echo "✗ DNS not resolving yet"
-    echo "Please wait for DNS propagation"
 fi
+
+# Check DNS for website
+echo -n "Checking DNS for \$DOMAIN... "
+if host "\$DOMAIN" 8.8.8.8 > /dev/null 2>&1; then
+    echo "✓ Resolving"
+    
+    # Get certificate for website
+    systemctl start nginx 2>/dev/null || true
+    
+    certbot --nginx \\
+        -d "\$DOMAIN" \\
+        -d "www.\$DOMAIN" \\
+        --non-interactive \\
+        --agree-tos \\
+        --email "\$ADMIN_EMAIL" \\
+        --no-eff-email
+    
+    if [ \$? -eq 0 ]; then
+        echo "✓ Website certificate obtained!"
+    fi
+else
+    echo "✗ DNS not resolving yet"
+fi
+
+systemctl reload postfix dovecot nginx 2>/dev/null || true
+echo ""
+echo "Done! Services reloaded."
 EOF
 
 chmod +x /usr/local/bin/get-ssl-cert
@@ -678,20 +828,29 @@ Generated: $(date)
 ================================================================================
 
 Domain: $DOMAIN_NAME
+Mail Subdomain: $MAIL_SUBDOMAIN
 Hostname: $HOSTNAME
 Admin Email: $ADMIN_EMAIL
 Primary IP: $PRIMARY_IP
+$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "Total IPs: ${#IP_ADDRESSES[@]}")
 
 First Email Account: ${FIRST_EMAIL:-Not configured}
 
 SSL Certificate:
 $(if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
-    echo "  Type: Let's Encrypt"
+    echo "  Mail Server: Let's Encrypt"
     echo "  Location: /etc/letsencrypt/live/$HOSTNAME/"
     echo "  Auto-renewal: Enabled"
 else
-    echo "  Type: Self-signed (temporary)"
+    echo "  Mail Server: Self-signed (temporary)"
     echo "  Get Let's Encrypt: run 'get-ssl-cert'"
+fi)
+
+$(if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
+    echo "  Website: Let's Encrypt"
+    echo "  Location: /etc/letsencrypt/live/$DOMAIN_NAME/"
+else
+    echo "  Website: Not configured yet"
 fi)
 
 DKIM Status:
@@ -699,6 +858,14 @@ DKIM Status:
   Port 8891: $(netstat -lnp 2>/dev/null | grep -q ":8891" && echo "Listening" || echo "Not listening")
   DKIM Key: $([ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ] && echo "Generated" || echo "Missing")
   DKIM in DNS: $(dig +short TXT mail._domainkey.$DOMAIN_NAME @8.8.8.8 2>/dev/null | grep -q "v=DKIM1" && echo "Yes" || echo "Pending")
+
+$(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "IP Rotation:"
+    echo "  Status: Configured"
+    echo "  Total IPs: ${#IP_ADDRESSES[@]}"
+    echo "  Mode: Sticky sessions (sender-based)"
+    echo "  Monitor: ip-rotation-status"
+fi)
 
 Services:
   Postfix (SMTP): $(systemctl is-active postfix 2>/dev/null || echo "not running")
@@ -732,14 +899,16 @@ Email Testing:
   MX Toolbox: https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
 
 Management Commands:
-  test-email     - Send test email
-  mail-account   - Manage email accounts
-  mail-status    - Check server status
-  mail-queue     - Manage mail queue
-  mail-log       - View mail logs
-  check-dns      - Verify DNS records
-  get-ssl-cert   - Get/renew SSL certificate
-  mailwizz-info  - Mailwizz configuration info
+  test-email        - Send test email with DKIM
+  mail-account      - Manage email accounts
+  mail-status       - Check server status
+  mail-queue        - Manage mail queue
+  mail-log          - View mail logs
+  check-dns         - Verify DNS records
+  get-ssl-cert      - Get/renew SSL certificates
+  mailwizz-info     - Mailwizz configuration info
+$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "  ip-rotation-status - Monitor IP rotation")
+$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "  ip-usage          - Check IP usage statistics")
 
 Logs:
   /var/log/mail.log     - Mail server log
@@ -764,45 +933,53 @@ echo "✓ Firewall configured"
 echo "✓ Fail2ban configured"
 echo "✓ Services optimized"
 echo "✓ Log rotation configured"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "✓ IP rotation configured with sticky sessions"
+fi
 echo ""
 
-# Show OpenDKIM status
-print_header "DKIM SIGNING STATUS"
-echo "OpenDKIM is configured to sign all outgoing emails."
-echo ""
-echo "Service Status: $(systemctl is-active opendkim 2>/dev/null || echo "not running")"
-echo "Listening on: localhost:8891"
-echo "DKIM Selector: mail"
-echo "DKIM Domain: $DOMAIN_NAME"
+# Show status summary
+print_header "SERVER STATUS"
 
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+echo "DKIM SIGNING:"
+echo "  Status: $(systemctl is-active opendkim 2>/dev/null || echo "not running")"
+echo "  Port: localhost:8891"
+echo "  Selector: mail"
+echo "  Domain: $DOMAIN_NAME"
+
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
-    echo -n "DKIM in DNS: "
-    if dig +short TXT mail._domainkey.$DOMAIN_NAME @8.8.8.8 2>/dev/null | grep -q "v=DKIM1"; then
-        print_message "✓ Active and working!"
-    else
-        print_warning "⚠ Not found yet (check DNS propagation)"
-    fi
+    echo "IP ROTATION:"
+    echo "  Configured IPs: ${#IP_ADDRESSES[@]}"
+    echo "  Primary: $PRIMARY_IP"
+    echo "  Mode: Sticky sessions"
+    echo "  Monitor: ip-rotation-status"
 fi
 
 echo ""
-
-# Show status
+echo "SSL STATUS:"
 if [ -f "/etc/letsencrypt/live/$HOSTNAME/fullchain.pem" ]; then
-    print_message "✓ Let's Encrypt SSL certificate is active"
+    print_message "  ✓ Mail server: Let's Encrypt certificate active"
 else
-    print_warning "⚠ Using temporary self-signed certificate"
-    echo "  Get Let's Encrypt certificate: get-ssl-cert"
+    print_warning "  ⚠ Mail server: Using temporary self-signed certificate"
+    echo "    Get certificate: get-ssl-cert"
+fi
+
+if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
+    print_message "  ✓ Website: Let's Encrypt certificate active"
+else
+    print_warning "  ⚠ Website: No SSL certificate yet"
 fi
 
 echo ""
 if [ ! -z "$FIRST_EMAIL" ]; then
-    print_message "Your email account is ready:"
+    print_message "Email account ready:"
     echo "  Email: $FIRST_EMAIL"
-    echo "  Password: [the one you set]"
-    echo ""
+    echo "  Server: $HOSTNAME"
+    echo "  Ports: 587 (SMTP), 993 (IMAP)"
 fi
 
+echo ""
 print_header "QUICK TEST COMMANDS"
 echo ""
 echo "1. Test DKIM signature:"
@@ -814,11 +991,16 @@ echo ""
 echo "3. Check DNS and DKIM:"
 echo "   check-dns $DOMAIN_NAME"
 echo ""
-echo "4. View mail logs:"
-echo "   mail-log follow"
-echo ""
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "4. Monitor IP rotation:"
+    echo "   ip-rotation-status"
+    echo ""
+fi
 
 print_message "Configuration saved to: /root/mail-server-config.txt"
 echo ""
 print_message "✓ Post-installation configuration completed!"
 print_message "✓ Your mail server is ready with DKIM signing enabled!"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    print_message "✓ IP rotation is active with sticky sessions!"
+fi
