@@ -2,7 +2,7 @@
 
 # =================================================================
 # DATABASE SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.1 - FIXED heredoc warning
+# Version: 17.0.4 - FIXED with 1024-bit DKIM key generation
 # Sets up MySQL/MariaDB with virtual users automatically
 # Creates first email account from configuration
 # =================================================================
@@ -270,7 +270,7 @@ EOF
     fi
 fi
 
-# FIX: Properly terminated heredoc for table creation
+# Create tables with properly terminated heredoc
 mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'EOF_SQLTABLES' 2>/dev/null || \
 mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'EOF_SQLTABLES' 2>/dev/null || true
 -- Create domains table
@@ -627,14 +627,55 @@ chown root:root /etc/dovecot/dovecot-sql.conf.ext
 print_message "✓ Dovecot configured"
 
 # ===================================================================
-# 8. FIX OPENDKIM FOR ACTUAL SIGNING (CRITICAL)
+# 8. REGENERATE DKIM KEY AS 1024-BIT (CRITICAL)
 # ===================================================================
 
-print_header "Fixing OpenDKIM Configuration for SIGNING"
+print_header "Ensuring 1024-bit DKIM Key"
 
-# Ensure OpenDKIM is properly configured to SIGN emails
+# Check if DKIM key exists and its size
+DKIM_KEY_FILE="/etc/opendkim/keys/$DOMAIN_NAME/mail.private"
+if [ -f "$DKIM_KEY_FILE" ]; then
+    # Check key size
+    KEY_BITS=$(openssl rsa -in "$DKIM_KEY_FILE" -text -noout 2>/dev/null | grep "Private-Key:" | grep -oP '\d+' || echo "0")
+    
+    if [ "$KEY_BITS" -ne 1024 ]; then
+        print_warning "⚠ Existing DKIM key is $KEY_BITS-bit, regenerating as 1024-bit..."
+        
+        # Backup old key
+        mv "$DKIM_KEY_FILE" "${DKIM_KEY_FILE}.backup.$(date +%s)"
+        mv "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt.backup.$(date +%s)"
+        
+        # Generate new 1024-bit key
+        cd /etc/opendkim/keys/$DOMAIN_NAME
+        opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024
+        chown opendkim:opendkim mail.private mail.txt
+        chmod 600 mail.private
+        chmod 644 mail.txt
+        
+        print_message "✓ Generated new 1024-bit DKIM key"
+    else
+        print_message "✓ DKIM key is already 1024-bit"
+    fi
+else
+    print_message "Generating new 1024-bit DKIM key..."
+    mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
+    cd /etc/opendkim/keys/$DOMAIN_NAME
+    opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024
+    chown -R opendkim:opendkim /etc/opendkim
+    chmod 600 mail.private
+    chmod 644 mail.txt
+    print_message "✓ Generated 1024-bit DKIM key"
+fi
+
+# Verify key length
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    DKIM_PUB_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=//' | sed 's/".*//' | tr -d '\n\t\r ')
+    echo "DKIM public key length: ${#DKIM_PUB_KEY} characters (should be ~215 for 1024-bit)"
+fi
+
+# Configure OpenDKIM properly
 cat > /etc/opendkim.conf <<'OPENDKIM_CONFIG'
-# OpenDKIM Configuration - FIXED TO ACTUALLY SIGN EMAILS
+# OpenDKIM Configuration - WITH SIGNING ENABLED
 AutoRestart             Yes
 AutoRestartRate         10/1h
 UMask                   002
@@ -718,7 +759,7 @@ chown opendkim:opendkim /var/run/opendkim
 systemctl restart opendkim
 sleep 2
 
-print_message "✓ OpenDKIM configured for SIGNING"
+print_message "✓ OpenDKIM configured for SIGNING with 1024-bit key"
 
 # ===================================================================
 # 9. CREATE DATABASE MANAGEMENT SCRIPT
@@ -864,12 +905,21 @@ echo ""
 echo "✓ Database created: mailserver"
 echo "✓ Database user: mailuser"
 echo "✓ Password saved in: /root/.mail_db_password"
-echo "✓ OpenDKIM configured for SIGNING"
+echo "✓ OpenDKIM configured for SIGNING with 1024-bit key"
 if [ ! -z "$FIRST_EMAIL" ]; then
     echo "✓ First account: $FIRST_EMAIL"
 fi
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "✓ IP rotation tracking table created"
+fi
+echo ""
+echo "DKIM KEY STATUS:"
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    echo "  ✓ 1024-bit key generated"
+    echo "  ✓ Public key length: ${#DKIM_PUB_KEY} characters"
+    if [ ${#DKIM_PUB_KEY} -gt 250 ]; then
+        print_warning "  ⚠ WARNING: Key seems too long, may still be 2048-bit!"
+    fi
 fi
 echo ""
 echo "Database management commands:"
@@ -895,4 +945,4 @@ if [ ! -z "$FIRST_EMAIL" ]; then
     echo "  Ports: 587 (SMTP), 993 (IMAP)"
 fi
 
-print_message "✓ Database setup completed successfully with DKIM SIGNING ENABLED!"
+print_message "✓ Database setup completed with 1024-bit DKIM key!"
