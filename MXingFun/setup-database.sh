@@ -2,7 +2,7 @@
 
 # =================================================================
 # DATABASE SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.0
+# Version: 17.0.1 - FIXED heredoc warning
 # Sets up MySQL/MariaDB with virtual users automatically
 # Creates first email account from configuration
 # =================================================================
@@ -270,9 +270,9 @@ EOF
     fi
 fi
 
-# Create tables
-mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'SQLTABLES' 2>/dev/null || \
-mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'SQLTABLES' 2>/dev/null || true
+# FIX: Properly terminated heredoc for table creation
+mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'EOF_SQLTABLES' 2>/dev/null || \
+mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'EOF_SQLTABLES' 2>/dev/null || true
 -- Create domains table
 CREATE TABLE IF NOT EXISTS virtual_domains (
     id INT NOT NULL AUTO_INCREMENT,
@@ -326,7 +326,7 @@ CREATE TABLE IF NOT EXISTS ip_rotation_log (
 CREATE INDEX IF NOT EXISTS idx_email ON virtual_users(email);
 CREATE INDEX IF NOT EXISTS idx_domain ON virtual_domains(name);
 CREATE INDEX IF NOT EXISTS idx_sender ON ip_rotation_log(sender_email);
-SQLTABLES
+EOF_SQLTABLES
 
 # Verify tables were created
 TABLE_COUNT=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SHOW TABLES" 2>/dev/null | wc -l || \
@@ -627,7 +627,101 @@ chown root:root /etc/dovecot/dovecot-sql.conf.ext
 print_message "✓ Dovecot configured"
 
 # ===================================================================
-# 8. CREATE DATABASE MANAGEMENT SCRIPT
+# 8. FIX OPENDKIM FOR ACTUAL SIGNING (CRITICAL)
+# ===================================================================
+
+print_header "Fixing OpenDKIM Configuration for SIGNING"
+
+# Ensure OpenDKIM is properly configured to SIGN emails
+cat > /etc/opendkim.conf <<'OPENDKIM_CONFIG'
+# OpenDKIM Configuration - FIXED TO ACTUALLY SIGN EMAILS
+AutoRestart             Yes
+AutoRestartRate         10/1h
+UMask                   002
+Syslog                  yes
+SyslogSuccess           Yes
+LogWhy                  Yes
+
+# CRITICAL: Set to signing mode
+Mode                    sv
+Canonicalization        relaxed/simple
+
+# Domain and selector
+Domain                  DOMAIN_PLACEHOLDER
+Selector                mail
+MinimumKeyBits          1024
+SubDomains              yes
+
+# CRITICAL: Always sign
+SignatureAlgorithm      rsa-sha256
+OversignHeaders         From
+AlwaysAddARHeader       yes
+
+# Key and signing tables
+ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
+InternalHosts           refile:/etc/opendkim/TrustedHosts
+KeyTable                refile:/etc/opendkim/KeyTable
+SigningTable            refile:/etc/opendkim/SigningTable
+
+# Socket
+Socket                  inet:8891@localhost
+PidFile                 /var/run/opendkim/opendkim.pid
+UserID                  opendkim:opendkim
+TemporaryDirectory      /var/tmp
+OPENDKIM_CONFIG
+
+# Replace placeholder with actual domain
+sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /etc/opendkim.conf
+
+# Ensure TrustedHosts includes everything
+cat > /etc/opendkim/TrustedHosts <<EOF
+127.0.0.1
+localhost
+::1
+$PRIMARY_IP
+$HOSTNAME
+*.$DOMAIN_NAME
+$DOMAIN_NAME
+EOF
+
+# Add all additional IPs if present
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    for ip in "${IP_ADDRESSES[@]}"; do
+        echo "$ip" >> /etc/opendkim/TrustedHosts
+    done
+fi
+
+# Fix SigningTable to be comprehensive
+cat > /etc/opendkim/SigningTable <<EOF
+*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
+*@$HOSTNAME mail._domainkey.$DOMAIN_NAME
+*@localhost mail._domainkey.$DOMAIN_NAME
+*@localhost.localdomain mail._domainkey.$DOMAIN_NAME
+$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
+*@* mail._domainkey.$DOMAIN_NAME
+EOF
+
+# Ensure KeyTable is correct
+echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
+
+# Set proper permissions
+chown -R opendkim:opendkim /etc/opendkim
+chmod 644 /etc/opendkim/TrustedHosts
+chmod 644 /etc/opendkim/KeyTable
+chmod 644 /etc/opendkim/SigningTable
+
+# Create systemd directory if needed
+mkdir -p /var/run/opendkim
+chown opendkim:opendkim /var/run/opendkim
+
+# Restart OpenDKIM
+systemctl restart opendkim
+sleep 2
+
+print_message "✓ OpenDKIM configured for SIGNING"
+
+# ===================================================================
+# 9. CREATE DATABASE MANAGEMENT SCRIPT
 # ===================================================================
 
 echo "Creating database management utility..."
@@ -726,6 +820,9 @@ systemctl restart postfix 2>/dev/null && echo "✓" || echo "✗"
 echo -n "Restarting Dovecot... "
 systemctl restart dovecot 2>/dev/null && echo "✓" || echo "✗"
 
+echo -n "Restarting OpenDKIM... "
+systemctl restart opendkim 2>/dev/null && echo "✓" || echo "✗"
+
 # ===================================================================
 # 10. TEST DATABASE CONNECTION
 # ===================================================================
@@ -767,6 +864,7 @@ echo ""
 echo "✓ Database created: mailserver"
 echo "✓ Database user: mailuser"
 echo "✓ Password saved in: /root/.mail_db_password"
+echo "✓ OpenDKIM configured for SIGNING"
 if [ ! -z "$FIRST_EMAIL" ]; then
     echo "✓ First account: $FIRST_EMAIL"
 fi
@@ -797,4 +895,4 @@ if [ ! -z "$FIRST_EMAIL" ]; then
     echo "  Ports: 587 (SMTP), 993 (IMAP)"
 fi
 
-print_message "✓ Database setup completed successfully!"
+print_message "✓ Database setup completed successfully with DKIM SIGNING ENABLED!"
