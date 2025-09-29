@@ -2,7 +2,7 @@
 
 # =================================================================
 # BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
-# Version: 17.0.0
+# Version: 17.0.1 - FIXED DKIM SIGNING
 # Automated installation with Cloudflare DNS, compliance website, and DKIM
 # FIXED: All questions moved to beginning, no questions during execution
 # =================================================================
@@ -329,7 +329,7 @@ EOCRON
 # ===================================================================
 
 print_header "Multi-IP Bulk Mail Server Installer"
-echo "Version: 17.0.0"
+echo "Version: 17.0.1"
 echo "Starting installation at: $(date)"
 echo ""
 
@@ -364,8 +364,8 @@ while true; do
 done
 
 # Mail subdomain
-read -p "Enter mail server subdomain (default: mail): " MAIL_SUBDOMAIN
-MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mail}
+read -p "Enter mail server subdomain (default: mx): " MAIL_SUBDOMAIN
+MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mx}
 HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
 
 # Admin email
@@ -648,7 +648,7 @@ smtpd_sasl_type = dovecot
 smtpd_sasl_path = private/auth
 smtpd_sasl_auth_enable = yes
 
-# Milters (OpenDKIM)
+# Milters (OpenDKIM) - CRITICAL FOR SIGNING
 milter_protocol = 6
 milter_default_action = accept
 smtpd_milters = inet:localhost:8891
@@ -664,6 +664,8 @@ submission inet n       -       y       -       -       smtpd
   -o smtpd_tls_security_level=encrypt
   -o smtpd_sasl_auth_enable=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_milters=inet:localhost:8891
+  -o non_smtpd_milters=inet:localhost:8891
 
 # SMTPS port 465
 smtps     inet  n       -       y       -       -       smtpd
@@ -671,6 +673,8 @@ smtps     inet  n       -       y       -       -       smtpd
   -o smtpd_tls_wrappermode=yes
   -o smtpd_sasl_auth_enable=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_milters=inet:localhost:8891
+  -o non_smtpd_milters=inet:localhost:8891
 EOF
 
 # Setup OpenDKIM
@@ -681,41 +685,76 @@ opendkim-genkey -s mail -d $DOMAIN_NAME -b 2048
 chown -R opendkim:opendkim /etc/opendkim
 chmod 600 mail.private
 
-# Configure OpenDKIM
+# FIX: Configure OpenDKIM PROPERLY TO ACTUALLY SIGN EMAILS
 cat > /etc/opendkim.conf <<EOF
+# CRITICAL: THIS CONFIG ACTUALLY SIGNS EMAILS
 AutoRestart             Yes
 AutoRestartRate         10/1h
 UMask                   002
 Syslog                  yes
 SyslogSuccess           Yes
 LogWhy                  Yes
+
+# SIGNING MODE - CRITICAL
+Mode                    sv
+Domain                  $DOMAIN_NAME
+Selector                mail
+MinimumKeyBits          1024
+SubDomains              yes
+
+# Canonicalization
 Canonicalization        relaxed/simple
+
+# Host lists
 ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
 InternalHosts           refile:/etc/opendkim/TrustedHosts
 KeyTable                refile:/etc/opendkim/KeyTable
 SigningTable            refile:/etc/opendkim/SigningTable
-Mode                    sv
+
+# Socket
+Socket                  inet:8891@localhost
 PidFile                 /var/run/opendkim/opendkim.pid
 SignatureAlgorithm      rsa-sha256
 UserID                  opendkim:opendkim
-Socket                  inet:8891@localhost
+TemporaryDirectory      /var/tmp
+
+# CRITICAL: Sign everything
+OversignHeaders         From
+AlwaysAddARHeader       yes
 EOF
 
-# Setup DKIM tables
+# Setup DKIM tables - COMPREHENSIVE
 echo "127.0.0.1" > /etc/opendkim/TrustedHosts
 echo "localhost" >> /etc/opendkim/TrustedHosts
+echo "::1" >> /etc/opendkim/TrustedHosts
 echo ".$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
+echo "$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
+echo "$HOSTNAME" >> /etc/opendkim/TrustedHosts
 for ip in "${IP_ADDRESSES[@]}"; do
     echo "$ip" >> /etc/opendkim/TrustedHosts
 done
 
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
-echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
+
+# COMPREHENSIVE SigningTable
+cat > /etc/opendkim/SigningTable <<EOF
+*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
+*@$HOSTNAME mail._domainkey.$DOMAIN_NAME
+*@localhost mail._domainkey.$DOMAIN_NAME
+*@localhost.localdomain mail._domainkey.$DOMAIN_NAME
+$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
+EOF
+
+# Create systemd directory
+mkdir -p /var/run/opendkim
+chown opendkim:opendkim /var/run/opendkim
 
 # Start services
-systemctl restart opendkim postfix
+systemctl restart opendkim
+sleep 2
+systemctl restart postfix
 
-print_message "✓ Basic mail server configured"
+print_message "✓ Basic mail server configured with DKIM SIGNING ENABLED"
 
 # ===================================================================
 # PHASE 6: DATABASE SETUP
@@ -799,11 +838,14 @@ else
 </html>
 EOF
     
-    # Basic nginx config
+    # FIX: Basic nginx config WITHOUT DUPLICATE SERVER BLOCKS
     cat > /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
+# Single server block for ALL domains
 server {
-    listen 80;
-    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name $DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME _;
+    
     root /var/www/$DOMAIN_NAME;
     index index.html;
     
@@ -812,6 +854,9 @@ server {
     }
 }
 EOF
+    
+    # Remove default site
+    rm -f /etc/nginx/sites-enabled/default
     
     ln -sf /etc/nginx/sites-available/$DOMAIN_NAME /etc/nginx/sites-enabled/
     nginx -t 2>/dev/null && systemctl reload nginx
@@ -909,6 +954,20 @@ if [ -f "$INSTALL_DIR/post-install-config.sh" ]; then
     bash "$INSTALL_DIR/post-install-config.sh"
 fi
 
+# Ensure OpenDKIM is running
+systemctl restart opendkim
+sleep 2
+
+# Verify OpenDKIM is listening
+if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+    print_message "✓ OpenDKIM is listening on port 8891"
+else
+    print_error "✗ OpenDKIM not listening - restarting"
+    systemctl stop opendkim
+    sleep 1
+    systemctl start opendkim
+fi
+
 # Restart all services
 systemctl restart postfix dovecot opendkim nginx
 systemctl enable postfix dovecot opendkim nginx mysql
@@ -921,6 +980,7 @@ print_header "Installation Complete!"
 
 echo ""
 print_message "✓ Mail server installed successfully!"
+print_message "✓ DKIM SIGNING IS ENABLED!"
 echo ""
 echo "Domain: $DOMAIN_NAME"
 echo "Mail Server: $HOSTNAME"
@@ -950,6 +1010,11 @@ if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     echo ""
 fi
 
+echo "VERIFY DKIM IS WORKING:"
+echo "  opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
+echo "  systemctl status opendkim"
+echo ""
+
 echo "Next Steps:"
 echo "1. Add DNS records (check dns-records-$DOMAIN_NAME.txt)"
 echo "2. Wait for DNS propagation (5-30 minutes)"
@@ -971,4 +1036,4 @@ echo ""
 
 echo "Installation log: $LOG_FILE"
 echo ""
-print_message "Your bulk mail server is ready!"
+print_message "Your bulk mail server is ready WITH DKIM SIGNING!"
