@@ -2,9 +2,9 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE
-# Version: 2.2.1
+# Version: 17.0.0
 # Creates compliance website with privacy policy and unsubscribe
-# FIXED: Better error handling and directory creation
+# FIXED: Truncated HTML line, improved nginx configuration
 # =================================================================
 
 # Colors
@@ -59,6 +59,13 @@ if [ -z "$DOMAIN_NAME" ]; then
     fi
 fi
 
+# Get hostname with subdomain
+if [ ! -z "$MAIL_SUBDOMAIN" ]; then
+    HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
+else
+    HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+fi
+
 # Get primary IP if not in config
 if [ -z "$PRIMARY_IP" ]; then
     PRIMARY_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
@@ -69,7 +76,12 @@ if [ -z "$ADMIN_EMAIL" ]; then
     ADMIN_EMAIL="${FIRST_EMAIL:-admin@$DOMAIN_NAME}"
 fi
 
+# Get current date
+CURRENT_DATE=$(date +'%B %d, %Y')
+CURRENT_YEAR=$(date +%Y)
+
 echo "Domain: $DOMAIN_NAME"
+echo "Mail Server: $HOSTNAME"
 echo "Primary IP: $PRIMARY_IP"
 echo "Admin Email: $ADMIN_EMAIL"
 echo ""
@@ -126,13 +138,246 @@ if [ ! -d "$WEB_ROOT" ]; then
     exit 1
 fi
 
+# Create additional directories
+mkdir -p "$WEB_ROOT/css"
+mkdir -p "$WEB_ROOT/js"
+mkdir -p "$WEB_ROOT/images"
+
 # ===================================================================
 # 3. CREATE WEBSITE CONTENT
 # ===================================================================
 
 echo "Creating website pages..."
 
-# Homepage with professional design
+# Create modern CSS file
+cat > "$WEB_ROOT/css/style.css" <<'EOF'
+/* Modern Email Service Website Styles */
+:root {
+    --primary-color: #667eea;
+    --secondary-color: #764ba2;
+    --text-color: #333;
+    --text-light: #6c757d;
+    --bg-light: #f8f9fa;
+    --white: #ffffff;
+    --border-color: #e9ecef;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    line-height: 1.6;
+    color: var(--text-color);
+    background: var(--bg-light);
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 20px;
+}
+
+/* Header Styles */
+header {
+    background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
+    color: var(--white);
+    padding: 80px 0;
+    text-align: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+
+header h1 {
+    font-size: 3em;
+    margin-bottom: 10px;
+    font-weight: 700;
+}
+
+header p {
+    font-size: 1.2em;
+    opacity: 0.95;
+}
+
+/* Navigation */
+nav {
+    background: var(--white);
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    padding: 20px 0;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+
+nav ul {
+    list-style: none;
+    display: flex;
+    justify-content: center;
+    gap: 40px;
+    flex-wrap: wrap;
+}
+
+nav a {
+    color: var(--text-color);
+    text-decoration: none;
+    font-weight: 500;
+    transition: color 0.3s;
+    font-size: 1.1em;
+}
+
+nav a:hover {
+    color: var(--primary-color);
+}
+
+/* Content Area */
+.content {
+    padding: 80px 0;
+    background: var(--white);
+    margin: 40px 0;
+    border-radius: 10px;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.05);
+}
+
+.section {
+    margin-bottom: 60px;
+}
+
+h2 {
+    color: var(--primary-color);
+    margin-bottom: 25px;
+    font-size: 2.5em;
+    font-weight: 600;
+}
+
+.card {
+    background: var(--bg-light);
+    padding: 40px;
+    border-radius: 10px;
+    margin-bottom: 30px;
+    border: 1px solid var(--border-color);
+}
+
+.card h3 {
+    color: #495057;
+    margin-bottom: 15px;
+    font-size: 1.5em;
+}
+
+/* Features Grid */
+.features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 30px;
+    margin-top: 30px;
+}
+
+.feature {
+    text-align: center;
+    padding: 30px;
+    background: var(--bg-light);
+    border-radius: 10px;
+    transition: transform 0.3s, box-shadow 0.3s;
+}
+
+.feature:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 5px 20px rgba(102,126,234,0.1);
+}
+
+.feature-icon {
+    font-size: 3em;
+    margin-bottom: 15px;
+}
+
+/* Buttons */
+.btn {
+    display: inline-block;
+    padding: 15px 40px;
+    background: var(--primary-color);
+    color: var(--white);
+    text-decoration: none;
+    border-radius: 50px;
+    font-weight: 600;
+    transition: background 0.3s, transform 0.3s;
+    margin-top: 20px;
+}
+
+.btn:hover {
+    background: #5a67d8;
+    transform: translateY(-2px);
+}
+
+/* Footer */
+footer {
+    background: #2c3e50;
+    color: var(--white);
+    text-align: center;
+    padding: 50px 0;
+    margin-top: 80px;
+}
+
+footer a {
+    color: var(--primary-color);
+    text-decoration: none;
+}
+
+footer a:hover {
+    text-decoration: underline;
+}
+
+/* Notices and Alerts */
+.notice {
+    background: #fff3cd;
+    border: 1px solid #ffc107;
+    color: #856404;
+    padding: 20px;
+    border-radius: 5px;
+    margin: 20px 0;
+}
+
+/* Compliance Badges */
+.compliance-badges {
+    display: flex;
+    justify-content: center;
+    gap: 20px;
+    margin: 40px 0;
+    flex-wrap: wrap;
+}
+
+.badge {
+    padding: 10px 20px;
+    background: var(--white);
+    border: 2px solid var(--primary-color);
+    border-radius: 5px;
+    font-weight: 600;
+    color: var(--primary-color);
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    header h1 {
+        font-size: 2em;
+    }
+    
+    nav ul {
+        flex-direction: column;
+        gap: 10px;
+        text-align: center;
+    }
+    
+    h2 {
+        font-size: 1.8em;
+    }
+    
+    .features {
+        grid-template-columns: 1fr;
+    }
+}
+EOF
+
+# Homepage with professional design (FIXED TRUNCATION)
 cat > "$WEB_ROOT/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -141,161 +386,7 @@ cat > "$WEB_ROOT/index.html" <<EOF
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Professional email services by $DOMAIN_NAME">
     <title>$DOMAIN_NAME - Professional Email Services</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            background: #f8f9fa;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 0 20px;
-        }
-        header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 80px 0;
-            text-align: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        header h1 {
-            font-size: 3em;
-            margin-bottom: 10px;
-            font-weight: 700;
-        }
-        header p {
-            font-size: 1.2em;
-            opacity: 0.95;
-        }
-        nav {
-            background: white;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            padding: 20px 0;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
-        nav ul {
-            list-style: none;
-            display: flex;
-            justify-content: center;
-            gap: 40px;
-        }
-        nav a {
-            color: #333;
-            text-decoration: none;
-            font-weight: 500;
-            transition: color 0.3s;
-            font-size: 1.1em;
-        }
-        nav a:hover {
-            color: #667eea;
-        }
-        .content {
-            padding: 80px 0;
-            background: white;
-            margin: 40px 0;
-            border-radius: 10px;
-            box-shadow: 0 2px 20px rgba(0,0,0,0.05);
-        }
-        .section {
-            margin-bottom: 60px;
-        }
-        h2 {
-            color: #667eea;
-            margin-bottom: 25px;
-            font-size: 2.5em;
-            font-weight: 600;
-        }
-        .card {
-            background: #f8f9fa;
-            padding: 40px;
-            border-radius: 10px;
-            margin-bottom: 30px;
-            border: 1px solid #e9ecef;
-        }
-        .card h3 {
-            color: #495057;
-            margin-bottom: 15px;
-            font-size: 1.5em;
-        }
-        .features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 30px;
-            margin-top: 30px;
-        }
-        .feature {
-            text-align: center;
-            padding: 30px;
-            background: #f8f9fa;
-            border-radius: 10px;
-            transition: transform 0.3s, box-shadow 0.3s;
-        }
-        .feature:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 5px 20px rgba(102,126,234,0.1);
-        }
-        .feature-icon {
-            font-size: 3em;
-            margin-bottom: 15px;
-        }
-        .btn {
-            display: inline-block;
-            padding: 15px 40px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 50px;
-            font-weight: 600;
-            transition: background 0.3s, transform 0.3s;
-            margin-top: 20px;
-        }
-        .btn:hover {
-            background: #5a67d8;
-            transform: translateY(-2px);
-        }
-        footer {
-            background: #2c3e50;
-            color: white;
-            text-align: center;
-            padding: 50px 0;
-            margin-top: 80px;
-        }
-        footer a {
-            color: #667eea;
-            text-decoration: none;
-        }
-        footer a:hover {
-            text-decoration: underline;
-        }
-        .notice {
-            background: #fff3cd;
-            border: 1px solid #ffc107;
-            color: #856404;
-            padding: 20px;
-            border-radius: 5px;
-            margin: 20px 0;
-        }
-        .compliance-badges {
-            display: flex;
-            justify-content: center;
-            gap: 40px;
-            margin: 40px 0;
-            flex-wrap: wrap;
-        }
-        .badge {
-            padding: 10px 20px;
-            background: white;
-            border: 2px solid #667eea;
-            border-radius: 5px;
-            font-weight: 600;
-            color: #667eea;
-        }
-    </style>
+    <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
     <header>
@@ -387,7 +478,7 @@ cat > "$WEB_ROOT/index.html" <<EOF
                         <li>• Manage frequency settings</li>
                     </ul>
                     <div class="notice">
-                        <strong>Important:</strong> To unsubscribe or manage your email preferences, please use the unsubscribe link provided in any email you've received from us. This ensures we can properly identify and update your preferences.
+                        <strong>Important:</strong> To unsubscribe or manage your email preferences, please use the unsubscribe link provided in any email you've received from us. This ensures we can properly identify and update your preferences in our system.
                     </div>
                     <a href="/unsubscribe" class="btn">Unsubscribe Center</a>
                 </div>
@@ -397,7 +488,7 @@ cat > "$WEB_ROOT/index.html" <<EOF
     
     <footer>
         <div class="container">
-            <p>&copy; $(date +%Y) $DOMAIN_NAME - All Rights Reserved</p>
+            <p>&copy; $CURRENT_YEAR $DOMAIN_NAME - All Rights Reserved</p>
             <p style="margin-top: 15px;">
                 <a href="/privacy.html">Privacy Policy</a> | 
                 <a href="/terms.html">Terms of Service</a> | 
@@ -414,61 +505,18 @@ cat > "$WEB_ROOT/index.html" <<EOF
 EOF
 
 # Create Privacy Policy
-cat > "$WEB_ROOT/privacy.html" <<'PRIVACY_EOF'
+cat > "$WEB_ROOT/privacy.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Policy - DOMAIN_PLACEHOLDER</title>
+    <title>Privacy Policy - $DOMAIN_NAME</title>
+    <link rel="stylesheet" href="/css/style.css">
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.8;
-            color: #333;
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 40px 20px;
-            background: #f8f9fa;
-        }
-        .content {
-            background: white;
-            padding: 60px;
-            border-radius: 10px;
-            box-shadow: 0 2px 20px rgba(0,0,0,0.05);
-        }
-        h1 { 
-            color: #667eea; 
-            margin-bottom: 10px;
-            font-size: 2.5em;
-        }
-        .date {
-            color: #6c757d;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-        }
-        h2 { 
-            color: #495057; 
-            margin-top: 40px; 
-            margin-bottom: 20px;
-            font-size: 1.8em;
-            border-bottom: 2px solid #e9ecef;
-            padding-bottom: 10px;
-        }
-        p, li {
-            color: #495057;
-            margin-bottom: 15px;
-        }
-        ul {
-            margin-left: 20px;
-        }
-        a { 
-            color: #667eea; 
-            text-decoration: none;
-        }
-        a:hover {
-            text-decoration: underline;
-        }
+        .content { max-width: 900px; margin: 40px auto; }
+        .date { color: #6c757d; margin-bottom: 30px; font-size: 1.1em; }
+        .highlight { background: #f8f9fa; padding: 20px; border-left: 4px solid #667eea; margin: 20px 0; }
         .back-link { 
             display: inline-block;
             margin-top: 40px;
@@ -478,24 +526,24 @@ cat > "$WEB_ROOT/privacy.html" <<'PRIVACY_EOF'
             text-decoration: none;
             border-radius: 50px;
             font-weight: 600;
-            transition: background 0.3s;
         }
-        .back-link:hover {
-            background: #5a67d8;
-            text-decoration: none;
-        }
-        .highlight {
-            background: #f8f9fa;
-            padding: 20px;
-            border-left: 4px solid #667eea;
-            margin: 20px 0;
-        }
+        .back-link:hover { background: #5a67d8; }
     </style>
 </head>
 <body>
+    <nav>
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/privacy.html">Privacy Policy</a></li>
+            <li><a href="/terms.html">Terms of Service</a></li>
+            <li><a href="/contact.html">Contact</a></li>
+            <li><a href="/unsubscribe">Unsubscribe</a></li>
+        </ul>
+    </nav>
+    
     <div class="content">
-        <h1>Privacy Policy</h1>
-        <div class="date">Last Updated: DATE_PLACEHOLDER</div>
+        <h1 style="color: #667eea;">Privacy Policy</h1>
+        <div class="date">Last Updated: $CURRENT_DATE</div>
         
         <div class="highlight">
             <strong>Your Privacy Matters:</strong> We are committed to protecting your personal information and being transparent about how we collect, use, and safeguard your data.
@@ -573,21 +621,18 @@ cat > "$WEB_ROOT/privacy.html" <<'PRIVACY_EOF'
         <h2>8. Contact Us</h2>
         <p>If you have questions about this Privacy Policy or our data practices, please contact us:</p>
         <div class="highlight">
-            <p><strong>Email:</strong> privacy@DOMAIN_PLACEHOLDER</p>
-            <p><strong>Website:</strong> <a href="/">DOMAIN_PLACEHOLDER</a></p>
+            <p><strong>Email:</strong> privacy@$DOMAIN_NAME</p>
+            <p><strong>Website:</strong> <a href="/">$DOMAIN_NAME</a></p>
+            <p><strong>Mail Server:</strong> $HOSTNAME</p>
         </div>
         
         <a href="/" class="back-link">← Back to Home</a>
     </div>
 </body>
 </html>
-PRIVACY_EOF
+EOF
 
-# Replace placeholders in privacy policy
-sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" "$WEB_ROOT/privacy.html"
-sed -i "s/DATE_PLACEHOLDER/$(date +'%B %d, %Y')/g" "$WEB_ROOT/privacy.html"
-
-# Create Terms of Service (simplified)
+# Create Terms of Service
 cat > "$WEB_ROOT/terms.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -595,25 +640,9 @@ cat > "$WEB_ROOT/terms.html" <<EOF
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Terms of Service - $DOMAIN_NAME</title>
+    <link rel="stylesheet" href="/css/style.css">
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.8;
-            color: #333;
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 40px 20px;
-            background: #f8f9fa;
-        }
-        .content {
-            background: white;
-            padding: 60px;
-            border-radius: 10px;
-            box-shadow: 0 2px 20px rgba(0,0,0,0.05);
-        }
-        h1 { color: #667eea; }
-        h2 { color: #495057; margin-top: 40px; }
-        a { color: #667eea; }
+        .content { max-width: 900px; margin: 40px auto; padding: 40px; }
         .back-link { 
             display: inline-block;
             margin-top: 40px;
@@ -626,21 +655,57 @@ cat > "$WEB_ROOT/terms.html" <<EOF
     </style>
 </head>
 <body>
+    <nav>
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/privacy.html">Privacy Policy</a></li>
+            <li><a href="/terms.html">Terms of Service</a></li>
+            <li><a href="/contact.html">Contact</a></li>
+            <li><a href="/unsubscribe">Unsubscribe</a></li>
+        </ul>
+    </nav>
+    
     <div class="content">
-        <h1>Terms of Service</h1>
-        <p>Last Updated: $(date +'%B %d, %Y')</p>
+        <h1 style="color: #667eea;">Terms of Service</h1>
+        <p>Last Updated: $CURRENT_DATE</p>
         
         <h2>1. Acceptance of Terms</h2>
         <p>By subscribing to our email list or using our services, you agree to these Terms of Service.</p>
         
         <h2>2. Email Services</h2>
-        <p>Our email services are provided to subscribers who have explicitly opted in. You may unsubscribe at any time.</p>
+        <p>Our email services are provided to subscribers who have explicitly opted in. You may unsubscribe at any time using the unsubscribe link in any email.</p>
         
         <h2>3. Anti-Spam Compliance</h2>
-        <p>We maintain strict compliance with CAN-SPAM, GDPR, and other anti-spam regulations.</p>
+        <p>We maintain strict compliance with CAN-SPAM Act, GDPR, and other international anti-spam regulations. We never:</p>
+        <ul>
+            <li>Send unsolicited commercial emails</li>
+            <li>Use deceptive subject lines or headers</li>
+            <li>Hide or obscure sender information</li>
+            <li>Sell or rent email addresses to third parties</li>
+        </ul>
         
-        <h2>4. Contact Information</h2>
-        <p>For questions about these Terms, contact us at legal@$DOMAIN_NAME</p>
+        <h2>4. User Responsibilities</h2>
+        <p>When subscribing to our services, you agree to:</p>
+        <ul>
+            <li>Provide accurate and current information</li>
+            <li>Maintain the security of your account credentials</li>
+            <li>Notify us of any unauthorized use</li>
+            <li>Use our services in compliance with all applicable laws</li>
+        </ul>
+        
+        <h2>5. Intellectual Property</h2>
+        <p>All content provided through our email services is protected by copyright and other intellectual property laws.</p>
+        
+        <h2>6. Limitation of Liability</h2>
+        <p>Our services are provided "as is" without warranties of any kind. We are not liable for any indirect, incidental, or consequential damages.</p>
+        
+        <h2>7. Modifications</h2>
+        <p>We reserve the right to modify these terms at any time. Continued use of our services constitutes acceptance of modified terms.</p>
+        
+        <h2>8. Contact Information</h2>
+        <p>For questions about these Terms, contact us at:</p>
+        <p><strong>Email:</strong> legal@$DOMAIN_NAME</p>
+        <p><strong>Website:</strong> $DOMAIN_NAME</p>
         
         <a href="/" class="back-link">← Back to Home</a>
     </div>
@@ -656,23 +721,9 @@ cat > "$WEB_ROOT/contact.html" <<EOF
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Contact Us - $DOMAIN_NAME</title>
+    <link rel="stylesheet" href="/css/style.css">
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.8;
-            color: #333;
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 40px 20px;
-            background: #f8f9fa;
-        }
-        .content {
-            background: white;
-            padding: 60px;
-            border-radius: 10px;
-            box-shadow: 0 2px 20px rgba(0,0,0,0.05);
-        }
-        h1 { color: #667eea; }
+        .content { max-width: 900px; margin: 40px auto; padding: 40px; }
         .contact-card {
             background: #f8f9fa;
             padding: 30px;
@@ -684,6 +735,14 @@ cat > "$WEB_ROOT/contact.html" <<EOF
             border: 2px solid #667eea;
             padding: 25px;
             border-radius: 10px;
+            margin: 30px 0;
+        }
+        .important-notice {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            color: #856404;
+            padding: 20px;
+            border-radius: 5px;
             margin: 30px 0;
         }
         .back-link {
@@ -698,33 +757,93 @@ cat > "$WEB_ROOT/contact.html" <<EOF
     </style>
 </head>
 <body>
+    <nav>
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/privacy.html">Privacy Policy</a></li>
+            <li><a href="/terms.html">Terms of Service</a></li>
+            <li><a href="/contact.html">Contact</a></li>
+            <li><a href="/unsubscribe">Unsubscribe</a></li>
+        </ul>
+    </nav>
+    
     <div class="content">
-        <h1>Contact Us</h1>
+        <h1 style="color: #667eea;">Contact Us</h1>
         
         <div class="contact-card">
             <h2>General Inquiries</h2>
             <p><strong>Domain:</strong> $DOMAIN_NAME</p>
-            <p><strong>Email:</strong> contact@$DOMAIN_NAME</p>
+            <p><strong>Email Server:</strong> $HOSTNAME</p>
+            <p><strong>Contact Email:</strong> contact@$DOMAIN_NAME</p>
+            <p><strong>Privacy Inquiries:</strong> privacy@$DOMAIN_NAME</p>
+            <p><strong>Abuse Reports:</strong> abuse@$DOMAIN_NAME</p>
         </div>
         
         <div class="address-box">
             <h2>Mailing Address</h2>
-            <p><strong>CAN-SPAM Compliance Notice:</strong></p>
+            <p><strong>CAN-SPAM Compliance Physical Address:</strong></p>
             <p>
                 [YOUR COMPANY NAME]<br>
                 [STREET ADDRESS]<br>
                 [CITY, STATE ZIP CODE]<br>
                 [COUNTRY]
             </p>
-            <p style="margin-top: 20px; color: #6c757d; font-size: 0.9em;">
-                <em>Note: Please update this with your actual physical mailing address.</em>
-            </p>
+            <div class="important-notice">
+                <strong>⚠️ IMPORTANT:</strong> You must update this address with your actual physical mailing address to comply with CAN-SPAM Act requirements. Edit this file at: $WEB_ROOT/contact.html
+            </div>
+        </div>
+        
+        <div class="contact-card">
+            <h2>Technical Information</h2>
+            <p><strong>Mail Server:</strong> $HOSTNAME</p>
+            <p><strong>Server IP:</strong> $PRIMARY_IP</p>
+            <p><strong>Email Authentication:</strong></p>
+            <ul style="margin-left: 20px;">
+                <li>SPF: Enabled</li>
+                <li>DKIM: Enabled (Selector: mail)</li>
+                <li>DMARC: Configured</li>
+            </ul>
         </div>
         
         <a href="/" class="back-link">← Back to Home</a>
     </div>
 </body>
 </html>
+EOF
+
+# Create robots.txt
+cat > "$WEB_ROOT/robots.txt" <<EOF
+User-agent: *
+Allow: /
+Disallow: /unsubscribe
+Sitemap: https://$DOMAIN_NAME/sitemap.xml
+EOF
+
+# Create sitemap.xml
+cat > "$WEB_ROOT/sitemap.xml" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+        <loc>https://$DOMAIN_NAME/</loc>
+        <lastmod>$(date +%Y-%m-%d)</lastmod>
+        <priority>1.0</priority>
+    </url>
+    <url>
+        <loc>https://$DOMAIN_NAME/privacy.html</loc>
+        <lastmod>$(date +%Y-%m-%d)</lastmod>
+        <priority>0.8</priority>
+    </url>
+    <url>
+        <loc>https://$DOMAIN_NAME/terms.html</loc>
+        <lastmod>$(date +%Y-%m-%d)</lastmod>
+        <priority>0.8</priority>
+    </url>
+    <url>
+        <loc>https://$DOMAIN_NAME/contact.html</loc>
+        <lastmod>$(date +%Y-%m-%d)</lastmod>
+        <priority>0.8</priority>
+    </url>
+</urlset>
 EOF
 
 # Set permissions
@@ -739,11 +858,21 @@ print_message "✓ Website files created"
 
 print_header "Configuring Nginx"
 
+# Create sites directories if they don't exist
+mkdir -p /etc/nginx/sites-available
+mkdir -p /etc/nginx/sites-enabled
+
+# Ensure sites-enabled is included in nginx.conf
+if ! grep -q "include /etc/nginx/sites-enabled/\*" /etc/nginx/nginx.conf; then
+    sed -i '/http {/a\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
+fi
+
 # Remove default site if it exists
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null
 
-# Create Nginx server block
+# Create Nginx server block with improved configuration
 cat > /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
+# HTTP Server Block
 server {
     listen 80;
     listen [::]:80;
@@ -764,26 +893,76 @@ server {
     gzip_min_length 256;
     gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
     
+    # Main location
     location / {
-        try_files \$uri \$uri/ =404;
+        try_files \$uri \$uri/ /index.html;
+    }
+    
+    # CSS and JS with proper content types
+    location ~ \\.css\$ {
+        add_header Content-Type text/css;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    location ~ \\.js\$ {
+        add_header Content-Type application/javascript;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
     }
     
     # Mailwizz unsubscribe redirect
     # UPDATE THIS WITH YOUR ACTUAL MAILWIZZ URL
     location /unsubscribe {
+        # Change this to your actual Mailwizz unsubscribe URL
+        return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
+    }
+    
+    # Alternative unsubscribe endpoints
+    location /unsub {
+        return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
+    }
+    
+    location /optout {
         return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
     }
     
     # Block access to hidden files
-    location ~ /\. {
+    location ~ /\\. {
         deny all;
+        access_log off;
+        log_not_found off;
     }
     
     # Cache static assets
-    location ~* \.(jpg|jpeg|png|gif|ico|css|js)$ {
+    location ~* \\.(jpg|jpeg|png|gif|ico|svg|webp)\$ {
         expires 30d;
         add_header Cache-Control "public, immutable";
     }
+    
+    # Error pages
+    error_page 404 /404.html;
+    error_page 500 502 503 504 /50x.html;
+    
+    location = /404.html {
+        internal;
+    }
+    
+    location = /50x.html {
+        internal;
+    }
+    
+    # Logging
+    access_log /var/log/nginx/${DOMAIN_NAME}_access.log;
+    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;
+}
+
+# Redirect www to non-www
+server {
+    listen 80;
+    listen [::]:80;
+    server_name www.$DOMAIN_NAME;
+    return 301 http://\$DOMAIN_NAME\$request_uri;
 }
 EOF
 
@@ -820,6 +999,11 @@ IMPORTANT SETUP STEPS:
    Edit: $WEB_ROOT/contact.html
    Find: [YOUR COMPANY NAME]
    Replace with your actual business address
+   
+   This is REQUIRED by the CAN-SPAM Act. You must include:
+   - Your current street address, OR
+   - A post office box registered with USPS, OR
+   - A private mailbox registered with a commercial mail receiving agency
 
 2. CONFIGURE MAILWIZZ UNSUBSCRIBE:
    Edit: /etc/nginx/sites-available/$DOMAIN_NAME
@@ -832,13 +1016,31 @@ IMPORTANT SETUP STEPS:
 4. SSL CERTIFICATE (After DNS propagates):
    Command: certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME
 
+5. CUSTOMIZE CONTENT:
+   - Update company information in all pages
+   - Add your logo to /images/
+   - Modify CSS in /css/style.css
+   - Add additional pages as needed
+
 Website Features:
-- Privacy Policy page
+- Privacy Policy page (GDPR compliant)
 - Terms of Service page
-- Contact page with address
-- Unsubscribe redirect
+- Contact page with address placeholder
+- Unsubscribe redirect to Mailwizz
 - Mobile responsive design
 - Security headers configured
+- SEO optimized with sitemap
+- Modern, professional design
+
+File Locations:
+- Website Root: $WEB_ROOT
+- Nginx Config: /etc/nginx/sites-available/$DOMAIN_NAME
+- Access Logs: /var/log/nginx/${DOMAIN_NAME}_access.log
+- Error Logs: /var/log/nginx/${DOMAIN_NAME}_error.log
+
+Testing:
+- Local: curl -I http://localhost
+- External: http://$DOMAIN_NAME (after DNS propagates)
 EOF
 
 chown www-data:www-data "$WEB_ROOT/setup-instructions.txt" 2>/dev/null || true
@@ -853,12 +1055,13 @@ echo ""
 echo "✅ Website created at: http://$DOMAIN_NAME"
 echo "✅ Nginx configured and running"
 echo "✅ Compliance pages created"
+echo "✅ Modern responsive design implemented"
 echo ""
 echo "⚠️ REQUIRED ACTIONS:"
 echo ""
 echo "1. UPDATE YOUR PHYSICAL ADDRESS:"
 echo "   vim $WEB_ROOT/contact.html"
-echo "   (Required by CAN-SPAM Act)"
+echo "   (Required by CAN-SPAM Act - MUST be a valid physical address)"
 echo ""
 echo "2. CONFIGURE MAILWIZZ UNSUBSCRIBE URL:"
 echo "   vim /etc/nginx/sites-available/$DOMAIN_NAME"
