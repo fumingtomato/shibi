@@ -117,7 +117,7 @@ EOF
 fi
 
 # ===================================================================
-# 2. VERIFY DKIM IS PROPERLY CONFIGURED (1024-bit)
+# 2. VERIFY DKIM IS PROPERLY CONFIGURED (1024-bit) - FIXED
 # ===================================================================
 
 print_header "Verifying DKIM Configuration"
@@ -129,9 +129,15 @@ if ! command -v opendkim &> /dev/null; then
     apt-get install -y opendkim opendkim-tools > /dev/null 2>&1
 fi
 
-# Check DKIM key size
+# Check DKIM key size - FIXED VERSION
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
-    KEY_BITS=$(openssl rsa -in "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" -text -noout 2>/dev/null | grep "Private-Key:" | grep -oP '\d+' || echo "0")
+    # Extract key bits properly - handle multiline output
+    KEY_BITS=$(openssl rsa -in "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" -text -noout 2>/dev/null | grep "Private-Key:" | head -1 | grep -oP '\d+' | head -1 || echo "0")
+    
+    # Ensure KEY_BITS is numeric
+    if ! [[ "$KEY_BITS" =~ ^[0-9]+$ ]]; then
+        KEY_BITS=0
+    fi
     
     if [ "$KEY_BITS" -eq 1024 ]; then
         print_message "✓ DKIM key is 1024-bit (DNS compatible)"
@@ -148,8 +154,21 @@ if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
         chmod 644 mail.txt
         
         print_message "✓ Regenerated as 1024-bit key"
+    elif [ "$KEY_BITS" -eq 0 ]; then
+        print_warning "⚠ Could not determine DKIM key size - regenerating"
+        
+        cd /etc/opendkim/keys/$DOMAIN_NAME
+        [ -f mail.private ] && mv mail.private mail.private.backup
+        [ -f mail.txt ] && mv mail.txt mail.txt.backup
+        
+        opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024
+        chown opendkim:opendkim mail.private mail.txt
+        chmod 600 mail.private
+        chmod 644 mail.txt
+        
+        print_message "✓ Generated new 1024-bit key"
     else
-        print_warning "⚠ Could not determine DKIM key size"
+        print_warning "⚠ Unexpected key size: $KEY_BITS bits"
     fi
     
     # Display key info
@@ -158,6 +177,8 @@ if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
         echo "DKIM public key length: ${#DKIM_KEY} characters"
         if [ ${#DKIM_KEY} -gt 250 ]; then
             print_warning "⚠ Key seems too long for 1024-bit (should be ~215 chars)"
+        elif [ ${#DKIM_KEY} -eq 0 ]; then
+            print_warning "⚠ Could not extract DKIM key from file"
         fi
     fi
 else
