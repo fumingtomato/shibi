@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# WEBSITE SETUP FOR BULK EMAIL COMPLIANCE
+# WEBSITE SETUP FOR BULK EMAIL COMPLIANCE - AUTOMATIC, NO QUESTIONS
 # Version: 17.0.1
-# Creates compliance website with privacy policy and unsubscribe
-# FIXED: Complete file with all execution code
+# Creates compliance website automatically with all required pages
 # =================================================================
 
 # Colors
@@ -55,7 +54,7 @@ if [ -z "$DOMAIN_NAME" ]; then
     fi
     
     if [ -z "$DOMAIN_NAME" ]; then
-        read -p "Enter your domain name: " DOMAIN_NAME
+        DOMAIN_NAME=$(hostname -d)
     fi
 fi
 
@@ -377,7 +376,7 @@ footer a:hover {
 }
 EOF
 
-# Homepage with professional design (COMPLETE VERSION)
+# Homepage with professional design
 cat > "$WEB_ROOT/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -478,7 +477,7 @@ cat > "$WEB_ROOT/index.html" <<EOF
                         <li>• Manage frequency settings</li>
                     </ul>
                     <div class="notice">
-                        <strong>Important:</strong> To unsubscribe or manage your email preferences, please use the unsubscribe link provided in any email you've received from us. This ensures we can properly identify and update your preferences.
+                        <strong>Important:</strong> To unsubscribe or manage your email preferences, please use the unsubscribe link provided in any email you've received from us.
                     </div>
                     <a href="/unsubscribe" class="btn">Unsubscribe Center</a>
                 </div>
@@ -713,7 +712,7 @@ cat > "$WEB_ROOT/terms.html" <<EOF
 </html>
 EOF
 
-# Create Contact Page
+# Create Contact Page with placeholder for physical address
 cat > "$WEB_ROOT/contact.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -870,7 +869,7 @@ fi
 # Remove default site if it exists
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null
 
-# Create Nginx server block with improved configuration
+# Create Nginx server block
 cat > /etc/nginx/sites-available/$DOMAIN_NAME <<EOF
 # HTTP Server Block
 server {
@@ -911,10 +910,9 @@ server {
         add_header Cache-Control "public, immutable";
     }
     
-    # Mailwizz unsubscribe redirect
-    # UPDATE THIS WITH YOUR ACTUAL MAILWIZZ URL
+    # Mailwizz unsubscribe redirect - UPDATE THIS LATER
     location /unsubscribe {
-        # Change this to your actual Mailwizz unsubscribe URL
+        # PLACEHOLDER - UPDATE WITH YOUR MAILWIZZ URL
         return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
     }
     
@@ -981,69 +979,38 @@ else
 fi
 
 # ===================================================================
-# 5. CREATE SETUP INSTRUCTIONS
+# 5. CREATE REMINDER FILES
 # ===================================================================
 
-cat > "$WEB_ROOT/setup-instructions.txt" <<EOF
-WEBSITE CONFIGURATION INSTRUCTIONS
-=====================================
+# Create a prominent reminder file
+cat > "$WEB_ROOT/IMPORTANT-UPDATE-ADDRESS.txt" <<EOF
+CRITICAL COMPLIANCE REQUIREMENT
+================================
+
+YOU MUST UPDATE THE PHYSICAL ADDRESS IN contact.html
+
+CAN-SPAM Act REQUIRES a valid physical postal address in all commercial emails.
+
+TO UPDATE:
+1. Edit: $WEB_ROOT/contact.html
+2. Find: [YOUR COMPANY NAME]
+3. Replace with your actual business address
+
+ACCEPTABLE ADDRESSES:
+- Your current street address
+- A post office box registered with USPS
+- A private mailbox registered with a commercial mail receiving agency
+
+This is a LEGAL REQUIREMENT for sending bulk email.
+
+ALSO UPDATE:
+1. Mailwizz unsubscribe URL in: /etc/nginx/sites-available/$DOMAIN_NAME
+2. Find: https://your-mailwizz-domain.com/lists/unsubscribe
+3. Replace with your actual Mailwizz URL
+4. Run: systemctl reload nginx
+
 Generated: $(date)
-
-Your compliance website has been created at:
-http://$DOMAIN_NAME
-
-IMPORTANT SETUP STEPS:
-======================
-
-1. UPDATE PHYSICAL ADDRESS (REQUIRED BY LAW):
-   Edit: $WEB_ROOT/contact.html
-   Find: [YOUR COMPANY NAME]
-   Replace with your actual business address
-   
-   This is REQUIRED by the CAN-SPAM Act. You must include:
-   - Your current street address, OR
-   - A post office box registered with USPS, OR
-   - A private mailbox registered with a commercial mail receiving agency
-
-2. CONFIGURE MAILWIZZ UNSUBSCRIBE:
-   Edit: /etc/nginx/sites-available/$DOMAIN_NAME
-   Find: return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
-   Replace with your actual Mailwizz unsubscribe URL
-
-3. RELOAD NGINX AFTER CHANGES:
-   Command: systemctl reload nginx
-
-4. SSL CERTIFICATE (After DNS propagates):
-   Command: certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME
-
-5. CUSTOMIZE CONTENT:
-   - Update company information in all pages
-   - Add your logo to /images/
-   - Modify CSS in /css/style.css
-   - Add additional pages as needed
-
-Website Features:
-- Privacy Policy page (GDPR compliant)
-- Terms of Service page
-- Contact page with address placeholder
-- Unsubscribe redirect to Mailwizz
-- Mobile responsive design
-- Security headers configured
-- SEO optimized with sitemap
-- Modern, professional design
-
-File Locations:
-- Website Root: $WEB_ROOT
-- Nginx Config: /etc/nginx/sites-available/$DOMAIN_NAME
-- Access Logs: /var/log/nginx/${DOMAIN_NAME}_access.log
-- Error Logs: /var/log/nginx/${DOMAIN_NAME}_error.log
-
-Testing:
-- Local: curl -I http://localhost
-- External: http://$DOMAIN_NAME (after DNS propagates)
 EOF
-
-chown www-data:www-data "$WEB_ROOT/setup-instructions.txt" 2>/dev/null || true
 
 # ===================================================================
 # COMPLETION
@@ -1057,22 +1024,21 @@ echo "✅ Nginx configured and running"
 echo "✅ Compliance pages created"
 echo "✅ Modern responsive design implemented"
 echo ""
-echo "⚠️ REQUIRED ACTIONS:"
+print_warning "⚠️ REQUIRED ACTIONS:"
 echo ""
-echo "1. UPDATE YOUR PHYSICAL ADDRESS:"
+echo "1. UPDATE YOUR PHYSICAL ADDRESS (LEGALLY REQUIRED):"
 echo "   vim $WEB_ROOT/contact.html"
-echo "   (Required by CAN-SPAM Act - MUST be a valid physical address)"
+echo "   Find: [YOUR COMPANY NAME]"
+echo "   Replace with your actual physical address"
 echo ""
-echo "2. CONFIGURE MAILWIZZ UNSUBSCRIBE URL:"
+echo "2. UPDATE MAILWIZZ UNSUBSCRIBE URL:"
 echo "   vim /etc/nginx/sites-available/$DOMAIN_NAME"
-echo "   Update the redirect URL to your Mailwizz instance"
+echo "   Find: https://your-mailwizz-domain.com/lists/unsubscribe"
+echo "   Replace with your actual Mailwizz URL"
 echo "   Then run: systemctl reload nginx"
 echo ""
-echo "3. GET SSL CERTIFICATE (after DNS propagates):"
-echo "   certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME"
-echo ""
-echo "📝 Setup instructions saved to:"
-echo "   $WEB_ROOT/setup-instructions.txt"
+echo "3. SSL CERTIFICATE will be attempted automatically"
+echo "   Check status with: certbot certificates"
 echo ""
 
 # Quick test
