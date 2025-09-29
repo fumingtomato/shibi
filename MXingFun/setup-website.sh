@@ -95,7 +95,7 @@ SSL_DOMAINS="$DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME"
 # Add numbered subdomains if multiple IPs
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     for i in {1..9}; do
-        if [ $i -lt ${#IP_ADDRESSES[@]} ]; then
+        if [ $i -le ${#IP_ADDRESSES[@]} ]; then
             SSL_DOMAINS="$SSL_DOMAINS ${MAIL_PREFIX}${i}.$DOMAIN_NAME"
         fi
     done
