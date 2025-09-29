@@ -117,10 +117,10 @@ EOF
 fi
 
 # ===================================================================
-# 2. VERIFY OPENDKIM CONFIGURATION
+# 2. FIX OPENDKIM CONFIGURATION TO ACTUALLY SIGN EMAILS
 # ===================================================================
 
-print_header "Verifying OpenDKIM Configuration"
+print_header "Fixing OpenDKIM Configuration for DKIM Signing"
 
 # Check if OpenDKIM is installed
 if ! command -v opendkim &> /dev/null; then
@@ -141,9 +141,9 @@ else
     chmod 600 mail.private
 fi
 
-# Ensure OpenDKIM configuration is correct
+# FIX: Proper OpenDKIM configuration that ACTUALLY SIGNS
 cat > /etc/opendkim.conf <<EOF
-# OpenDKIM Configuration
+# OpenDKIM Configuration - FIXED TO SIGN EMAILS
 AutoRestart             Yes
 AutoRestartRate         10/1h
 UMask                   002
@@ -151,12 +151,16 @@ Syslog                  yes
 SyslogSuccess           Yes
 LogWhy                  Yes
 
+# CRITICAL: Set to signing mode
+Mode                    sv
+Domain                  $DOMAIN_NAME
+Selector                mail
+MinimumKeyBits          1024
+SubDomains              yes
+AlwaysAddARHeader       yes
+
 # Canonicalization
 Canonicalization        relaxed/simple
-
-# Signing
-Mode                    sv
-SubDomains              yes
 
 # Trusted hosts
 ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
@@ -169,8 +173,9 @@ Socket                  inet:8891@localhost
 PidFile                 /var/run/opendkim/opendkim.pid
 SignatureAlgorithm      rsa-sha256
 UserID                  opendkim:opendkim
+TemporaryDirectory      /var/tmp
 
-# Additional settings
+# Additional signing settings
 OversignHeaders         From
 EOF
 
@@ -182,6 +187,7 @@ localhost
 $PRIMARY_IP
 $HOSTNAME
 *.$DOMAIN_NAME
+$DOMAIN_NAME
 EOF
 
 # Add all additional IPs
@@ -194,10 +200,13 @@ fi
 # Setup KeyTable
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 
-# Setup SigningTable
+# FIX: Complete SigningTable for all sending scenarios
 cat > /etc/opendkim/SigningTable <<EOF
 *@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
 *@$HOSTNAME mail._domainkey.$DOMAIN_NAME
+$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
+*@localhost mail._domainkey.$DOMAIN_NAME
+*@localhost.localdomain mail._domainkey.$DOMAIN_NAME
 EOF
 
 # Set proper permissions
@@ -211,6 +220,12 @@ postconf -e "milter_protocol = 6"
 postconf -e "milter_default_action = accept"
 postconf -e "smtpd_milters = inet:localhost:8891"
 postconf -e "non_smtpd_milters = inet:localhost:8891"
+
+# Create systemd directory if needed
+if [ ! -d /var/run/opendkim ]; then
+    mkdir -p /var/run/opendkim
+    chown opendkim:opendkim /var/run/opendkim
+fi
 
 # Restart OpenDKIM
 systemctl restart opendkim 2>/dev/null
@@ -869,7 +884,7 @@ EOF
 
 print_header "Post-Installation Complete!"
 echo ""
-echo "✓ OpenDKIM verified and running"
+echo "✓ OpenDKIM configured and signing enabled"
 echo "✓ SSL/TLS configured (auto-retry enabled for pending certificates)"
 echo "✓ Firewall configured" 
 echo "✓ Fail2ban configured"
@@ -888,6 +903,7 @@ echo "  Status: $(systemctl is-active opendkim 2>/dev/null || echo "not running"
 echo "  Port: localhost:8891"
 echo "  Selector: mail"
 echo "  Domain: $DOMAIN_NAME"
+echo "  Mode: SIGNING ENABLED (sv)"
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
@@ -942,7 +958,7 @@ fi
 print_message "Configuration saved to: /root/mail-server-config.txt"
 echo ""
 print_message "✓ Post-installation configuration completed!"
-print_message "✓ Your mail server is ready with DKIM signing enabled!"
+print_message "✓ Your mail server is ready with DKIM signing ENABLED!"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     print_message "✓ IP rotation is active with database-backed sticky sessions!"
 fi
