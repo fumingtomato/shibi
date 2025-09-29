@@ -360,6 +360,7 @@ else
     echo "  Type: TXT"
     echo "  Value: $DKIM_RECORD_VALUE"
 fi
+fi
 
 # 9. Additional email authentication records
 echo ""
