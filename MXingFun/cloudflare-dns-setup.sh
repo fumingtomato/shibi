@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# CLOUDFLARE DNS SETUP FOR MAIL SERVER
+# CLOUDFLARE DNS SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
 # Version: 17.0.0
-# Adds all DNS records including DKIM with proper key handling
-# FIXED: DKIM key size handling, subdomain support, better API error handling
+# Adds all DNS records including DKIM automatically
 # =================================================================
 
 # Colors
@@ -45,7 +44,8 @@ echo ""
 # Verify required variables
 if [ -z "$CF_API_KEY" ]; then
     print_error "Cloudflare API key not found in configuration"
-    exit 1
+    echo "Skipping automatic DNS setup"
+    exit 0
 fi
 
 if [ -z "$DOMAIN_NAME" ]; then
@@ -73,7 +73,7 @@ CREDS_FILE="/root/.cloudflare_credentials"
 if [ -f "$CREDS_FILE" ]; then
     source "$CREDS_FILE"
     CF_API_KEY="${SAVED_CF_API_KEY:-$CF_API_KEY}"
-    CF_EMAIL="${SAVED_CF_EMAIL:-}"
+    CF_EMAIL="${SAVED_CF_EMAIL:-$CF_EMAIL}"
 fi
 
 # Check if jq is installed
@@ -182,13 +182,9 @@ if [ "$SUCCESS" == "true" ]; then
 else
     # Try as Global API Key
     if [ -z "$CF_EMAIL" ]; then
-        echo ""
-        echo "API Token authentication failed."
-        echo "Trying Global API Key method..."
-        read -p "Enter your Cloudflare account email: " CF_EMAIL
-        
-        # Save email for future use
-        echo "SAVED_CF_EMAIL=\"$CF_EMAIL\"" >> "$CREDS_FILE"
+        print_error "✗ API Token authentication failed and no email provided"
+        echo "Cannot proceed with automatic DNS setup"
+        exit 0
     fi
     
     AUTH_METHOD="global"
@@ -201,7 +197,7 @@ else
         print_error "✗ Failed to authenticate with Cloudflare"
         ERROR_MSG=$(echo "$TEST_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null)
         [ ! -z "$ERROR_MSG" ] && [ "$ERROR_MSG" != "null" ] && echo "Error: $ERROR_MSG"
-        exit 1
+        exit 0
     fi
 fi
 
@@ -220,7 +216,7 @@ if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" == "null" ]; then
     echo "Make sure $DOMAIN_NAME exists in your Cloudflare account"
     ERROR_MSG=$(echo "$ZONE_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null)
     [ ! -z "$ERROR_MSG" ] && [ "$ERROR_MSG" != "null" ] && echo "Error: $ERROR_MSG"
-    exit 1
+    exit 0
 fi
 
 print_message "✓ Found"
@@ -293,7 +289,7 @@ add_dns_record() {
 }
 
 # ===================================================================
-# ADD DNS RECORDS
+# ADD DNS RECORDS - AUTOMATIC, NO QUESTIONS
 # ===================================================================
 
 print_header "Adding DNS Records to Cloudflare"
@@ -552,6 +548,63 @@ sed -i "s/IP_PLACEHOLDER/$PRIMARY_IP/g" /usr/local/bin/verify-dns
 chmod +x /usr/local/bin/verify-dns
 
 # ===================================================================
+# SAVE DNS RECORDS FILE
+# ===================================================================
+
+# Save DNS records to file for reference
+cat > /root/dns-records-$DOMAIN_NAME.txt <<EOF
+DNS RECORDS CONFIGURED IN CLOUDFLARE
+=====================================
+Generated: $(date)
+
+Domain: $DOMAIN_NAME
+Mail Server: $HOSTNAME
+Primary IP: $PRIMARY_IP
+
+RECORDS ADDED:
+--------------
+
+1. A Records:
+   - $HOSTNAME → $PRIMARY_IP
+   - $DOMAIN_NAME → $PRIMARY_IP
+   - www.$DOMAIN_NAME → $PRIMARY_IP
+$(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "   - Additional IPs configured"
+fi)
+
+2. MX Record:
+   - $DOMAIN_NAME → $HOSTNAME (Priority: 10)
+
+3. SPF Record:
+   - $DOMAIN_NAME TXT: "$SPF_RECORD"
+
+4. DMARC Record:
+   - _dmarc.$DOMAIN_NAME TXT: "$DMARC_RECORD"
+
+$(if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+echo "5. DKIM Record:
+   - mail._domainkey.$DOMAIN_NAME TXT: (2048-bit key added)"
+fi)
+
+6. Additional Records:
+   - Return Path CNAME: bounces.$DOMAIN_NAME → $HOSTNAME
+   - Autodiscover CNAME: autodiscover.$DOMAIN_NAME → $HOSTNAME
+
+PTR RECORD (MUST BE SET WITH YOUR HOSTING PROVIDER):
+   - $PRIMARY_IP → $HOSTNAME
+$(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    for ip in "${IP_ADDRESSES[@]:1}"; do
+        echo "   - $ip → $HOSTNAME"
+    done
+fi)
+
+VERIFICATION COMMANDS:
+   verify-dns - Check DNS propagation
+   check-dns - Detailed DNS check
+   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv - Test DKIM
+EOF
+
+# ===================================================================
 # COMPLETION
 # ===================================================================
 
@@ -588,7 +641,7 @@ fi
 echo ""
 echo "🔧 Don't forget:"
 echo "   • Set PTR records with your hosting provider"
-echo "   • Wait for DNS propagation before getting SSL certificate"
+echo "   • SSL certificates will be attempted automatically"
 echo ""
 echo "Test commands:"
 echo "   verify-dns                     - Check propagation"
@@ -601,5 +654,8 @@ if [ ! -z "$DKIM_RECORD_VALUE" ]; then
     echo "   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
     echo ""
 fi
+
+echo "DNS records saved to: /root/dns-records-$DOMAIN_NAME.txt"
+echo ""
 
 print_message "✓ Cloudflare DNS setup completed successfully!"
