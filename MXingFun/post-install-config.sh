@@ -2,9 +2,9 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION
-# Version: 17.0.0
+# Version: 17.0.1
 # Configures SSL, firewall, IP rotation finalization, and optimizations
-# FIXED: Complete IP rotation setup, better service detection, subdomain support
+# FIXED: Complete IP rotation setup with database integration, variable declarations
 # =================================================================
 
 # Colors
@@ -87,13 +87,13 @@ fi
 echo ""
 
 # ===================================================================
-# 1. FINALIZE IP ROTATION CONFIGURATION
+# 1. FINALIZE IP ROTATION CONFIGURATION WITH DATABASE INTEGRATION
 # ===================================================================
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     print_header "Finalizing IP Rotation Configuration"
     
-    echo "Configuring Postfix for ${#IP_ADDRESSES[@]} IP addresses..."
+    echo "Configuring Postfix for ${#IP_ADDRESSES[@]} IP addresses with database tracking..."
     
     # Create transport table
     cat > /etc/postfix/transport <<EOF
@@ -102,30 +102,38 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
 $DOMAIN_NAME    :
 EOF
     
-    # Create sender-dependent transport script
+    # Create enhanced sender-dependent transport script with full database support
     cat > /usr/local/bin/postfix-transport-selector <<'EOF'
 #!/bin/bash
-# Postfix Transport Selector for IP Rotation
-# This script assigns senders to specific IPs for sticky sessions
+# Postfix Transport Selector for IP Rotation with Database Tracking
+# This script assigns senders to specific IPs with sticky sessions
 
 SENDER="$1"
 NUM_IPS=REPLACE_NUM_IPS
 DB_PASS=$(cat /root/.mail_db_password 2>/dev/null)
+
+# IP addresses array
+declare -a IP_ADDRESSES=(
+REPLACE_IP_ARRAY
+)
 
 if [ -z "$SENDER" ]; then
     echo "smtp:"
     exit 0
 fi
 
-# Check if sender already has assigned IP in database
+# Check if database is available
 if [ ! -z "$DB_PASS" ]; then
-    ASSIGNED=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -N -e "
-        SELECT transport_id FROM ip_rotation_log WHERE sender_email='$SENDER' LIMIT 1
+    # Try to get existing assignment from database
+    ASSIGNED=$(mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -N -e "
+        SELECT transport_id FROM ip_rotation_log 
+        WHERE sender_email='$SENDER' 
+        LIMIT 1
     " 2>/dev/null)
     
-    if [ ! -z "$ASSIGNED" ]; then
+    if [ ! -z "$ASSIGNED" ] && [ "$ASSIGNED" -gt 0 ] 2>/dev/null; then
         # Update last used time and increment counter
-        mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
+        mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
             UPDATE ip_rotation_log 
             SET last_used=NOW(), message_count=message_count+1 
             WHERE sender_email='$SENDER'
@@ -136,20 +144,26 @@ if [ ! -z "$DB_PASS" ]; then
     fi
 fi
 
-# No existing assignment, create new one using hash
+# No existing assignment, create new one using hash for consistency
 HASH=$(echo -n "$SENDER" | md5sum | cut -c1-8)
 TRANSPORT_NUM=$((0x$HASH % NUM_IPS + 1))
 
 # Get the IP for this transport
-IP_NUM=$((TRANSPORT_NUM - 1))
-IP_ADDR="${IP_ADDRESSES[$IP_NUM]}"
+IP_INDEX=$((TRANSPORT_NUM - 1))
+if [ $IP_INDEX -lt ${#IP_ADDRESSES[@]} ]; then
+    ASSIGNED_IP="${IP_ADDRESSES[$IP_INDEX]}"
+else
+    ASSIGNED_IP="${IP_ADDRESSES[0]}"
+fi
 
-# Save assignment to database
-if [ ! -z "$DB_PASS" ]; then
-    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
-        INSERT INTO ip_rotation_log (sender_email, assigned_ip, transport_id, message_count)
-        VALUES ('$SENDER', '$IP_ADDR', $TRANSPORT_NUM, 1)
+# Save assignment to database if available
+if [ ! -z "$DB_PASS" ] && [ ! -z "$ASSIGNED_IP" ]; then
+    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
+        INSERT INTO ip_rotation_log (sender_email, assigned_ip, transport_id, message_count, last_used)
+        VALUES ('$SENDER', '$ASSIGNED_IP', $TRANSPORT_NUM, 1, NOW())
         ON DUPLICATE KEY UPDATE 
+            assigned_ip='$ASSIGNED_IP',
+            transport_id=$TRANSPORT_NUM,
             last_used=NOW(), 
             message_count=message_count+1
     " 2>/dev/null
@@ -161,14 +175,13 @@ EOF
     # Replace placeholders
     sed -i "s/REPLACE_NUM_IPS/${#IP_ADDRESSES[@]}/" /usr/local/bin/postfix-transport-selector
     
-    # Add IP addresses array to script
-    echo "" >> /usr/local/bin/postfix-transport-selector
-    echo "# IP Addresses" >> /usr/local/bin/postfix-transport-selector
-    echo "IP_ADDRESSES=(" >> /usr/local/bin/postfix-transport-selector
+    # Add IP addresses array to script (fixed variable declaration)
+    local ip_array_str=""
+    local ip
     for ip in "${IP_ADDRESSES[@]}"; do
-        echo "    \"$ip\"" >> /usr/local/bin/postfix-transport-selector
+        ip_array_str="${ip_array_str}    \"$ip\"\n"
     done
-    echo ")" >> /usr/local/bin/postfix-transport-selector
+    sed -i "s/REPLACE_IP_ARRAY/${ip_array_str}/" /usr/local/bin/postfix-transport-selector
     
     chmod +x /usr/local/bin/postfix-transport-selector
     
@@ -195,52 +208,133 @@ EOF
     # Configure transport maps
     postmap /etc/postfix/transport
     
-    # Update Postfix configuration
+    # Update Postfix configuration for IP rotation
     postconf -e "transport_maps = hash:/etc/postfix/transport"
     postconf -e "smtp_bind_address_enforce = yes"
+    postconf -e "default_transport = smtp"
     
-    # Create IP rotation monitoring command
+    # Create sender-based transport selection
+    cat > /etc/postfix/sender_transport <<EOF
+# Sender-based transport selection
+# This file can be used to override transport for specific senders
+# Format: sender@domain.com    transport:
+EOF
+    postmap /etc/postfix/sender_transport
+    
+    # Configure Postfix to use sender transport
+    postconf -e "sender_dependent_default_transport_maps = hash:/etc/postfix/sender_transport"
+    
+    # Create IP rotation monitoring command with database stats
     cat > /usr/local/bin/ip-rotation-status <<'EOF'
 #!/bin/bash
 
-# IP Rotation Status Monitor
+# IP Rotation Status Monitor with Database Statistics
+GREEN='\033[38;5;208m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
 DB_PASS=$(cat /root/.mail_db_password 2>/dev/null)
 
-echo "IP Rotation Status"
+echo -e "${GREEN}IP Rotation Status${NC}"
 echo "=================="
 echo ""
 
-if [ -z "$DB_PASS" ]; then
-    echo "Checking mail logs..."
-    for i in $(seq 1 REPLACE_NUM_IPS); do
-        count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=sent" || echo "0")
-        echo "Transport smtp-ip$i: $count messages sent today"
-    done
-else
-    echo "Database statistics:"
-    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
+# Check configuration
+NUM_IPS=$(grep -c "smtp-ip" /etc/postfix/master.cf 2>/dev/null || echo "0")
+echo "Configured IP Transports: $NUM_IPS"
+echo ""
+
+if [ ! -z "$DB_PASS" ]; then
+    echo "Database Statistics:"
+    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
         SELECT 
             transport_id as 'Transport',
             assigned_ip as 'IP Address',
-            COUNT(*) as 'Senders',
-            SUM(message_count) as 'Messages',
-            MAX(last_used) as 'Last Used'
+            COUNT(*) as 'Active Senders',
+            SUM(message_count) as 'Total Messages',
+            MAX(last_used) as 'Last Activity'
         FROM ip_rotation_log
         GROUP BY transport_id, assigned_ip
         ORDER BY transport_id
-    " 2>/dev/null || echo "No data available yet"
+    " 2>/dev/null || echo "  No rotation data in database yet"
+    echo ""
+fi
+
+echo "Log File Statistics (last 24 hours):"
+for i in $(seq 1 $NUM_IPS); do
+    sent_count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=sent" || echo "0")
+    deferred_count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=deferred" || echo "0")
+    bounced_count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=bounced" || echo "0")
+    
+    echo -e "Transport smtp-ip$i:"
+    echo "  Sent: $sent_count | Deferred: $deferred_count | Bounced: $bounced_count"
+done
+
+echo ""
+echo "Current Mail Queue:"
+QUEUE_COUNT=$(mailq | grep -c "^[A-Z0-9]" 2>/dev/null || echo "0")
+if [ "$QUEUE_COUNT" -eq 0 ]; then
+    echo -e "  ${GREEN}✓ Queue is empty${NC}"
+else
+    echo -e "  ${YELLOW}⚠ $QUEUE_COUNT messages in queue${NC}"
 fi
 
 echo ""
-echo "Current mail queue:"
-mailq | tail -5
+echo "Recent IP Usage (last 10 sent emails):"
+grep "status=sent" /var/log/mail.log 2>/dev/null | tail -10 | while read line; do
+    if echo "$line" | grep -q "postfix-ip"; then
+        transport=$(echo "$line" | grep -oP 'postfix-ip\d+' | head -1)
+        recipient=$(echo "$line" | grep -oP 'to=<[^>]+>' | sed 's/to=<//;s/>//')
+        echo "  $transport -> $recipient"
+    fi
+done
+
+echo ""
+echo "Commands:"
+echo "  mail-log ip-rotation  - View all IP rotation logs"
+echo "  maildb ip-stats       - Database IP statistics"
+echo "  mail-queue show       - View mail queue"
+echo ""
+echo "To test IP rotation:"
+echo "  for i in {1..5}; do"
+echo "    echo 'test' | mail -s 'test' -r user\$i@domain.com test@example.com"
+echo "  done"
 EOF
     
-    sed -i "s/REPLACE_NUM_IPS/${#IP_ADDRESSES[@]}/" /usr/local/bin/ip-rotation-status
     chmod +x /usr/local/bin/ip-rotation-status
     
-    print_message "✓ IP rotation configured with sticky sessions"
+    # Create test script for IP rotation
+    cat > /usr/local/bin/test-ip-rotation <<'EOF'
+#!/bin/bash
+
+# Test IP Rotation Script
+echo "Testing IP rotation with 5 different senders..."
+echo ""
+
+DOMAIN=$(postconf -h mydomain)
+
+for i in {1..5}; do
+    SENDER="testuser$i@$DOMAIN"
+    echo -n "Sending from $SENDER... "
+    
+    # Get assigned transport
+    TRANSPORT=$(/usr/local/bin/postfix-transport-selector "$SENDER" 2>/dev/null)
+    echo "assigned to $TRANSPORT"
+    
+    # Send test email
+    echo "Test email $i" | mail -s "IP Rotation Test $i" -r "$SENDER" postmaster@localhost 2>/dev/null
+done
+
+echo ""
+echo "Check assignments with: ip-rotation-status"
+echo "View database: maildb ip-stats"
+EOF
+    
+    chmod +x /usr/local/bin/test-ip-rotation
+    
+    print_message "✓ IP rotation configured with database-backed sticky sessions"
     echo "  Monitor with: ip-rotation-status"
+    echo "  Test with: test-ip-rotation"
     echo ""
 fi
 
@@ -861,10 +955,11 @@ DKIM Status:
 
 $(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "IP Rotation:"
-    echo "  Status: Configured"
+    echo "  Status: Configured with database tracking"
     echo "  Total IPs: ${#IP_ADDRESSES[@]}"
     echo "  Mode: Sticky sessions (sender-based)"
     echo "  Monitor: ip-rotation-status"
+    echo "  Test: test-ip-rotation"
 fi)
 
 Services:
@@ -908,7 +1003,8 @@ Management Commands:
   get-ssl-cert      - Get/renew SSL certificates
   mailwizz-info     - Mailwizz configuration info
 $([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "  ip-rotation-status - Monitor IP rotation")
-$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "  ip-usage          - Check IP usage statistics")
+$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "  test-ip-rotation  - Test IP rotation")
+$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "  maildb ip-stats   - Database IP statistics")
 
 Logs:
   /var/log/mail.log     - Mail server log
@@ -934,7 +1030,7 @@ echo "✓ Fail2ban configured"
 echo "✓ Services optimized"
 echo "✓ Log rotation configured"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "✓ IP rotation configured with sticky sessions"
+    echo "✓ IP rotation configured with database-backed sticky sessions"
 fi
 echo ""
 
@@ -952,8 +1048,9 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "IP ROTATION:"
     echo "  Configured IPs: ${#IP_ADDRESSES[@]}"
     echo "  Primary: $PRIMARY_IP"
-    echo "  Mode: Sticky sessions"
+    echo "  Mode: Database-backed sticky sessions"
     echo "  Monitor: ip-rotation-status"
+    echo "  Test: test-ip-rotation"
 fi
 
 echo ""
@@ -992,8 +1089,12 @@ echo "3. Check DNS and DKIM:"
 echo "   check-dns $DOMAIN_NAME"
 echo ""
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "4. Monitor IP rotation:"
+    echo "4. Test IP rotation:"
+    echo "   test-ip-rotation"
+    echo ""
+    echo "5. Monitor IP usage:"
     echo "   ip-rotation-status"
+    echo "   maildb ip-stats"
     echo ""
 fi
 
@@ -1002,5 +1103,5 @@ echo ""
 print_message "✓ Post-installation configuration completed!"
 print_message "✓ Your mail server is ready with DKIM signing enabled!"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_message "✓ IP rotation is active with sticky sessions!"
+    print_message "✓ IP rotation is active with database-backed sticky sessions!"
 fi
