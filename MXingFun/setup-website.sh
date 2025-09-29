@@ -2,7 +2,7 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.1
+# Version: 17.0.0
 # Creates compliance website automatically with all required pages
 # =================================================================
 
@@ -953,14 +953,6 @@ server {
     # Logging
     access_log /var/log/nginx/${DOMAIN_NAME}_access.log;
     error_log /var/log/nginx/${DOMAIN_NAME}_error.log;
-}
-
-# Redirect www to non-www
-server {
-    listen 80;
-    listen [::]:80;
-    server_name www.$DOMAIN_NAME;
-    return 301 http://\$DOMAIN_NAME\$request_uri;
 }
 EOF
 
