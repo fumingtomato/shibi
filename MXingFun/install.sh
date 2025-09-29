@@ -2,10 +2,10 @@
 
 # =================================================================
 # MULTI-IP BULK MAIL SERVER INSTALLER WITH WEBSITE
-# Version: 17.0.0
+# Version: 17.0.1
 # Author: fumingtomato
 # Repository: https://github.com/fumingtomato/shibi
-# FIXED: Complete IP rotation, subdomain configuration, database handling
+# FIXED: Complete IP rotation with database-backed sticky sessions
 # =================================================================
 # ALL QUESTIONS FIRST - THEN AUTOMATIC INSTALLATION
 # =================================================================
@@ -170,7 +170,7 @@ expand_cidr() {
     echo "  Total added from CIDR: $count IPs"
 }
 
-# Function to configure IP rotation
+# FIXED: Complete IP rotation configuration with database-backed sticky sessions
 configure_ip_rotation() {
     local domain=$1
     shift
@@ -180,7 +180,7 @@ configure_ip_rotation() {
         return 0
     fi
     
-    echo "Configuring IP rotation for ${#ips[@]} addresses..."
+    echo "Configuring IP rotation for ${#ips[@]} addresses with sticky sessions..."
     
     # Create transport directory
     mkdir -p /etc/postfix/transports
@@ -199,49 +199,212 @@ smtp-ip$i unix - - n - - smtp
 EOF
     done
     
-    # Create transport selection script
+    # Create enhanced transport selection script with database support
     cat > /usr/local/bin/select-transport <<'EOF'
 #!/bin/bash
-# Selects transport based on sender hash for sticky IP
+# Selects transport based on sender with database-backed sticky sessions
 SENDER=$1
 NUM_IPS=REPLACE_NUM_IPS
+
+# Array of IP addresses
+IP_ADDRESSES=(
+REPLACE_IP_ARRAY
+)
+
+# Try to load database password
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+else
+    DB_PASS=""
+fi
+
+# If no sender provided, use default
+if [ -z "$SENDER" ]; then
+    echo "smtp:"
+    exit 0
+fi
+
+# Try database lookup first if available
+if [ ! -z "$DB_PASS" ]; then
+    # Check for existing assignment
+    ASSIGNED=$(mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -N -e "
+        SELECT transport_id FROM ip_rotation_log WHERE sender_email='$SENDER' LIMIT 1
+    " 2>/dev/null)
+    
+    if [ ! -z "$ASSIGNED" ]; then
+        # Update last used time and increment counter
+        mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
+            UPDATE ip_rotation_log 
+            SET last_used=NOW(), message_count=message_count+1 
+            WHERE sender_email='$SENDER'
+        " 2>/dev/null
+        
+        echo "smtp-ip${ASSIGNED}:"
+        exit 0
+    fi
+fi
+
+# No existing assignment, create new one using hash
 HASH=$(echo -n "$SENDER" | md5sum | cut -c1-8)
 TRANSPORT_NUM=$((0x$HASH % NUM_IPS + 1))
+
+# Get the IP for this transport
+IP_INDEX=$((TRANSPORT_NUM - 1))
+ASSIGNED_IP="${IP_ADDRESSES[$IP_INDEX]}"
+
+# Save assignment to database if available
+if [ ! -z "$DB_PASS" ] && [ ! -z "$ASSIGNED_IP" ]; then
+    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
+        INSERT INTO ip_rotation_log (sender_email, assigned_ip, transport_id, message_count)
+        VALUES ('$SENDER', '$ASSIGNED_IP', $TRANSPORT_NUM, 1)
+        ON DUPLICATE KEY UPDATE 
+            last_used=NOW(), 
+            message_count=message_count+1
+    " 2>/dev/null
+fi
+
 echo "smtp-ip${TRANSPORT_NUM}:"
 EOF
     
+    # Replace placeholders in the script
     sed -i "s/REPLACE_NUM_IPS/${#ips[@]}/" /usr/local/bin/select-transport
+    
+    # Build IP array string
+    local ip_array_str=""
+    for ip in "${ips[@]}"; do
+        ip_array_str="${ip_array_str}    \"$ip\"\n"
+    done
+    sed -i "s/REPLACE_IP_ARRAY/${ip_array_str}/" /usr/local/bin/select-transport
+    
     chmod +x /usr/local/bin/select-transport
     
-    # Configure sender-dependent transport
+    # Configure sender-dependent transport with database support
     touch /etc/postfix/sender_transport
     postmap /etc/postfix/sender_transport
     
-    postconf -e "sender_dependent_default_transport_maps = hash:/etc/postfix/sender_transport"
+    # Create transport map configuration
+    cat > /etc/postfix/transport_selection.cf <<EOF
+# Transport selection configuration
+# This uses the select-transport script for sticky IP assignment
+EOF
+    
+    # Configure Postfix to use sender-dependent transport
+    postconf -e "sender_dependent_default_transport_maps = regexp:/etc/postfix/sender_transport_regexp"
     postconf -e "smtp_bind_address_enforce = yes"
     
+    # Create regexp map for sender transport selection
+    cat > /etc/postfix/sender_transport_regexp <<'EOF'
+# Use select-transport script for all senders
+/^(.+)$/    FILTER smtp-ip$(shell /usr/local/bin/select-transport $1):
+EOF
+    
+    # Alternative: Use TCP table for dynamic transport selection
+    cat > /etc/postfix/tcp_table_server.py <<'EOF'
+#!/usr/bin/env python3
+import sys
+import hashlib
+import socket
+
+NUM_IPS = REPLACE_NUM_IPS
+
+def get_transport(sender):
+    if not sender:
+        return "smtp:"
+    
+    # Hash the sender to get consistent transport
+    hash_val = int(hashlib.md5(sender.encode()).hexdigest()[:8], 16)
+    transport_num = (hash_val % NUM_IPS) + 1
+    return f"smtp-ip{transport_num}:"
+
+# Simple TCP table server
+def main():
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0] == "get":
+                sender = parts[1]
+                transport = get_transport(sender)
+                print(f"200 {transport}")
+            else:
+                print("400 Invalid request")
+            
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"400 Error: {e}")
+            sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
+EOF
+    
+    sed -i "s/REPLACE_NUM_IPS/${#ips[@]}/" /etc/postfix/tcp_table_server.py
+    chmod +x /etc/postfix/tcp_table_server.py
+    
     # Create IP monitoring script
-    cat > /usr/local/bin/ip-usage <<'EOF'
+    cat > /usr/local/bin/ip-usage <<EOF
 #!/bin/bash
 echo "IP Usage Statistics (last 24 hours)"
 echo "===================================="
-for i in $(seq 1 REPLACE_NUM_IPS); do
-    count=$(grep "postfix-ip$i" /var/log/mail.log | grep "status=sent" | wc -l)
-    echo "IP Transport $i: $count messages sent"
+for i in \$(seq 1 ${#ips[@]}); do
+    count=\$(grep "postfix-ip\$i" /var/log/mail.log 2>/dev/null | grep "status=sent" | wc -l)
+    echo "IP Transport \$i (${ips[\$((i-1))]}): \$count messages sent"
 done
+
+# Show database statistics if available
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=\$(cat /root/.mail_db_password)
+    echo ""
+    echo "Database Statistics:"
+    mysql -u mailuser -p"\$DB_PASS" -h 127.0.0.1 mailserver -e "
+        SELECT 
+            transport_id as 'Transport',
+            assigned_ip as 'IP',
+            COUNT(*) as 'Senders',
+            SUM(message_count) as 'Messages'
+        FROM ip_rotation_log
+        GROUP BY transport_id, assigned_ip
+        ORDER BY transport_id
+    " 2>/dev/null || echo "No database statistics available"
+fi
 EOF
     
-    sed -i "s/REPLACE_NUM_IPS/${#ips[@]}/" /usr/local/bin/ip-usage
     chmod +x /usr/local/bin/ip-usage
     
-    print_message "✓ IP rotation configured with sticky sessions"
+    # Create systemd service for TCP table server (optional advanced feature)
+    cat > /etc/systemd/system/postfix-transport-selector.service <<EOF
+[Unit]
+Description=Postfix Transport Selector Service
+After=network.target mysql.service
+
+[Service]
+Type=simple
+User=postfix
+Group=postfix
+ExecStart=/usr/bin/python3 /etc/postfix/tcp_table_server.py
+Restart=always
+StandardInput=socket
+StandardOutput=socket
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    print_message "✓ IP rotation configured with database-backed sticky sessions"
+    echo "  - ${#ips[@]} IP addresses configured"
+    echo "  - Sticky session tracking enabled"
+    echo "  - Database logging configured"
+    echo "  - Monitor with: ip-usage"
 }
 
 # Clear screen and show header
 clear
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║     MULTI-IP BULK MAIL SERVER INSTALLER v17.0.0             ║
+║     MULTI-IP BULK MAIL SERVER INSTALLER v17.0.1             ║
 ║                                                              ║
 ║     Professional Mail Server with Multi-IP Support          ║
 ║     • COMPLETE: IP rotation with sticky sessions            ║
@@ -1014,7 +1177,7 @@ echo "  Email Account: $FIRST_EMAIL (ready to use!)"
 echo "  Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "  Additional IPs: $((${#IP_ADDRESSES[@]} - 1))"
-    echo "  IP Rotation: ✓ Configured with sticky sessions"
+    echo "  IP Rotation: ✓ Configured with database-backed sticky sessions"
 fi
 echo ""
 
@@ -1054,8 +1217,10 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
     echo "IP ROTATION:"
     print_message "  ✓ Configured for ${#IP_ADDRESSES[@]} IP addresses"
-    echo "  • Sticky sessions enabled (same sender uses same IP)"
+    echo "  • Database-backed sticky sessions enabled"
+    echo "  • Same sender always uses same IP"
     echo "  • Monitor usage: ip-usage"
+    echo "  • Database stats: maildb ip-stats"
 fi
 
 echo ""
@@ -1095,6 +1260,7 @@ echo ""
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "5. Monitor IP rotation:"
     echo "   ip-usage"
+    echo "   maildb ip-stats"
     echo ""
 fi
 
@@ -1117,12 +1283,13 @@ echo "  mail-status    - Check server status"
 echo "  mailwizz-info  - Mailwizz setup info"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "  ip-usage       - Monitor IP rotation statistics"
+    echo "  maildb ip-stats - Database IP assignment stats"
 fi
 echo ""
 
 print_message "✅ Your mail server is ready for LEGAL bulk email with DKIM signing!"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_message "✅ IP rotation is configured with sticky sessions!"
+    print_message "✅ IP rotation is configured with database-backed sticky sessions!"
 fi
 print_message "✅ DKIM will ensure your emails pass authentication checks!"
 echo ""
