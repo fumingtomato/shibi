@@ -287,11 +287,10 @@ fi
 
 # Build list of ALL domains for SSL
 SSL_DOMAINS="$DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME"
-if [ ${#IP_ADDRESSES[@]} -gt 1 ] && [ ! -z "$MAIL_SUBDOMAIN" ]; then
-    for i in {1..9}; do
-        if [ $i -lt ${#IP_ADDRESSES[@]} ]; then
-            SSL_DOMAINS="$SSL_DOMAINS ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
-        fi
+# Add numbered subdomains if multiple IPs
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    for i in $(seq 1 $((${#IP_ADDRESSES[@]} - 1))); do
+        SSL_DOMAINS="$SSL_DOMAINS ${MAIL_PREFIX}${i}.$DOMAIN_NAME"
     done
 fi
 
