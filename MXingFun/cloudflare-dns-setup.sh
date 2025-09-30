@@ -2,7 +2,7 @@
 
 # =================================================================
 # CLOUDFLARE DNS SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.6 - FIXED DKIM extraction and Cloudflare API submission
+# Version: 17.1.0 - Fixed hostname generation with custom subdomain
 # Adds all DNS records including DKIM automatically
 # =================================================================
 
@@ -53,7 +53,7 @@ if [ -z "$DOMAIN_NAME" ]; then
     exit 1
 fi
 
-# Use configured hostname with subdomain
+# FIX 1: Use configured hostname with custom subdomain
 if [ ! -z "$MAIL_SUBDOMAIN" ]; then
     HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
     MAIL_PREFIX="$MAIL_SUBDOMAIN"
@@ -335,7 +335,7 @@ EOF
 
 print_header "Adding DNS Records to Cloudflare"
 
-# 1. A record for mail subdomain (USING CONFIGURED SUBDOMAIN)
+# FIX 1: A record for mail subdomain (USING CONFIGURED SUBDOMAIN)
 add_dns_record "A" "$HOSTNAME" "$PRIMARY_IP" "" "false"
 
 # 2. A record for root domain (for website)
@@ -344,18 +344,16 @@ add_dns_record "A" "$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
 # 3. A record for www subdomain
 add_dns_record "A" "www.$DOMAIN_NAME" "$PRIMARY_IP" "" "false"
 
-# 4. Additional IPs as A records (USING CONFIGURED SUBDOMAIN PREFIX)
+# FIX 1: Additional IPs as A records (USING CONFIGURED SUBDOMAIN PREFIX)
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
     echo "Adding additional IP addresses..."
-    i=0
-    for ip in "${IP_ADDRESSES[@]:1}"; do
-        i=$((i+1))
-        if [ $i -le 9 ]; then
-            # Use configured subdomain prefix
-            add_dns_record "A" "${MAIL_PREFIX}${i}.$DOMAIN_NAME" "$ip" "" "false"
-        else
-            add_dns_record "A" "smtp${i}.$DOMAIN_NAME" "$ip" "" "false"
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if [ $i -ne 0 ]; then
+            ip="${IP_ADDRESSES[$i]}"
+            # Use configured subdomain prefix with number suffix
+            subdomain_name="${MAIL_PREFIX}${i}.$DOMAIN_NAME"
+            add_dns_record "A" "$subdomain_name" "$ip" "" "false"
         fi
     done
 fi
@@ -464,8 +462,11 @@ echo "  Should resolve to: $HOSTNAME"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
     echo "Additional IPs needing PTR records:"
-    for ip in "${IP_ADDRESSES[@]:1}"; do
-        echo "  IP: $ip -> $HOSTNAME"
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if [ $i -ne 0 ]; then
+            ip="${IP_ADDRESSES[$i]}"
+            echo "  IP: $ip -> ${MAIL_PREFIX}${i}.$DOMAIN_NAME"
+        fi
     done
 fi
 
@@ -568,6 +569,7 @@ cat > /usr/local/bin/verify-dns << 'EOF'
 DOMAIN="DOMAIN_PLACEHOLDER"
 HOSTNAME="HOSTNAME_PLACEHOLDER"
 PRIMARY_IP="IP_PLACEHOLDER"
+MAIL_PREFIX="PREFIX_PLACEHOLDER"
 
 GREEN='\033[38;5;208m'
 RED='\033[0;31m'
@@ -626,6 +628,7 @@ EOF
 sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/verify-dns
 sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" /usr/local/bin/verify-dns
 sed -i "s/IP_PLACEHOLDER/$PRIMARY_IP/g" /usr/local/bin/verify-dns
+sed -i "s/PREFIX_PLACEHOLDER/$MAIL_PREFIX/g" /usr/local/bin/verify-dns
 chmod +x /usr/local/bin/verify-dns
 
 # ===================================================================
@@ -651,7 +654,12 @@ RECORDS ADDED:
    - $DOMAIN_NAME → $PRIMARY_IP
    - www.$DOMAIN_NAME → $PRIMARY_IP
 $(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "   - Additional IPs configured with ${MAIL_PREFIX}N.$DOMAIN_NAME pattern"
+    echo "   - Additional IPs configured with ${MAIL_PREFIX}N.$DOMAIN_NAME pattern:"
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if [ $i -ne 0 ]; then
+            echo "     ${MAIL_PREFIX}${i}.$DOMAIN_NAME → ${IP_ADDRESSES[$i]}"
+        fi
+    done
 fi)
 
 2. MX Record:
@@ -680,8 +688,10 @@ fi)
 PTR RECORDS (MUST BE SET WITH YOUR HOSTING PROVIDER):
    - $PRIMARY_IP → $HOSTNAME
 $(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    for ip in "${IP_ADDRESSES[@]:1}"; do
-        echo "   - $ip → $HOSTNAME"
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if [ $i -ne 0 ]; then
+            echo "   - ${IP_ADDRESSES[$i]} → ${MAIL_PREFIX}${i}.$DOMAIN_NAME"
+        fi
     done
 fi)
 
@@ -723,6 +733,7 @@ else
 fi
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "✅ Multiple IP addresses configured with ${MAIL_PREFIX}N pattern"
+    echo "   Example: ${MAIL_PREFIX}1.$DOMAIN_NAME, ${MAIL_PREFIX}2.$DOMAIN_NAME, etc."
 fi
 echo ""
 echo "⏱ DNS propagation typically takes:"
@@ -749,4 +760,4 @@ else
 fi
 
 echo ""
-print_message "✓ Cloudflare DNS setup completed!"
+print_message "✓ Cloudflare DNS setup completed with $MAIL_PREFIX subdomain!"
