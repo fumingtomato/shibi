@@ -2,7 +2,7 @@
 
 # =================================================================
 # CLOUDFLARE DNS SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.5 - FIXED DKIM key extraction
+# Version: 17.0.6 - FIXED DKIM extraction and Cloudflare API submission
 # Adds all DNS records including DKIM automatically
 # =================================================================
 
@@ -87,7 +87,7 @@ if ! command -v jq &> /dev/null; then
 fi
 
 # ===================================================================
-# GET AND PREPARE DKIM KEY (1024-bit compatible) - FIXED
+# GET AND PREPARE DKIM KEY (FIXED EXTRACTION METHOD)
 # ===================================================================
 
 DKIM_KEY=""
@@ -96,52 +96,55 @@ DKIM_RECORD_VALUE=""
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     print_message "✓ DKIM key found (generated during installation)"
     
-    # Extract the COMPLETE key - IMPROVED METHOD
-    # First, get the entire content between quotes
-    RAW_CONTENT=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r' | sed 's/.*"v=DKIM1[^"]*p=//' | sed 's/".*//')
+    # FIXED: Better extraction method that handles the multi-line format
+    # First, get the entire file content and clean it up
+    RAW_FILE=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt)
     
-    # If that didn't work, try alternative extraction
-    if [ -z "$RAW_CONTENT" ] || [ "$RAW_CONTENT" == "$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r')" ]; then
-        # Alternative method: extract everything between p= and the closing quote
-        RAW_CONTENT=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP 'p=\K[^"]+' | tr -d '\n\t\r ')
+    # Method 1: Extract everything between quotes, removing line breaks
+    DKIM_KEY=$(echo "$RAW_FILE" | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' ')
+    
+    # Method 2: If Method 1 fails, try extracting from the formatted output
+    if [ -z "$DKIM_KEY" ] || [ ${#DKIM_KEY} -lt 100 ]; then
+        # Extract all content between quotes and join
+        DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | \
+                   grep -o '"[^"]*"' | \
+                   sed 's/"//g' | \
+                   tr -d '\n' | \
+                   sed 's/.*p=//' | \
+                   tr -d ' ')
     fi
     
-    # Clean up any spaces
-    DKIM_KEY=$(echo "$RAW_CONTENT" | tr -d ' ')
+    # Method 3: If still failing, use awk
+    if [ -z "$DKIM_KEY" ] || [ ${#DKIM_KEY} -lt 100 ]; then
+        DKIM_KEY=$(awk '/p=/{found=1} found{gsub(/["\n\t\r ()]/, ""); gsub(/.*p=/, ""); gsub(/;.*/, ""); printf "%s", $0}' /etc/opendkim/keys/$DOMAIN_NAME/mail.txt)
+    fi
     
-    if [ ! -z "$DKIM_KEY" ]; then
+    # Validate the key
+    if [ ! -z "$DKIM_KEY" ] && [ ${#DKIM_KEY} -gt 100 ]; then
         KEY_LENGTH=${#DKIM_KEY}
         echo "  Key length: $KEY_LENGTH characters"
         
-        # 1024-bit keys are ~215 characters - should fit in single DNS TXT record
-        if [ $KEY_LENGTH -lt 255 ] && [ $KEY_LENGTH -gt 100 ]; then
-            echo "  1024-bit key detected - perfect for DNS"
-            DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
-        elif [ $KEY_LENGTH -ge 255 ]; then
-            print_warning "  WARNING: Key seems too long for 1024-bit (${KEY_LENGTH} chars)"
-            print_warning "  This might be a 2048-bit key - regenerate with 1024-bit"
-            DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
+        # Extract h= value if present
+        H_VALUE=$(echo "$RAW_FILE" | grep -oP 'h=\K[^;]+' | tr -d ' ' || echo "")
+        
+        # Build the complete DKIM record
+        if [ ! -z "$H_VALUE" ]; then
+            DKIM_RECORD_VALUE="v=DKIM1; h=$H_VALUE; k=rsa; p=$DKIM_KEY"
         else
-            print_warning "  WARNING: Key seems too short (${KEY_LENGTH} chars)"
-            print_warning "  Attempting to use it anyway"
             DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
+        fi
+        
+        # 1024-bit keys are ~216 characters
+        if [ $KEY_LENGTH -ge 200 ] && [ $KEY_LENGTH -le 250 ]; then
+            echo "  1024-bit key detected - perfect for DNS"
+        elif [ $KEY_LENGTH -gt 250 ]; then
+            print_warning "  WARNING: Key might be 2048-bit (${KEY_LENGTH} chars)"
         fi
         
         echo "  DKIM record prepared for DNS"
     else
         print_warning "⚠ Could not extract DKIM key from file"
-        print_warning "  Attempting alternative extraction..."
-        
-        # Last resort - try to get the raw p= value
-        DKIM_KEY=$(grep "p=" /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | sed 's/.*p=//' | sed 's/[";].*//' | tr -d '\n\t\r ')
-        
-        if [ ! -z "$DKIM_KEY" ]; then
-            echo "  Alternative extraction successful"
-            echo "  Key length: ${#DKIM_KEY} characters"
-            DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
-        else
-            print_error "  Failed to extract DKIM key"
-        fi
+        print_warning "  Key will need to be added manually"
     fi
 else
     print_warning "⚠ DKIM key file not found at /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
@@ -243,7 +246,7 @@ echo "Zone ID: $ZONE_ID"
 echo ""
 
 # ===================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (FIXED FOR PROPER DKIM HANDLING)
 # ===================================================================
 
 check_existing_record() {
@@ -277,22 +280,45 @@ add_dns_record() {
         done
     fi
     
-    # Build JSON data
+    # CRITICAL FIX: Properly escape the content for JSON
+    # This ensures special characters don't break the JSON
+    ESCAPED_CONTENT=$(echo "$record_content" | jq -Rs .)
+    
+    # Build JSON data based on record type
     if [ ! -z "$priority" ] && [ "$record_type" == "MX" ]; then
-        JSON_DATA=$(jq -n \
-            --arg type "$record_type" \
-            --arg name "$record_name" \
-            --arg content "$record_content" \
-            --argjson priority "$priority" \
-            --argjson proxied "$proxied" \
-            '{type: $type, name: $name, content: $content, priority: $priority, proxied: $proxied}')
+        JSON_DATA=$(cat <<EOF
+{
+  "type": "$record_type",
+  "name": "$record_name",
+  "content": "$record_content",
+  "priority": $priority,
+  "proxied": $proxied
+}
+EOF
+)
     else
-        JSON_DATA=$(jq -n \
-            --arg type "$record_type" \
-            --arg name "$record_name" \
-            --arg content "$record_content" \
-            --argjson proxied "$proxied" \
-            '{type: $type, name: $name, content: $content, proxied: $proxied}')
+        # For TXT records (including DKIM), use the escaped content
+        if [ "$record_type" == "TXT" ]; then
+            JSON_DATA=$(cat <<EOF
+{
+  "type": "$record_type",
+  "name": "$record_name",
+  "content": $ESCAPED_CONTENT,
+  "proxied": $proxied
+}
+EOF
+)
+        else
+            JSON_DATA=$(cat <<EOF
+{
+  "type": "$record_type",
+  "name": "$record_name",
+  "content": "$record_content",
+  "proxied": $proxied
+}
+EOF
+)
+        fi
     fi
     
     # Add the record
@@ -300,10 +326,12 @@ add_dns_record() {
     
     if [ "$(echo "$RESPONSE" | jq -r '.success' 2>/dev/null)" == "true" ]; then
         print_message "✓"
+        return 0
     else
         print_error "✗"
         ERROR_MSG=$(echo "$RESPONSE" | jq -r '.errors[0].message' 2>/dev/null)
         [ ! -z "$ERROR_MSG" ] && [ "$ERROR_MSG" != "null" ] && echo "  Error: $ERROR_MSG"
+        return 1
     fi
 }
 
@@ -355,36 +383,63 @@ add_dns_record "TXT" "$DOMAIN_NAME" "$SPF_RECORD" "" "false"
 DMARC_RECORD="v=DMARC1; p=quarantine; rua=mailto:dmarc@$DOMAIN_NAME; ruf=mailto:dmarc@$DOMAIN_NAME; fo=1; pct=100"
 add_dns_record "TXT" "_dmarc.$DOMAIN_NAME" "$DMARC_RECORD" "" "false"
 
-# 8. DKIM record (1024-bit key - COMPLETE VALUE)
-if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+# 8. DKIM record (FIXED TO WORK PROPERLY)
+if [ ! -z "$DKIM_RECORD_VALUE" ] && [ ! -z "$DKIM_KEY" ]; then
     echo ""
-    print_header "Adding DKIM Record (1024-bit)"
+    print_header "Adding DKIM Record"
     
     echo "Adding DKIM record to Cloudflare..."
     echo "  Name: mail._domainkey.$DOMAIN_NAME"
     echo "  Type: TXT"
     echo "  Key length: ${#DKIM_KEY} characters"
     
-    if [ ${#DKIM_KEY} -gt 255 ]; then
-        print_warning "  WARNING: Key is longer than expected for 1024-bit"
-        print_warning "  Expected ~215 characters, got ${#DKIM_KEY}"
-    fi
-    
-    # Add DKIM record with COMPLETE value
-    add_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD_VALUE" "" "false"
-    
-    if [ $? -eq 0 ]; then
+    # Add DKIM record with proper handling
+    if add_dns_record "TXT" "mail._domainkey.$DOMAIN_NAME" "$DKIM_RECORD_VALUE" "" "false"; then
         print_message "✓ DKIM record added successfully!"
         echo ""
-        echo "VERIFY: The DKIM value should be approximately 215 characters for 1024-bit key"
-        echo "If it's ~390 characters, you still have a 2048-bit key"
+        
+        # Verify it was added correctly
+        echo "Verifying DKIM record in Cloudflare..."
+        sleep 3
+        
+        CHECK_RESPONSE=$(cf_api_request "GET" "zones/$ZONE_ID/dns_records?type=TXT&name=mail._domainkey.$DOMAIN_NAME" "")
+        DKIM_IN_CF=$(echo "$CHECK_RESPONSE" | jq -r '.result[0].content' 2>/dev/null)
+        
+        if [[ "$DKIM_IN_CF" == *"p=$DKIM_KEY"* ]]; then
+            print_message "✓ DKIM record verified in Cloudflare!"
+        else
+            print_warning "⚠ DKIM record may not have been added correctly"
+            echo "  Please verify in Cloudflare dashboard"
+        fi
     else
-        print_error "✗ Failed to add DKIM record"
+        print_error "✗ Failed to add DKIM record via API"
         echo ""
-        echo "You can add it manually in Cloudflare:"
-        echo "  Name: mail._domainkey"
-        echo "  Type: TXT"
-        echo "  Value: $DKIM_RECORD_VALUE"
+        echo "MANUAL ADDITION REQUIRED:"
+        echo "========================="
+        echo "Add this TXT record in Cloudflare dashboard:"
+        echo ""
+        echo "Name: mail._domainkey"
+        echo "Type: TXT"
+        echo "Content: $DKIM_RECORD_VALUE"
+        echo ""
+        echo "========================="
+    fi
+else
+    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+        print_warning "⚠ DKIM key extraction failed"
+        echo ""
+        echo "MANUAL ADDITION REQUIRED:"
+        echo "========================="
+        echo "1. Get the key from your server:"
+        echo "   cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+        echo ""
+        echo "2. Extract the p= value (everything between quotes on the p= line)"
+        echo ""
+        echo "3. Add TXT record in Cloudflare:"
+        echo "   Name: mail._domainkey"
+        echo "   Type: TXT"
+        echo "   Content: v=DKIM1; k=rsa; p=[YOUR_KEY_HERE]"
+        echo "========================="
     fi
 fi
 
@@ -482,20 +537,20 @@ else
     print_warning "⚠ Not propagated yet"
 fi
 
-# Test DKIM record (CRITICAL CHECK)
-if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+# Test DKIM record
+if [ ! -z "$DKIM_KEY" ]; then
     echo -n "DKIM record: "
     DKIM=$(test_dns TXT mail._domainkey.$DOMAIN_NAME | grep "v=DKIM1")
     if [ ! -z "$DKIM" ]; then
-        print_message "✓ Found"
-        # Extract and check key length
-        DKIM_DNS_KEY=$(echo "$DKIM" | sed 's/.*p=//' | sed 's/".*//' | tr -d ' ')
-        echo "  DNS key length: ${#DKIM_DNS_KEY} characters"
-        if [ ${#DKIM_DNS_KEY} -lt 200 ]; then
-            print_warning "  ⚠ Key seems truncated (should be ~215 chars for 1024-bit)"
+        print_message "✓ Found in DNS"
+        # Verify it contains our key
+        if [[ "$DKIM" == *"$DKIM_KEY"* ]]; then
+            print_message "  ✓ Key matches local key"
+        else
+            print_warning "  ⚠ Key in DNS doesn't match local key"
         fi
     else
-        print_warning "⚠ Not propagated yet"
+        print_warning "⚠ Not in DNS yet (may take 5-30 minutes)"
     fi
 fi
 
@@ -553,13 +608,11 @@ for server in $DNS_SERVERS; do
         echo -e "${YELLOW}✗ ($result)${NC}"
     fi
     
-    # DKIM - check and display length
+    # DKIM
     echo -n "  DKIM record: "
     result=$(dig +short TXT mail._domainkey.$DOMAIN @$server 2>/dev/null)
     if echo "$result" | grep -q "v=DKIM1"; then
         echo -e "${GREEN}✓${NC}"
-        key_length=$(echo "$result" | sed 's/.*p=//' | sed 's/".*//' | tr -d ' ' | wc -c)
-        echo "    Key length in DNS: $((key_length-1)) characters"
     else
         echo -e "${YELLOW}✗${NC}"
     fi
@@ -568,7 +621,11 @@ for server in $DNS_SERVERS; do
 done
 
 echo "Note: DNS propagation can take 5-30 minutes globally"
-echo "DKIM key should be ~215 characters for 1024-bit key"
+
+# Test with OpenDKIM
+echo ""
+echo "OpenDKIM Verification:"
+opendkim-testkey -d $DOMAIN -s mail -vvv 2>&1 | tail -3
 EOF
 
 # Replace placeholders
@@ -581,7 +638,7 @@ chmod +x /usr/local/bin/verify-dns
 # SAVE DNS RECORDS FILE
 # ===================================================================
 
-# Save DNS records to file for reference
+# Save complete DNS records to file
 cat > /root/dns-records-$DOMAIN_NAME.txt <<EOF
 DNS RECORDS CONFIGURED IN CLOUDFLARE
 =====================================
@@ -612,17 +669,21 @@ fi)
 4. DMARC Record:
    - _dmarc.$DOMAIN_NAME TXT: "$DMARC_RECORD"
 
+5. DKIM Record:
+   - mail._domainkey.$DOMAIN_NAME TXT:
 $(if [ ! -z "$DKIM_RECORD_VALUE" ]; then
-echo "5. DKIM Record (1024-bit key):
-   - mail._domainkey.$DOMAIN_NAME TXT: Added
-   - Key length: ${#DKIM_KEY} characters"
+    echo "     $DKIM_RECORD_VALUE"
+    echo "   - Key length: ${#DKIM_KEY} characters"
+else
+    echo "     [MANUAL ADDITION REQUIRED - Key extraction failed]"
 fi)
 
 6. Additional Records:
+   - SPF for mail: $HOSTNAME TXT: v=spf1 a -all
    - Return Path CNAME: bounces.$DOMAIN_NAME → $HOSTNAME
    - Autodiscover CNAME: autodiscover.$DOMAIN_NAME → $HOSTNAME
 
-PTR RECORD (MUST BE SET WITH YOUR HOSTING PROVIDER):
+PTR RECORDS (MUST BE SET WITH YOUR HOSTING PROVIDER):
    - $PRIMARY_IP → $HOSTNAME
 $(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     for ip in "${IP_ADDRESSES[@]:1}"; do
@@ -631,18 +692,24 @@ $(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
 fi)
 
 VERIFICATION COMMANDS:
-   verify-dns - Check DNS propagation
-   check-dns - Detailed DNS check
-   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv - Test DKIM
+   verify-dns                              - Check DNS propagation
+   check-dns                               - Detailed DNS check
+   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv  - Test DKIM key
 
-DKIM VERIFICATION:
-   The DKIM key should be approximately 215 characters for a 1024-bit key.
-   If it shows ~390 characters, the key is still 2048-bit and needs regeneration.
-   
-MANUAL DKIM RECORD (if needed):
-   Name: mail._domainkey
-   Type: TXT
-   Value: $DKIM_RECORD_VALUE
+$(if [ -z "$DKIM_KEY" ] && [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+    echo ""
+    echo "MANUAL DKIM ADDITION REQUIRED:"
+    echo "==============================="
+    echo "The DKIM key could not be automatically extracted."
+    echo "Please add it manually to Cloudflare:"
+    echo ""
+    echo "1. Get the key from: cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+    echo "2. Extract the p= value (everything between quotes)"
+    echo "3. Add TXT record:"
+    echo "   Name: mail._domainkey"
+    echo "   Type: TXT"
+    echo "   Content: v=DKIM1; k=rsa; p=[YOUR_KEY_HERE]"
+fi)
 EOF
 
 # ===================================================================
@@ -653,11 +720,12 @@ echo ""
 print_header "DNS Configuration Complete!"
 
 echo ""
-echo "✅ All DNS records have been added to Cloudflare"
+echo "✅ DNS records have been added to Cloudflare"
 echo "✅ Using mail subdomain: $MAIL_PREFIX (creates $HOSTNAME)"
-if [ ! -z "$DKIM_RECORD_VALUE" ]; then
-    echo "✅ DKIM record has been added (1024-bit key: ~215 chars)"
-    echo "   Key extracted: ${#DKIM_KEY} characters"
+if [ ! -z "$DKIM_KEY" ]; then
+    echo "✅ DKIM record processed (${#DKIM_KEY} characters)"
+else
+    echo "⚠️  DKIM record needs manual addition"
 fi
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "✅ Multiple IP addresses configured with ${MAIL_PREFIX}N pattern"
@@ -668,60 +736,23 @@ echo "   - Cloudflare network: Immediate"
 echo "   - Global propagation: 5-30 minutes"
 echo "   - Full propagation: Up to 48 hours (rare)"
 echo ""
-echo "📝 Records added:"
-echo "   • A record: $HOSTNAME → $PRIMARY_IP"
-echo "   • A record: $DOMAIN_NAME → $PRIMARY_IP"
-echo "   • A record: www.$DOMAIN_NAME → $PRIMARY_IP"
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "   • Additional A records for ${#IP_ADDRESSES[@]} IP addresses"
-fi
-echo "   • MX record: $DOMAIN_NAME → $HOSTNAME"
-echo "   • SPF record: Includes all configured IPs"
-echo "   • DMARC record: Quarantine policy"
-if [ ! -z "$DKIM_RECORD_VALUE" ]; then
-    echo "   • DKIM record: mail._domainkey (1024-bit: ${#DKIM_KEY} chars)"
-fi
-echo ""
-echo "🔧 Don't forget:"
-echo "   • Set PTR records with your hosting provider"
-echo "   • SSL certificates will be obtained automatically"
+echo "📝 Configuration saved to: /root/dns-records-$DOMAIN_NAME.txt"
 echo ""
 echo "Test commands:"
 echo "   verify-dns                     - Check propagation"
 echo "   check-dns $DOMAIN_NAME         - Detailed DNS check"
-echo "   dig +short A $HOSTNAME @1.1.1.1"
 echo ""
 
-if [ ! -z "$DKIM_RECORD_VALUE" ]; then
-    echo "Test DKIM:"
+if [ ! -z "$DKIM_KEY" ]; then
+    echo "DKIM Verification:"
     echo "   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
     echo ""
-    echo "IMPORTANT: DKIM key length should be ~215 characters for 1024-bit"
-    echo "Your key length: ${#DKIM_KEY} characters"
-    if [ ${#DKIM_KEY} -gt 250 ]; then
-        print_warning "WARNING: Key might still be 2048-bit! Regenerate with:"
-        echo "   cd /etc/opendkim/keys/$DOMAIN_NAME"
-        echo "   opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024"
-        echo "   systemctl restart opendkim"
-    elif [ ${#DKIM_KEY} -lt 100 ]; then
-        print_warning "WARNING: Key seems too short! Check the file manually:"
-        echo "   cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
-    fi
+    echo "After 5 minutes, test your email score at:"
+    echo "   https://www.mail-tester.com"
+else
+    echo "⚠️  IMPORTANT: Add DKIM record manually in Cloudflare"
+    echo "   See /root/dns-records-$DOMAIN_NAME.txt for details"
 fi
 
 echo ""
-echo "DNS records saved to: /root/dns-records-$DOMAIN_NAME.txt"
-echo ""
-
-# Show the actual DKIM record value for manual addition if needed
-if [ ! -z "$DKIM_RECORD_VALUE" ]; then
-    echo "DKIM Record for manual addition (if needed):"
-    echo "----------------------------------------"
-    echo "Name: mail._domainkey"
-    echo "Type: TXT"
-    echo "Value: $DKIM_RECORD_VALUE"
-    echo "----------------------------------------"
-fi
-
-echo ""
-print_message "✓ Cloudflare DNS setup completed successfully!"
+print_message "✓ Cloudflare DNS setup completed!"
