@@ -390,19 +390,19 @@ if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
     fi
     
     # Add user to database
-    { mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<ADDUSER 2>/dev/null || \
-    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<ADDUSER 2>/dev/null || true
--- Get domain ID
-SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN_NAME');
+    { mysql -u mailuser -p"$DB_PASS" -h localhost mailserver 2>/dev/null || \
+    mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver 2>/dev/null || true; } <<ADDUSER
+    -- Get domain ID
+    SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN_NAME');
 
--- Delete existing user if any
-DELETE FROM virtual_users WHERE email = '$FIRST_EMAIL';
+    -- Delete existing user if any
+    DELETE FROM virtual_users WHERE email = '$FIRST_EMAIL';
 
--- Insert new user
-INSERT INTO virtual_users (domain_id, email, password, quota, active)
-SELECT id, '$FIRST_EMAIL', '$PASS_HASH', 0, 1
-FROM virtual_domains WHERE name = '$DOMAIN_NAME';
-ADDUSER
+    -- Insert new user
+    INSERT INTO virtual_users (domain_id, email, password, quota, active)
+    SELECT id, '$FIRST_EMAIL', '$PASS_HASH', 0, 1
+    FROM virtual_domains WHERE name = '$DOMAIN_NAME';
+    ADDUSER
     
     # Check if user was created
     USER_EXISTS=$(mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "SELECT COUNT(*) FROM virtual_users WHERE email='$FIRST_EMAIL'" 2>/dev/null | tail -1 || \
