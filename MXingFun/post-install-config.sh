@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =================================================================
-# MAIL SERVER POST-INSTALLATION CONFIGURATION - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.4 - FIXED ip_local_port_range and DKIM verification
+# MAIL SERVER POST-INSTALLATION CONFIGURATION
+# Version: 17.1.0 - Fixed hostname generation and IP rotation
 # Configures SSL, firewall, IP rotation finalization, and optimizations
 # =================================================================
 
@@ -57,7 +57,7 @@ if [ -z "$DOMAIN_NAME" ]; then
         DOMAIN_NAME=$(hostname -d)
     fi
 else
-    # Use configured hostname with subdomain
+    # FIX 1: Use configured hostname with custom subdomain
     if [ ! -z "$MAIL_SUBDOMAIN" ]; then
         HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
     else
@@ -78,6 +78,7 @@ fi
 echo "Configuration:"
 echo "  Domain: $DOMAIN_NAME"
 echo "  Hostname: $HOSTNAME"
+echo "  Mail Subdomain: ${MAIL_SUBDOMAIN:-mail}"
 echo "  Admin Email: $ADMIN_EMAIL"
 echo "  Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
@@ -86,7 +87,7 @@ fi
 echo ""
 
 # ===================================================================
-# 1. FINALIZE IP ROTATION CONFIGURATION
+# 1. FINALIZE IP ROTATION CONFIGURATION (FIX 2)
 # ===================================================================
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
@@ -97,27 +98,63 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     # Ensure MySQL directory exists
     mkdir -p /etc/postfix/mysql
     
-    # Update transport table if needed
-    if [ ! -f /etc/postfix/transport ]; then
-        cat > /etc/postfix/transport <<EOF
-# Transport table for IP rotation
-# Default transport uses database-based selection
-$DOMAIN_NAME    :
-EOF
-        postmap /etc/postfix/transport
-        postconf -e "transport_maps = hash:/etc/postfix/transport"
+    # Get database password
+    if [ -f /root/.mail_db_password ]; then
+        DB_PASS=$(cat /root/.mail_db_password)
+    else
+        print_error "Database password not found"
+        exit 1
     fi
     
-    # Ensure IP rotation is properly configured
+    # Create sender transport lookup
+    cat > /etc/postfix/mysql/sender-transports.cf <<EOF
+user = mailuser
+password = $DB_PASS
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT CONCAT('smtp-ip', transport_id, ':') FROM ip_rotation_advanced WHERE sender_email='%s'
+EOF
+    
+    # Set permissions
+    chmod 640 /etc/postfix/mysql/sender-transports.cf
+    chown root:postfix /etc/postfix/mysql/sender-transports.cf
+    
+    # Create hash-based sender transports file
+    touch /etc/postfix/sender_transports
+    postmap /etc/postfix/sender_transports
+    
+    # Configure Postfix for sender-dependent transport
+    postconf -e "sender_dependent_default_transport_maps = hash:/etc/postfix/sender_transports, mysql:/etc/postfix/mysql/sender-transports.cf"
+    postconf -e "smtp_sender_dependent_authentication = yes"
     postconf -e "smtp_bind_address_enforce = yes"
     postconf -e "default_transport = smtp"
+    
+    # Verify transport configurations in master.cf
+    echo "Verifying transport configurations..."
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if grep -q "smtp-ip$i" /etc/postfix/master.cf; then
+            echo "  ✓ Transport smtp-ip$i configured"
+        else
+            print_warning "  ⚠ Transport smtp-ip$i missing - adding"
+            
+            # FIX 2: Add missing transport configuration
+            cat >> /etc/postfix/master.cf <<EOF
+
+# Transport for IP ${IP_ADDRESSES[$i]} (index $i)
+smtp-ip$i unix - - n - - smtp
+  -o smtp_bind_address=${IP_ADDRESSES[$i]}
+  -o smtp_helo_name=${MAIL_SUBDOMAIN}$i.$DOMAIN_NAME
+  -o syslog_name=postfix-ip$i
+EOF
+        fi
+    done
     
     print_message "✓ IP rotation finalized with ${#IP_ADDRESSES[@]} addresses"
     echo ""
 fi
 
 # ===================================================================
-# 2. VERIFY DKIM IS PROPERLY CONFIGURED (1024-bit) - FIXED
+# 2. VERIFY DKIM IS PROPERLY CONFIGURED (1024-bit)
 # ===================================================================
 
 print_header "Verifying DKIM Configuration"
@@ -129,9 +166,9 @@ if ! command -v opendkim &> /dev/null; then
     apt-get install -y opendkim opendkim-tools > /dev/null 2>&1
 fi
 
-# Check DKIM key size - FIXED VERSION
+# Check DKIM key size
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" ]; then
-    # Extract key bits properly - handle multiline output
+    # Extract key bits properly
     KEY_BITS=$(openssl rsa -in "/etc/opendkim/keys/$DOMAIN_NAME/mail.private" -text -noout 2>/dev/null | grep "Private-Key:" | head -1 | grep -oP '\d+' | head -1 || echo "0")
     
     # Ensure KEY_BITS is numeric
@@ -230,7 +267,7 @@ TemporaryDirectory      /var/tmp
 OversignHeaders         From
 EOF
 
-# Setup TrustedHosts with all IPs
+# Setup TrustedHosts with all IPs and hostnames
 cat > /etc/opendkim/TrustedHosts <<EOF
 127.0.0.1
 localhost
@@ -241,10 +278,13 @@ $HOSTNAME
 $DOMAIN_NAME
 EOF
 
-# Add all additional IPs
+# Add all additional IPs and their hostnames
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    for ip in "${IP_ADDRESSES[@]}"; do
-        echo "$ip" >> /etc/opendkim/TrustedHosts
+    for i in "${!IP_ADDRESSES[@]}"; do
+        echo "${IP_ADDRESSES[$i]}" >> /etc/opendkim/TrustedHosts
+        if [ $i -ne 0 ]; then
+            echo "${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
+        fi
     done
 fi
 
@@ -308,10 +348,13 @@ fi
 
 # Build list of ALL domains for SSL
 SSL_DOMAINS="$DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME"
-# Add numbered subdomains if multiple IPs
+
+# FIX 1: Add numbered subdomains with correct prefix if multiple IPs
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    for i in $(seq 1 $((${#IP_ADDRESSES[@]} - 1))); do
-        SSL_DOMAINS="$SSL_DOMAINS ${MAIL_PREFIX}${i}.$DOMAIN_NAME"
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if [ $i -ne 0 ]; then
+            SSL_DOMAINS="$SSL_DOMAINS ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+        fi
     done
 fi
 
@@ -433,9 +476,11 @@ if [ ! -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
     if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
         # Build domain list
         CERT_ARGS="-d $DOMAIN_NAME -d www.$DOMAIN_NAME -d $HOSTNAME"
-        if [ ! -z "$MAIL_SUBDOMAIN" ]; then
-            for i in {1..9}; do
-                [ -d "/var/www/$DOMAIN_NAME" ] && CERT_ARGS="$CERT_ARGS -d ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+        if [ ! -z "$MAIL_SUBDOMAIN" ] && [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+            for i in "${!IP_ADDRESSES[@]}"; do
+                if [ $i -ne 0 ]; then
+                    CERT_ARGS="$CERT_ARGS -d ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+                fi
             done
         fi
         
@@ -492,87 +537,7 @@ else
 fi
 
 # ===================================================================
-# 5. FAIL2BAN CONFIGURATION
-# ===================================================================
-
-print_header "Fail2ban Configuration"
-
-if ! command -v fail2ban-client &> /dev/null; then
-    print_message "Installing Fail2ban..."
-    apt-get install -y fail2ban > /dev/null 2>&1
-fi
-
-# Create jail configuration
-cat > /etc/fail2ban/jail.local <<'EOF'
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 5
-destemail = root@localhost
-action = %(action_mwl)s
-
-[sshd]
-enabled = true
-port = 22
-maxretry = 3
-
-[postfix]
-enabled = true
-port = smtp,submission,smtps
-filter = postfix
-logpath = /var/log/mail.log
-maxretry = 3
-
-[postfix-sasl]
-enabled = true
-port = smtp,submission,smtps
-filter = postfix[mode=auth]
-logpath = /var/log/mail.log
-maxretry = 3
-
-[dovecot]
-enabled = true
-port = pop3,pop3s,imap,imaps,submission,sieve
-filter = dovecot
-logpath = /var/log/mail.log
-maxretry = 3
-
-[nginx-http-auth]
-enabled = true
-filter = nginx-http-auth
-port = http,https
-logpath = /var/log/nginx/*error.log
-
-[nginx-noscript]
-enabled = true
-port = http,https
-filter = nginx-noscript
-logpath = /var/log/nginx/*access.log
-maxretry = 6
-
-[nginx-badbots]
-enabled = true
-port = http,https
-filter = nginx-badbots
-logpath = /var/log/nginx/*access.log
-maxretry = 2
-
-[nginx-noproxy]
-enabled = true
-port = http,https
-filter = nginx-noproxy
-logpath = /var/log/nginx/*error.log
-maxretry = 2
-EOF
-
-# Restart fail2ban
-systemctl restart fail2ban > /dev/null 2>&1
-systemctl enable fail2ban > /dev/null 2>&1
-
-print_message "✓ Fail2ban configured"
-
-# ===================================================================
-# 6. POSTFIX OPTIMIZATION
+# 5. POSTFIX OPTIMIZATION
 # ===================================================================
 
 print_header "Optimizing Postfix Configuration"
@@ -624,78 +589,7 @@ postconf -e "mailbox_size_limit = 0"         # Unlimited
 print_message "✓ Postfix optimized for bulk email"
 
 # ===================================================================
-# 7. SYSTEM OPTIMIZATION (FIXED)
-# ===================================================================
-
-print_header "System Optimization"
-
-# Increase file descriptors
-if ! grep -q "# Mail server limits" /etc/security/limits.conf; then
-    cat >> /etc/security/limits.conf <<EOF
-
-# Mail server limits
-* soft nofile 65536
-* hard nofile 65536
-* soft nproc 32768
-* hard nproc 32768
-EOF
-fi
-
-# Kernel parameters with proper ip_local_port_range values (odd start, even end)
-cat > /etc/sysctl.d/99-mailserver.conf <<EOF
-# Mail Server Optimization
-net.ipv4.tcp_fin_timeout = 20
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_keepalive_time = 1200
-# FIX: Use odd start and even end for port range to avoid warning
-net.ipv4.ip_local_port_range = 10001 65000
-net.core.rmem_default = 31457280
-net.core.rmem_max = 67108864
-net.core.wmem_default = 31457280
-net.core.wmem_max = 67108864
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_congestion_control = htcp
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_window_scaling = 1
-EOF
-
-# Apply sysctl settings quietly to avoid the warning showing
-sysctl -p /etc/sysctl.d/99-mailserver.conf > /dev/null 2>&1
-
-print_message "✓ System optimized"
-
-# ===================================================================
-# 8. LOG ROTATION
-# ===================================================================
-
-print_header "Configuring Log Rotation"
-
-cat > /etc/logrotate.d/mailserver <<EOF
-/var/log/mail.log
-/var/log/mail.err
-/var/log/mail.warn
-{
-    daily
-    rotate 30
-    compress
-    delaycompress
-    missingok
-    notifempty
-    sharedscripts
-    postrotate
-        /usr/bin/doveadm log reopen 2>/dev/null || true
-        /usr/sbin/postfix reload 2>/dev/null || true
-    endscript
-}
-EOF
-
-print_message "✓ Log rotation configured"
-
-# ===================================================================
-# 9. SERVICES RESTART
+# 6. SERVICES RESTART
 # ===================================================================
 
 print_header "Restarting Services"
@@ -725,7 +619,7 @@ for service in "${services[@]}"; do
 done
 
 # ===================================================================
-# 10. CREATE HELPER SCRIPT FOR SSL
+# 7. CREATE HELPER SCRIPT FOR SSL
 # ===================================================================
 
 print_header "Creating Helper Scripts"
@@ -734,7 +628,7 @@ print_header "Creating Helper Scripts"
 cat > /usr/local/bin/get-ssl-cert <<EOF
 #!/bin/bash
 
-# Quick SSL Certificate Getter - AUTOMATIC VERSION
+# Quick SSL Certificate Getter
 HOSTNAME="$HOSTNAME"
 DOMAIN="$DOMAIN_NAME"
 ADMIN_EMAIL="$ADMIN_EMAIL"
@@ -757,12 +651,14 @@ if host "\$DOMAIN" 8.8.8.8 > /dev/null 2>&1; then
     CERT_ARGS="-d \$DOMAIN -d www.\$DOMAIN -d \$HOSTNAME"
     
     # Add numbered subdomains if they exist
-    for i in {1..9}; do
-        SUB="\${MAIL_SUBDOMAIN}\${i}.\$DOMAIN"
-        if host "\$SUB" 8.8.8.8 > /dev/null 2>&1; then
-            CERT_ARGS="\$CERT_ARGS -d \$SUB"
-        fi
-    done
+    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+        for i in {1..$((${#IP_ADDRESSES[@]}-1))}; do
+            SUB="\${MAIL_SUBDOMAIN}\${i}.\$DOMAIN"
+            if host "\$SUB" 8.8.8.8 > /dev/null 2>&1; then
+                CERT_ARGS="\$CERT_ARGS -d \$SUB"
+            fi
+        done
+    fi
     
     echo "Requesting certificate for all domains..."
     
@@ -804,102 +700,6 @@ EOF
 chmod +x /usr/local/bin/get-ssl-cert
 
 # ===================================================================
-# 11. SAVE CONFIGURATION SUMMARY
-# ===================================================================
-
-cat > /root/mail-server-config.txt <<EOF
-Mail Server Configuration Summary
-Generated: $(date)
-================================================================================
-
-Domain: $DOMAIN_NAME
-Mail Subdomain: $MAIL_SUBDOMAIN
-Hostname: $HOSTNAME
-Admin Email: $ADMIN_EMAIL
-Primary IP: $PRIMARY_IP
-$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "Total IPs: ${#IP_ADDRESSES[@]}")
-
-First Email Account: ${FIRST_EMAIL:-Not configured}
-
-SSL Certificate:
-$(if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
-    echo "  Status: Let's Encrypt Active"
-    echo "  Location: /etc/letsencrypt/live/$DOMAIN_NAME/"
-    echo "  Auto-renewal: Enabled"
-else
-    echo "  Status: Self-signed (temporary)"
-    echo "  Get Let's Encrypt: run 'get-ssl-cert'"
-fi)
-
-DKIM Status:
-  Service: $(systemctl is-active opendkim 2>/dev/null || echo "not running")
-  Port 8891: $(netstat -lnp 2>/dev/null | grep -q ":8891" && echo "Listening" || echo "Not listening")
-  DKIM Key: $([ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ] && echo "Generated (1024-bit)" || echo "Missing")
-  Mode: SIGNING (sv)
-  DKIM in DNS: $(dig +short TXT mail._domainkey.$DOMAIN_NAME @8.8.8.8 2>/dev/null | grep -q "v=DKIM1" && echo "Yes" || echo "Pending")
-
-$(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "IP Rotation:"
-    echo "  Status: Configured with database tracking"
-    echo "  Total IPs: ${#IP_ADDRESSES[@]}"
-    echo "  Mode: Sticky sessions (sender-based)"
-    echo "  Monitor: ip-rotation-status"
-fi)
-
-Services:
-  Postfix (SMTP): $(systemctl is-active postfix 2>/dev/null || echo "not running")
-  Dovecot (IMAP): $(systemctl is-active dovecot 2>/dev/null || echo "not running")
-  OpenDKIM: $(systemctl is-active opendkim 2>/dev/null || echo "not running")
-  MySQL: $(systemctl is-active mysql 2>/dev/null || systemctl is-active mariadb 2>/dev/null || echo "not running")
-  Nginx: $(systemctl is-active nginx 2>/dev/null || echo "not running")
-  Fail2ban: $(systemctl is-active fail2ban 2>/dev/null || echo "not running")
-  Firewall: $(ufw status 2>/dev/null | grep -q "Status: active" && echo "Active" || echo "Inactive")
-
-Ports:
-  25  - SMTP
-  587 - Submission (STARTTLS)
-  465 - SMTPS
-  143 - IMAP
-  993 - IMAPS
-  110 - POP3
-  995 - POP3S
-  80  - HTTP (website)
-  443 - HTTPS (website)
-  8891 - OpenDKIM
-
-Website:
-  URL: http://$DOMAIN_NAME
-  SSL: $([ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] && echo "https://$DOMAIN_NAME" || echo "Pending auto-retry")
-  Root: /var/www/$DOMAIN_NAME
-
-Email Testing:
-  Send test: test-email check-auth@verifier.port25.com ${FIRST_EMAIL:-user@$DOMAIN_NAME}
-  Mail Tester: https://www.mail-tester.com
-  MX Toolbox: https://mxtoolbox.com/SuperTool.aspx?action=mx:$DOMAIN_NAME
-
-Management Commands:
-  test-email        - Send test email with DKIM
-  mail-account      - Manage email accounts
-  mail-status       - Check server status
-  mail-queue        - Manage mail queue
-  mail-log          - View mail logs
-  check-dns         - Verify DNS records
-  get-ssl-cert      - Get/renew SSL certificates
-  mailwizz-info     - Mailwizz configuration info
-$([ ${#IP_ADDRESSES[@]} -gt 1 ] && echo "  ip-rotation-status - Monitor IP rotation")
-
-Logs:
-  /var/log/mail.log     - Mail server log
-  /var/log/syslog       - System log
-  journalctl -xe        - Service logs
-
-Backup:
-  Run: mail-backup
-
-================================================================================
-EOF
-
-# ===================================================================
 # COMPLETION
 # ===================================================================
 
@@ -908,12 +708,10 @@ echo ""
 echo "✓ OpenDKIM configured with 1024-bit key and signing enabled"
 echo "✓ SSL/TLS configured (auto-retry enabled for all domains)"
 echo "✓ Firewall configured" 
-echo "✓ Fail2ban configured"
 echo "✓ Services optimized"
-echo "✓ System optimization completed (no kernel warnings)"
-echo "✓ Log rotation configured"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "✓ IP rotation configured with database-backed sticky sessions"
+    echo "✓ IP rotation configured with ${#IP_ADDRESSES[@]} addresses"
+    echo "✓ Custom mail subdomain: $MAIL_SUBDOMAIN"
 fi
 echo ""
 
@@ -932,9 +730,13 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
     echo "IP ROTATION:"
     echo "  Configured IPs: ${#IP_ADDRESSES[@]}"
-    echo "  Primary: $PRIMARY_IP"
-    echo "  Mode: Database-backed sticky sessions"
-    echo "  Monitor: ip-rotation-status"
+    echo "  Primary: $PRIMARY_IP ($HOSTNAME)"
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if [ $i -ne 0 ]; then
+            echo "  Additional: ${IP_ADDRESSES[$i]} (${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME)"
+        fi
+    done
+    echo "  Mode: Database-backed with bulk-ip-manage"
 fi
 
 echo ""
@@ -947,42 +749,9 @@ else
 fi
 
 echo ""
-if [ ! -z "$FIRST_EMAIL" ]; then
-    print_message "Email account ready:"
-    echo "  Email: $FIRST_EMAIL"
-    echo "  Server: $HOSTNAME"
-    echo "  Ports: 587 (SMTP), 993 (IMAP)"
-fi
-
-echo ""
-print_header "QUICK TEST COMMANDS"
-echo ""
-echo "1. Test DKIM signature:"
-echo "   test-email check-auth@verifier.port25.com ${FIRST_EMAIL:-test@$DOMAIN_NAME}"
-echo ""
-echo "2. Verify DKIM key in DNS:"
-echo "   opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
-echo ""
-echo "3. Check everything:"
-echo "   mail-test"
-echo ""
-echo "4. Check DNS:"
-echo "   check-dns $DOMAIN_NAME"
-echo ""
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "5. Monitor IP rotation:"
-    echo "   ip-rotation-status"
-    echo ""
-fi
-
-print_message "Configuration saved to: /root/mail-server-config.txt"
-echo ""
 print_message "✓ Post-installation configuration completed!"
-print_message "✓ Your mail server is ready with 1024-bit DKIM signing!"
-print_message "✓ System optimized WITHOUT kernel warnings!"
+print_message "✓ Mail subdomain: $MAIL_SUBDOMAIN"
+print_message "✓ Hostname: $HOSTNAME"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_message "✓ IP rotation is active with database-backed sticky sessions!"
+    print_message "✓ IP rotation active with bulk-ip-manage command!"
 fi
-echo ""
-print_warning "REMINDER: Update physical address in /var/www/$DOMAIN_NAME/contact.html"
-print_warning "REMINDER: Update Mailwizz URL in /etc/nginx/sites-available/$DOMAIN_NAME.conf"
