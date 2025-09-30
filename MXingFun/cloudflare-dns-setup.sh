@@ -93,30 +93,24 @@ fi
 DKIM_KEY=""
 DKIM_RECORD_VALUE=""
 
+# FIXED: Better extraction method that handles the multi-line format
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     print_message "✓ DKIM key found (generated during installation)"
     
-    # FIXED: Better extraction method that handles the multi-line format
-    # First, get the entire file content and clean it up
+    # Extract the entire content between quotes and clean it
     RAW_FILE=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt)
     
-    # Method 1: Extract everything between quotes, removing line breaks
-    DKIM_KEY=$(echo "$RAW_FILE" | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' ')
+    # Method 1: Extract everything after p= and before the closing quote
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' "')
     
-    # Method 2: If Method 1 fails, try extracting from the formatted output
+    # Method 2: If Method 1 fails, try grep with perl regex
     if [ -z "$DKIM_KEY" ] || [ ${#DKIM_KEY} -lt 100 ]; then
-        # Extract all content between quotes and join
-        DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | \
-                   grep -o '"[^"]*"' | \
-                   sed 's/"//g' | \
-                   tr -d '\n' | \
-                   sed 's/.*p=//' | \
-                   tr -d ' ')
+        DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -Po '(?<=p=)[^"]+' | tr -d '\n\r\t ')
     fi
     
     # Method 3: If still failing, use awk
     if [ -z "$DKIM_KEY" ] || [ ${#DKIM_KEY} -lt 100 ]; then
-        DKIM_KEY=$(awk '/p=/{found=1} found{gsub(/["\n\t\r ()]/, ""); gsub(/.*p=/, ""); gsub(/;.*/, ""); printf "%s", $0}' /etc/opendkim/keys/$DOMAIN_NAME/mail.txt)
+        DKIM_KEY=$(awk -F'"' '/p=/{print $2}' /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | sed 's/.*p=//' | tr -d '\n\r\t ')
     fi
     
     # Validate the key
