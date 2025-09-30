@@ -306,15 +306,45 @@ if ($row = $result->fetch_assoc()) {
     // Check if it's a plain password (for testing) or hashed
     if (strpos($stored_pass, '{') === 0) {
         // It's hashed, we need to verify properly
-        $cmd = "doveadm pw -t '$stored_pass' -p " . escapeshellarg($password) . " 2>&1";
+        // Try multiple verification methods
+        
+        // Method 1: Use doveadm if available
+        $cmd = "doveadm pw -t " . escapeshellarg($stored_pass) . " -p " . escapeshellarg($password) . " 2>&1";
         exec($cmd, $output, $return_code);
         
-        if ($return_code === 0 && strpos(implode('', $output), 'verified') !== false) {
+        $verified = false;
+        
+        // Check for success in different ways
+        if ($return_code === 0) {
+            // Check output for verification message
+            $output_str = implode(' ', $output);
+            if (strpos($output_str, 'verified') !== false || empty($output_str)) {
+                $verified = true;
+            }
+        }
+        
+        // Method 2: If doveadm fails, try password_verify for CRYPT passwords
+        if (!$verified && strpos($stored_pass, '{SHA512-CRYPT}') === 0) {
+            $hash = substr($stored_pass, 14); // Remove {SHA512-CRYPT} prefix
+            if (function_exists('password_verify')) {
+                $verified = password_verify($password, $hash);
+            }
+        }
+        
+        // Method 3: For PLAIN passwords stored with {PLAIN} prefix
+        if (!$verified && strpos($stored_pass, '{PLAIN}') === 0) {
+            $plain_pass = substr($stored_pass, 7); // Remove {PLAIN} prefix
+            $verified = ($plain_pass === $password);
+        }
+        
+        if ($verified) {
             // Success
             session_start();
             $_SESSION['user'] = $email;
             echo json_encode(['success' => true, 'user' => $email]);
         } else {
+            // Debug info (remove in production)
+            error_log("Auth failed - Return code: $return_code, Output: " . implode(' ', $output));
             http_response_code(401);
             echo json_encode(['error' => 'Invalid credentials']);
         }
