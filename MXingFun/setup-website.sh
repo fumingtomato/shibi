@@ -1428,7 +1428,7 @@ cat > "$WEB_ROOT/privacy.html" <<'EOF'
 
             <p>You are subscribing to receive calls only from Publisher and their partner third-party companies, and only at the specific number(s) you have provided to us if you did provide a number. Your consent will be effective if the number you have provided is a home, business, or mobile phone line, or if the number is registered on any state or federal Do-Not-Call (DNC) list as of the date of this consent. Publisher reserves the right to refrain from calling any number registered on a DNC list in connection with any promotions. This consent shall remain in effect until you revoke your consent and cancel your subscription.</p>
 
-            <p>If you have additional questions about this policy, please contact Publisher from the "Contact Us" page of the Publisher's website.</p>
+            <p>If you have additional questions about this policy, please contact us, email $ADMIN_EMAIL</p>
         </div>
     </div>
     
