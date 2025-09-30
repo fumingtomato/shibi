@@ -715,16 +715,33 @@ header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST');
 header('Access-Control-Allow-Headers: Content-Type');
+header('Cache-Control: no-cache, no-store, must-revalidate');
+header('Pragma: no-cache');
+header('Expires: 0');
 
 $colors_file = dirname(__DIR__) . '/data/colors.json';
 
+// Debug logging
+error_log("Colors API called - Method: " . $_SERVER['REQUEST_METHOD']);
+error_log("Colors file path: " . $colors_file);
+
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     // Get current colors
-    if (file_exists($colors_file)) {
-        $colors = json_decode(file_get_contents($colors_file), true);
-        echo json_encode($colors);
+    if (file_exists($colors_file) && is_readable($colors_file)) {
+        $content = file_get_contents($colors_file);
+        $colors = json_decode($content, true);
+        
+        if (json_last_error() === JSON_ERROR_NONE && $colors) {
+            error_log("Returning colors: " . json_encode($colors));
+            echo json_encode($colors);
+        } else {
+            // Return default colors if JSON is invalid
+            error_log("JSON decode error, returning defaults");
+            echo json_encode(['primary' => '#667eea', 'secondary' => '#764ba2']);
+        }
     } else {
-        // Default colors
+        // Default colors if file doesn't exist
+        error_log("File not found, returning defaults");
         echo json_encode(['primary' => '#667eea', 'secondary' => '#764ba2']);
     }
 } elseif ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -749,9 +766,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     
     $colors = ['primary' => $primary, 'secondary' => $secondary];
     
-    if (file_put_contents($colors_file, json_encode($colors))) {
+    // Ensure directory exists
+    $dir = dirname($colors_file);
+    if (!is_dir($dir)) {
+        mkdir($dir, 0777, true);
+    }
+    
+    // Write with proper permissions
+    if (file_put_contents($colors_file, json_encode($colors, JSON_PRETTY_PRINT))) {
+        // Set permissions to ensure it's readable
+        chmod($colors_file, 0666);
+        
+        error_log("Colors saved successfully: " . json_encode($colors));
         echo json_encode(['success' => true, 'colors' => $colors]);
     } else {
+        error_log("Failed to save colors to file");
         http_response_code(500);
         echo json_encode(['error' => 'Failed to save colors']);
     }
@@ -1157,31 +1186,71 @@ footer a:hover {
 EOF
 
 # Create JavaScript file for loading global colors on all pages
+# Replace the colors.js file with an improved version
 cat > "$WEB_ROOT/js/colors.js" <<'JSCOLORS'
 // Load and apply global colors for all visitors
 (function() {
+    console.log('Colors.js loaded');
+    
+    // Function to apply colors to CSS variables
+    function applyColors(primary, secondary) {
+        console.log('Applying colors:', primary, secondary);
+        document.documentElement.style.setProperty('--primary-color', primary);
+        document.documentElement.style.setProperty('--secondary-color', secondary);
+        
+        // Force update on specific elements
+        const headerElements = document.querySelectorAll('header, h1, h2, .btn');
+        headerElements.forEach(el => {
+            el.style.transition = 'all 0.3s ease';
+        });
+    }
+    
     // Function to load colors from API
     function loadGlobalColors() {
+        console.log('Loading colors from API...');
+        
         fetch('/api/colors.php')
-            .then(response => response.json())
-            .then(data => {
-                if (data.primary) {
-                    document.documentElement.style.setProperty('--primary-color', data.primary);
+            .then(response => {
+                console.log('API Response status:', response.status);
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
                 }
-                if (data.secondary) {
-                    document.documentElement.style.setProperty('--secondary-color', data.secondary);
+                return response.json();
+            })
+            .then(data => {
+                console.log('Colors data received:', data);
+                if (data.primary && data.secondary) {
+                    applyColors(data.primary, data.secondary);
+                } else {
+                    console.warn('Invalid color data received');
+                    // Apply defaults if no valid data
+                    applyColors('#667eea', '#764ba2');
                 }
             })
             .catch(error => {
                 console.error('Failed to load colors:', error);
+                // Apply default colors on error
+                applyColors('#667eea', '#764ba2');
             });
     }
     
-    // Load colors when page loads
-    loadGlobalColors();
+    // Load colors when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', loadGlobalColors);
+    } else {
+        // DOM is already loaded
+        loadGlobalColors();
+    }
     
-    // Reload colors every 30 seconds to catch updates
-    setInterval(loadGlobalColors, 30000);
+    // Reload colors every 10 seconds to catch updates (reduced from 30)
+    setInterval(loadGlobalColors, 10000);
+    
+    // Also listen for storage events (if using localStorage in future)
+    window.addEventListener('storage', function(e) {
+        if (e.key === 'siteColors') {
+            loadGlobalColors();
+        }
+    });
 })();
 JSCOLORS
 
