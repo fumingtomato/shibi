@@ -281,19 +281,28 @@ MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mx}
 HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
 
 # Admin email
+#while true; do
+#    read -p "Enter admin email address: " ADMIN_EMAIL
+#    if [[ "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+#        break
+#    else
+#        print_error "Invalid email format"
+#    fi
+#done
+
+# First email account
 while true; do
-    read -p "Enter admin email address: " ADMIN_EMAIL
-    if [[ "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+read -p "Email address for first account (e.g., admin@$DOMAIN_NAME): " FIRST_EMAIL
+if [[ "$FIRST_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
         break
     else
         print_error "Invalid email format"
     fi
 done
-
-# First email account
-read -p "Email address for first account (e.g., admin@$DOMAIN_NAME): " FIRST_EMAIL
-read -sp "Password for $FIRST_EMAIL: " FIRST_PASS
+read -sp "Password for $FIRST_EMAIL: (Will not show)" FIRST_PASS
 echo ""
+
+ADMIN_EMAIL=$FIRST_EMAIL
 
 # Detect primary IP
 PRIMARY_IP=$(curl -s --max-time 5 https://ipinfo.io/ip 2>/dev/null || \
@@ -373,7 +382,7 @@ echo "Total IPs configured: ${#IP_ADDRESSES[@]}"
 echo ""
 echo "Cloudflare DNS Configuration (optional)"
 echo "Leave blank to skip automatic DNS setup"
-read -sp "Enter Cloudflare API Key/Token (or press Enter to skip): " CF_API_KEY
+read -p "Enter Cloudflare API Key/Token (or press Enter to skip): " CF_API_KEY
 echo ""
 
 if [ ! -z "$CF_API_KEY" ]; then
