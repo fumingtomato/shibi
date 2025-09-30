@@ -343,8 +343,8 @@ fi
 
 echo "Adding primary domain: $DOMAIN_NAME"
 
-mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<ADDDOMAIN 2>/dev/null || \
-mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<ADDDOMAIN 2>/dev/null || true
+{ mysql -u mailuser -p"$DB_PASS" -h localhost mailserver 2>/dev/null || \
+  mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver 2>/dev/null || true; } <<ADDDOMAIN
 INSERT INTO virtual_domains (name) VALUES ('$DOMAIN_NAME')
 ON DUPLICATE KEY UPDATE name = name;
 ADDDOMAIN
@@ -390,7 +390,7 @@ if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
     fi
     
     # Add user to database
-    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<ADDUSER 2>/dev/null || \
+    { mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<ADDUSER 2>/dev/null || \
     mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<ADDUSER 2>/dev/null || true
 -- Get domain ID
 SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN_NAME');
