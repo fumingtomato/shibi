@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# UNIVERSAL PERMISSIONS SETUP FOR ALL USERS
-# Version: 17.0.7 - Seamless Multi-User Access
-# Makes all mail commands work for any user without changing installers
+# SETUP PERMISSIONS FOR MAIL SERVER COMMANDS
+# Version: 17.1.0 - Enable non-root user access to mail commands
+# Allows all users to run mail management commands
 # =================================================================
 
 # Colors
@@ -37,20 +37,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-print_header "Setting Up Universal Command Access"
-
-# Load configuration
-if [ -f "$(pwd)/install.conf" ]; then
-    source "$(pwd)/install.conf"
-elif [ -f "/root/mail-installer/install.conf" ]; then
-    source "/root/mail-installer/install.conf"
-fi
+print_header "Setting Up Universal User Access"
 
 # ===================================================================
-# 1. CREATE SECURE SHARED CONFIGURATION
+# CREATE MAIL CONFIG DIRECTORY
 # ===================================================================
 
-echo "Creating shared configuration directory..."
+print_message "Creating shared configuration directory..."
+
+# Create directory for shared configs
 mkdir -p /etc/mail-config
 chmod 755 /etc/mail-config
 
@@ -58,248 +53,152 @@ chmod 755 /etc/mail-config
 if [ -f /root/.mail_db_password ]; then
     cp /root/.mail_db_password /etc/mail-config/db_password
     chmod 644 /etc/mail-config/db_password
-    print_message "✓ Database password made accessible"
+    print_message "✓ Database password copied to shared location"
 fi
 
-# Copy install configuration
+# Copy installation config
 if [ -f /root/mail-installer/install.conf ]; then
     cp /root/mail-installer/install.conf /etc/mail-config/install.conf
     chmod 644 /etc/mail-config/install.conf
-    print_message "✓ Configuration made accessible"
+    print_message "✓ Installation config copied to shared location"
 fi
 
 # ===================================================================
-# 2. CREATE UNIVERSAL WRAPPER FUNCTION
+# CREATE MAIL MANAGEMENT GROUP
 # ===================================================================
 
-echo "Creating universal command wrapper..."
+print_message "Creating mail management group..."
 
-cat > /usr/local/bin/mail-wrapper <<'WRAPPER'
-#!/bin/bash
-
-# Universal wrapper for mail commands
-# This wrapper handles permission issues transparently
-
-# Get the actual command name
-COMMAND_NAME=$(basename "$0")
-ACTUAL_COMMAND="/usr/local/bin/.${COMMAND_NAME}-real"
-
-# Function to get database password from multiple locations
-get_db_password() {
-    if [ -f /etc/mail-config/db_password ]; then
-        cat /etc/mail-config/db_password
-    elif [ "$EUID" -eq 0 ] && [ -f /root/.mail_db_password ]; then
-        cat /root/.mail_db_password
-    elif [ -f /root/.mail_db_password ] && [ -r /root/.mail_db_password ]; then
-        cat /root/.mail_db_password
-    else
-        # Try with sudo if available
-        if command -v sudo >/dev/null 2>&1; then
-            sudo cat /root/.mail_db_password 2>/dev/null || echo ""
-        else
-            echo ""
-        fi
-    fi
-}
-
-# Function to get configuration
-get_config() {
-    if [ -f /etc/mail-config/install.conf ]; then
-        source /etc/mail-config/install.conf
-    elif [ "$EUID" -eq 0 ] && [ -f /root/mail-installer/install.conf ]; then
-        source /root/mail-installer/install.conf
-    fi
-}
-
-# Export functions and variables for the actual command
-export -f get_db_password
-export -f get_config
-export DB_PASS=$(get_db_password)
-get_config
-
-# Handle commands that need root differently
-case "$COMMAND_NAME" in
-    mail-account|mail-backup|ip-rotation-status)
-        # These need database access
-        if [ -z "$DB_PASS" ]; then
-            echo "Error: Cannot access database password"
-            echo "Try: sudo $COMMAND_NAME $@"
-            exit 1
-        fi
-        ;;
-    mail-status|mail-test|check-dns|test-email)
-        # These can run with limited permissions
-        ;;
-    *)
-        # Default case
-        ;;
-esac
-
-# Execute the actual command
-if [ -f "$ACTUAL_COMMAND" ]; then
-    bash "$ACTUAL_COMMAND" "$@"
-else
-    # Check if it's a command that only exists with certain configurations
-    if [ "$COMMAND_NAME" == "ip-rotation-status" ]; then
-        echo "Error: IP rotation is not configured (single IP setup)"
-        echo "This command is only available when multiple IPs are configured"
-        exit 1
-    elif [ "$COMMAND_NAME" == "assign-ip" ]; then
-        echo "Error: IP assignment is not configured (single IP setup)"
-        echo "This command is only available when multiple IPs are configured"
-        exit 1
-    else
-        # Fallback to original command if wrapper not set up
-        ORIGINAL="/usr/local/bin/${COMMAND_NAME}-original"
-        if [ -f "$ORIGINAL" ]; then
-            bash "$ORIGINAL" "$@"
-        else
-            echo "Error: Command not found: $COMMAND_NAME"
-            echo "This command may not be installed or configured"
-            exit 1
-        fi
-    fi
-fi
-WRAPPER
-
-chmod 755 /usr/local/bin/mail-wrapper
+# Create group for mail management
+groupadd -f mailadmin
+print_message "✓ Created mailadmin group"
 
 # ===================================================================
-# 3. WRAP EXISTING COMMANDS
+# SETUP SUDO PERMISSIONS
 # ===================================================================
 
-echo "Wrapping existing commands for universal access..."
+print_message "Configuring sudo permissions..."
 
-# List of commands to wrap
-COMMANDS=(
-    "mail-status"
-    "mail-account" 
-    "test-email"
-    "check-dns"
-    "mail-test"
-    "mail-log"
-    "mail-queue"
-    "mail-backup"
-    "mailwizz-info"
-    "ip-rotation-status"
-    "verify-dns"
-    "verify-dkim"
-    "get-ssl-cert"
-    "assign-ip"
-)
+# Create sudoers file for mail commands
+cat > /etc/sudoers.d/mail-commands <<'EOF'
+# Mail Server Management Commands
+# Allows mailadmin group to run specific commands without password
 
-for cmd in "${COMMANDS[@]}"; do
-    if [ -f "/usr/local/bin/$cmd" ]; then
-        echo -n "  Wrapping $cmd... "
-        
-        # Check if already wrapped
-        if [ -L "/usr/local/bin/$cmd" ] && [ -f "/usr/local/bin/.${cmd}-real" ]; then
-            echo "already wrapped ✓"
-            continue
-        fi
-        
-        # Move original command only if it's not already a symlink
-        if [ ! -L "/usr/local/bin/$cmd" ]; then
-            mv "/usr/local/bin/$cmd" "/usr/local/bin/.${cmd}-real" 2>/dev/null
-            
-            # Create symlink to wrapper
-            ln -sf /usr/local/bin/mail-wrapper "/usr/local/bin/$cmd"
-            
-            # Make the real command accessible
-            chmod 755 "/usr/local/bin/.${cmd}-real" 2>/dev/null
-            
-            print_message "✓"
-        else
-            print_warning "skipped (already a symlink)"
-        fi
-    else
-        # Command doesn't exist - don't create wrapper
-        if [ "$cmd" == "ip-rotation-status" ]; then
-            # This is expected if only single IP configured
-            continue
-        else
-            # For other commands, note if missing
-            echo "  $cmd not found (skipping)"
-        fi
-    fi
-done
+# Service management
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl status postfix
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl status dovecot
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl status opendkim
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl status nginx
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl status mysql
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl status mariadb
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl restart postfix
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl restart dovecot
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl restart opendkim
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl reload postfix
+%mailadmin ALL=(root) NOPASSWD: /bin/systemctl reload nginx
 
-# ===================================================================
-# 4. FIX SPECIFIC COMMANDS FOR DATABASE ACCESS
-# ===================================================================
+# Mail queue management
+%mailadmin ALL=(root) NOPASSWD: /usr/sbin/postqueue
+%mailadmin ALL=(root) NOPASSWD: /usr/sbin/postsuper
+%mailadmin ALL=(root) NOPASSWD: /usr/bin/mailq
 
-echo "Fixing database-dependent commands..."
+# Database access (read-only)
+%mailadmin ALL=(root) NOPASSWD: /usr/bin/mysql -u mailuser *
 
-# Fix ip-rotation-status specifically
-if [ -f "/usr/local/bin/.ip-rotation-status-real" ]; then
-    sed -i 's|cat /root/.mail_db_password|get_db_password|g' "/usr/local/bin/.ip-rotation-status-real"
-    sed -i '1a source /usr/local/bin/mail-wrapper' "/usr/local/bin/.ip-rotation-status-real"
-fi
+# Postfix commands
+%mailadmin ALL=(root) NOPASSWD: /usr/sbin/postmap
+%mailadmin ALL=(root) NOPASSWD: /usr/sbin/postconf
 
-# Fix mail-account
-if [ -f "/usr/local/bin/.mail-account-real" ]; then
-    sed -i 's|cat /root/.mail_db_password|get_db_password|g' "/usr/local/bin/.mail-account-real"
-    sed -i 's|if \[ -f /root/.mail_db_password \]; then|if DB_PASS=$(get_db_password); [ ! -z "$DB_PASS" ]; then|g' "/usr/local/bin/.mail-account-real"
-fi
+# Network commands for diagnostics
+%mailadmin ALL=(root) NOPASSWD: /bin/netstat
+%mailadmin ALL=(root) NOPASSWD: /usr/bin/ss
 
-# Fix mail-backup
-if [ -f "/usr/local/bin/.mail-backup-real" ]; then
-    sed -i 's|cat /root/.mail_db_password|get_db_password|g' "/usr/local/bin/.mail-backup-real"
-    sed -i 's|/root/.mail_db_password|/etc/mail-config/db_password|g' "/usr/local/bin/.mail-backup-real"
-fi
-
-# Fix mail-test
-if [ -f "/usr/local/bin/.mail-test-real" ]; then
-    sed -i 's|cat /root/.mail_db_password|get_db_password|g' "/usr/local/bin/.mail-test-real"
-    sed -i 's|if \[ -f /root/.mail_db_password \]; then|if DB_PASS=$(get_db_password); [ ! -z "$DB_PASS" ]; then|g' "/usr/local/bin/.mail-test-real"
-fi
-
-# ===================================================================
-# 5. CREATE SUDO RULES FOR PRIVILEGED OPERATIONS
-# ===================================================================
-
-echo "Setting up sudo rules for privileged operations..."
-
-cat > /etc/sudoers.d/mail-commands <<'SUDOERS'
 # Allow all users to run mail management commands
-# Some commands need root for service management
-
-# Read-only commands - no password needed
 ALL ALL=(root) NOPASSWD: /usr/local/bin/mail-status
+ALL ALL=(root) NOPASSWD: /usr/local/bin/mail-account list
 ALL ALL=(root) NOPASSWD: /usr/local/bin/check-dns
-ALL ALL=(root) NOPASSWD: /usr/local/bin/mail-log
-ALL ALL=(root) NOPASSWD: /usr/local/bin/verify-dns
-ALL ALL=(root) NOPASSWD: /usr/local/bin/mailwizz-info
-
-# Database commands - require authentication but allow access
-ALL ALL=(root) NOPASSWD: /usr/local/bin/mail-account
-ALL ALL=(root) NOPASSWD: /usr/local/bin/ip-rotation-status
-ALL ALL=(root) NOPASSWD: /usr/local/bin/mail-test
 ALL ALL=(root) NOPASSWD: /usr/local/bin/test-email
-
-# Administrative commands
-ALL ALL=(root) NOPASSWD: /usr/local/bin/mail-queue
-ALL ALL=(root) NOPASSWD: /usr/local/bin/mail-backup
-ALL ALL=(root) NOPASSWD: /usr/local/bin/get-ssl-cert
-ALL ALL=(root) NOPASSWD: /usr/local/bin/assign-ip
-
-# Allow reading specific files
-ALL ALL=(root) NOPASSWD: /bin/cat /root/.mail_db_password
-ALL ALL=(root) NOPASSWD: /bin/cat /root/mail-installer/install.conf
-SUDOERS
+ALL ALL=(root) NOPASSWD: /usr/local/bin/bulk-ip-manage list
+ALL ALL=(root) NOPASSWD: /usr/local/bin/bulk-ip-manage stats
+ALL ALL=(root) NOPASSWD: /usr/local/bin/ip-rotation-status
+ALL ALL=(root) NOPASSWD: /usr/local/bin/mailwizz-info
+EOF
 
 chmod 440 /etc/sudoers.d/mail-commands
+print_message "✓ Sudo permissions configured"
 
 # ===================================================================
-# 6. CREATE HELPER SCRIPT FOR USERS
+# CREATE WRAPPER SCRIPTS
 # ===================================================================
 
-echo "Creating user helper script..."
+print_message "Creating wrapper scripts for non-root access..."
 
-cat > /usr/local/bin/mail-help <<'HELP'
+# Create wrapper for mail-status
+cat > /usr/local/bin/mail-status-wrapper <<'EOF'
+#!/bin/bash
+# Wrapper script to allow non-root users to check mail status
+
+if [ $EUID -eq 0 ]; then
+    /usr/local/bin/mail-status "$@"
+else
+    sudo /usr/local/bin/mail-status "$@"
+fi
+EOF
+chmod 755 /usr/local/bin/mail-status-wrapper
+
+# Create wrapper for mail-account (read operations only for non-root)
+cat > /usr/local/bin/mail-account-wrapper <<'EOF'
+#!/bin/bash
+# Wrapper script for mail account management
+
+if [ $EUID -eq 0 ]; then
+    /usr/local/bin/mail-account "$@"
+else
+    case "$1" in
+        list|"")
+            sudo /usr/local/bin/mail-account "$@"
+            ;;
+        *)
+            echo "Permission denied. Only 'list' command available for non-root users."
+            echo "Contact system administrator for account changes."
+            exit 1
+            ;;
+    esac
+fi
+EOF
+chmod 755 /usr/local/bin/mail-account-wrapper
+
+# Create wrapper for bulk-ip-manage
+cat > /usr/local/bin/bulk-ip-manage-wrapper <<'EOF'
+#!/bin/bash
+# Wrapper script for IP management
+
+if [ $EUID -eq 0 ]; then
+    /usr/local/bin/bulk-ip-manage "$@"
+else
+    case "$1" in
+        list|stats|report|"")
+            sudo /usr/local/bin/bulk-ip-manage "$@"
+            ;;
+        *)
+            echo "Permission denied. Read-only commands available for non-root users."
+            echo "Available: list, stats, report"
+            exit 1
+            ;;
+    esac
+fi
+EOF
+chmod 755 /usr/local/bin/bulk-ip-manage-wrapper
+
+# ===================================================================
+# CREATE MAIL HELP COMMAND
+# ===================================================================
+
+cat > /usr/local/bin/mail-help <<'EOF'
 #!/bin/bash
 
 GREEN='\033[38;5;208m'
+YELLOW='\033[1;33m'
 BLUE='\033[1;33m'
 NC='\033[0m'
 
@@ -307,105 +206,160 @@ echo -e "${BLUE}==================================================${NC}"
 echo -e "${BLUE}Mail Server Management Commands${NC}"
 echo -e "${BLUE}==================================================${NC}"
 echo ""
-echo "All commands can be run by any user:"
+
+echo -e "${GREEN}Status & Monitoring:${NC}"
+echo "  mail-status          - Check server status"
+echo "  ip-rotation-status   - View IP rotation status"
+echo "  check-dns            - Verify DNS records"
+echo "  mailwizz-info        - MailWizz configuration info"
 echo ""
-echo -e "${GREEN}Information Commands:${NC}"
-echo "  mail-status         - Check server status"
-echo "  mail-test          - Comprehensive server test"
-echo "  check-dns          - Verify DNS configuration"
-echo "  verify-dns         - Check DNS propagation"
-echo "  mailwizz-info      - MailWizz configuration guide"
+
+echo -e "${GREEN}Account Management:${NC}"
+if [ $EUID -eq 0 ]; then
+    echo "  mail-account add     - Create new email account"
+    echo "  mail-account delete  - Remove email account"
+    echo "  mail-account list    - List all accounts"
+    echo "  mail-account password - Change account password"
+else
+    echo "  mail-account list    - List all accounts"
+    echo "  (Other operations require root access)"
+fi
 echo ""
-echo -e "${GREEN}Management Commands:${NC}"
-echo "  mail-account       - Manage email accounts"
-echo "    add EMAIL PASSWORD      - Create account"
-echo "    delete EMAIL           - Delete account"
-echo "    list                   - List all accounts"
-echo "    password EMAIL PASS    - Change password"
+
+echo -e "${GREEN}IP Rotation Management:${NC}"
+if [ $EUID -eq 0 ]; then
+    echo "  bulk-ip-manage assign    - Assign IP to sender"
+    echo "  bulk-ip-manage list      - List IP assignments"
+    echo "  bulk-ip-manage stats     - Show IP statistics"
+    echo "  bulk-ip-manage reset     - Reset assignments"
+    echo "  bulk-ip-manage report    - Generate usage report"
+else
+    echo "  bulk-ip-manage list      - List IP assignments"
+    echo "  bulk-ip-manage stats     - Show IP statistics"
+    echo "  bulk-ip-manage report    - Generate usage report"
+    echo "  (Modifications require root access)"
+fi
 echo ""
-echo -e "${GREEN}Operations:${NC}"
-echo "  test-email EMAIL   - Send test email"
-echo "  mail-log          - View mail logs"
-echo "    live                   - Watch live log"
-echo "    errors                 - Show recent errors"
-echo "    sent                   - Show sent emails"
-echo "  mail-queue        - Manage mail queue"
-echo "    show                   - Show queue"
-echo "    flush                  - Flush queue"
+
+echo -e "${GREEN}Testing:${NC}"
+echo "  test-email <recipient>   - Send test email"
 echo ""
-echo -e "${GREEN}IP Rotation (if configured):${NC}"
-echo "  ip-rotation-status - Check IP rotation status"
-echo "  assign-ip EMAIL IP - Assign IP to sender"
+
+echo -e "${GREEN}Logs & Troubleshooting:${NC}"
+echo "  mail-log live        - Watch live mail log"
+echo "  mail-log errors      - Show recent errors"
+echo "  mail-log sent        - Show sent emails"
+echo "  mail-queue show      - Show mail queue"
 echo ""
-echo "All commands work for any user - no sudo needed!"
-HELP
+
+if [ $EUID -ne 0 ]; then
+    echo -e "${YELLOW}Note: You're running as a regular user.${NC}"
+    echo -e "${YELLOW}Some commands have limited functionality.${NC}"
+    echo -e "${YELLOW}For full access, use: sudo <command>${NC}"
+fi
+EOF
 
 chmod 755 /usr/local/bin/mail-help
 
 # ===================================================================
-# 7. TEST PERMISSIONS
+# UPDATE COMMAND SCRIPTS FOR NON-ROOT ACCESS
+# ===================================================================
+
+print_message "Updating command scripts for universal access..."
+
+# Update scripts to check for both password locations
+for script in /usr/local/bin/mail-account /usr/local/bin/bulk-ip-manage /usr/local/bin/ip-rotation-status /usr/local/bin/maildb; do
+    if [ -f "$script" ]; then
+        # Update password loading logic
+        sed -i 's|if \[ -f /root/.mail_db_password \]; then|if [ -f /root/.mail_db_password ]; then\n    DB_PASS=$(cat /root/.mail_db_password)\nelif [ -f /etc/mail-config/db_password ]; then\n    DB_PASS=$(cat /etc/mail-config/db_password)|' "$script" 2>/dev/null || true
+    fi
+done
+
+# ===================================================================
+# CREATE SYMBOLIC LINKS
+# ===================================================================
+
+print_message "Creating command aliases..."
+
+# Create symbolic links for easier access
+ln -sf /usr/local/bin/mail-status-wrapper /usr/bin/mail-status 2>/dev/null || true
+ln -sf /usr/local/bin/mail-account-wrapper /usr/bin/mail-account 2>/dev/null || true
+ln -sf /usr/local/bin/bulk-ip-manage-wrapper /usr/bin/bulk-ip-manage 2>/dev/null || true
+ln -sf /usr/local/bin/mail-help /usr/bin/mail-help 2>/dev/null || true
+ln -sf /usr/local/bin/test-email /usr/bin/test-email 2>/dev/null || true
+ln -sf /usr/local/bin/check-dns /usr/bin/check-dns 2>/dev/null || true
+ln -sf /usr/local/bin/ip-rotation-status /usr/bin/ip-rotation-status 2>/dev/null || true
+ln -sf /usr/local/bin/mailwizz-info /usr/bin/mailwizz-info 2>/dev/null || true
+
+print_message "✓ Command aliases created"
+
+# ===================================================================
+# TEST COMMAND ACCESS
 # ===================================================================
 
 print_header "Testing Command Access"
 
-# Create a test user if it doesn't exist
-TEST_USER="mailtest"
-if ! id "$TEST_USER" &>/dev/null; then
-    useradd -m -s /bin/bash "$TEST_USER" 2>/dev/null
-fi
-
-echo "Testing commands as non-root user..."
-
-# Test a few commands as the test user
 test_command() {
     local cmd=$1
-    echo -n "  Testing $cmd: "
-    if su - "$TEST_USER" -c "$cmd" &>/dev/null; then
-        print_message "✓"
+    local user=${2:-nobody}
+    
+    echo -n "Testing $cmd as $user: "
+    if su - $user -s /bin/bash -c "command -v $cmd" > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ Available${NC}"
+        return 0
     else
-        # Try with wrapper
-        if su - "$TEST_USER" -c "bash /usr/local/bin/$cmd 2>/dev/null" &>/dev/null; then
-            print_message "✓"
-        else
-            print_warning "⚠ May need sudo"
-        fi
+        echo -e "${RED}✗ Not found${NC}"
+        return 1
     fi
 }
 
-test_command "mail-status"
-test_command "check-dns"
+# Test as nobody user
+echo "Testing commands for regular users..."
+test_command "mail-help" "nobody"
+test_command "mail-status" "nobody"
+test_command "check-dns" "nobody"
 
-# Clean up test user
-userdel "$TEST_USER" 2>/dev/null
+# ===================================================================
+# ADD CURRENT USER TO MAILADMIN GROUP (IF NOT ROOT)
+# ===================================================================
+
+CURRENT_USER="${SUDO_USER:-$USER}"
+if [ ! -z "$CURRENT_USER" ] && [ "$CURRENT_USER" != "root" ]; then
+    print_message "Adding $CURRENT_USER to mailadmin group..."
+    usermod -a -G mailadmin "$CURRENT_USER" 2>/dev/null && \
+        print_message "✓ User $CURRENT_USER added to mailadmin group" || \
+        print_warning "⚠ Could not add $CURRENT_USER to mailadmin group"
+    echo "Note: $CURRENT_USER may need to log out and back in for group changes to take effect"
+fi
 
 # ===================================================================
 # COMPLETION
 # ===================================================================
 
-print_header "Permission Setup Complete!"
+echo ""
+print_header "Universal Access Setup Complete!"
 
 echo ""
-echo "✅ All mail commands are now accessible to all users!"
+echo "✓ Shared configuration directory created: /etc/mail-config"
+echo "✓ Mail management group created: mailadmin"
+echo "✓ Sudo permissions configured"
+echo "✓ Wrapper scripts created for non-root access"
+echo "✓ Command aliases installed"
 echo ""
-echo "Features enabled:"
-echo "  • Database access wrapper for non-root users"
-echo "  • Configuration shared in /etc/mail-config/"
-echo "  • Sudo rules configured for privileged operations"
-echo "  • All commands work transparently for any user"
+echo "Available commands for ALL users:"
+echo "  • mail-help     - Show all available commands"
+echo "  • mail-status   - Check server status"
+echo "  • check-dns     - Verify DNS records"
+echo "  • test-email    - Send test emails"
 echo ""
-echo "Users can now run:"
-echo "  mail-help          - Show all available commands"
-echo "  mail-status        - Check server status"
-echo "  mail-account list  - List email accounts"
-echo "  ip-rotation-status - Check IP rotation (if configured)"
+echo "Read-only commands for regular users:"
+echo "  • mail-account list      - View email accounts"
+echo "  • bulk-ip-manage list    - View IP assignments"
+echo "  • bulk-ip-manage stats   - View IP statistics"
+echo "  • ip-rotation-status     - Monitor IP rotation"
 echo ""
-echo "No 'sudo' prefix needed - commands work for everyone!"
+echo "To grant full access to a user:"
+echo "  usermod -a -G mailadmin username"
 echo ""
-
-# Add this script to be called at the end of installation
-if [ -f /root/mail-installer/install.conf ]; then
-    echo "# Permission wrapper configured" >> /root/mail-installer/install.conf
-    echo "PERMISSIONS_CONFIGURED=true" >> /root/mail-installer/install.conf
-fi
-
-print_message "✓ Universal access configuration completed!"
+print_message "✓ All users can now use mail management commands!"
+print_message "✓ Type 'mail-help' from any user account to see available commands"
