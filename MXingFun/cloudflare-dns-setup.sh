@@ -2,7 +2,7 @@
 
 # =================================================================
 # CLOUDFLARE DNS SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.4 - FIXED for 1024-bit DKIM keys
+# Version: 17.0.5 - FIXED DKIM key extraction
 # Adds all DNS records including DKIM automatically
 # =================================================================
 
@@ -87,7 +87,7 @@ if ! command -v jq &> /dev/null; then
 fi
 
 # ===================================================================
-# GET AND PREPARE DKIM KEY (1024-bit compatible)
+# GET AND PREPARE DKIM KEY (1024-bit compatible) - FIXED
 # ===================================================================
 
 DKIM_KEY=""
@@ -96,26 +96,52 @@ DKIM_RECORD_VALUE=""
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     print_message "✓ DKIM key found (generated during installation)"
     
-    # Extract the COMPLETE key - NO SPLITTING for 1024-bit keys
-    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=//' | sed 's/".*//' | tr -d '\n\t\r ')
+    # Extract the COMPLETE key - IMPROVED METHOD
+    # First, get the entire content between quotes
+    RAW_CONTENT=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r' | sed 's/.*"v=DKIM1[^"]*p=//' | sed 's/".*//')
+    
+    # If that didn't work, try alternative extraction
+    if [ -z "$RAW_CONTENT" ] || [ "$RAW_CONTENT" == "$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r')" ]; then
+        # Alternative method: extract everything between p= and the closing quote
+        RAW_CONTENT=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP 'p=\K[^"]+' | tr -d '\n\t\r ')
+    fi
+    
+    # Clean up any spaces
+    DKIM_KEY=$(echo "$RAW_CONTENT" | tr -d ' ')
     
     if [ ! -z "$DKIM_KEY" ]; then
         KEY_LENGTH=${#DKIM_KEY}
         echo "  Key length: $KEY_LENGTH characters"
         
         # 1024-bit keys are ~215 characters - should fit in single DNS TXT record
-        if [ $KEY_LENGTH -lt 255 ]; then
+        if [ $KEY_LENGTH -lt 255 ] && [ $KEY_LENGTH -gt 100 ]; then
             echo "  1024-bit key detected - perfect for DNS"
             DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
-        else
+        elif [ $KEY_LENGTH -ge 255 ]; then
             print_warning "  WARNING: Key seems too long for 1024-bit (${KEY_LENGTH} chars)"
             print_warning "  This might be a 2048-bit key - regenerate with 1024-bit"
+            DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
+        else
+            print_warning "  WARNING: Key seems too short (${KEY_LENGTH} chars)"
+            print_warning "  Attempting to use it anyway"
             DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
         fi
         
         echo "  DKIM record prepared for DNS"
     else
         print_warning "⚠ Could not extract DKIM key from file"
+        print_warning "  Attempting alternative extraction..."
+        
+        # Last resort - try to get the raw p= value
+        DKIM_KEY=$(grep "p=" /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | sed 's/.*p=//' | sed 's/[";].*//' | tr -d '\n\t\r ')
+        
+        if [ ! -z "$DKIM_KEY" ]; then
+            echo "  Alternative extraction successful"
+            echo "  Key length: ${#DKIM_KEY} characters"
+            DKIM_RECORD_VALUE="v=DKIM1; k=rsa; p=$DKIM_KEY"
+        else
+            print_error "  Failed to extract DKIM key"
+        fi
     fi
 else
     print_warning "⚠ DKIM key file not found at /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
@@ -360,7 +386,7 @@ if [ ! -z "$DKIM_RECORD_VALUE" ]; then
         echo "  Type: TXT"
         echo "  Value: $DKIM_RECORD_VALUE"
     fi
-fi  # FIXED: Added this missing fi to close the DKIM_RECORD_VALUE check
+fi
 
 # 9. Additional email authentication records
 echo ""
@@ -612,6 +638,11 @@ VERIFICATION COMMANDS:
 DKIM VERIFICATION:
    The DKIM key should be approximately 215 characters for a 1024-bit key.
    If it shows ~390 characters, the key is still 2048-bit and needs regeneration.
+   
+MANUAL DKIM RECORD (if needed):
+   Name: mail._domainkey
+   Type: TXT
+   Value: $DKIM_RECORD_VALUE
 EOF
 
 # ===================================================================
@@ -626,6 +657,7 @@ echo "✅ All DNS records have been added to Cloudflare"
 echo "✅ Using mail subdomain: $MAIL_PREFIX (creates $HOSTNAME)"
 if [ ! -z "$DKIM_RECORD_VALUE" ]; then
     echo "✅ DKIM record has been added (1024-bit key: ~215 chars)"
+    echo "   Key extracted: ${#DKIM_KEY} characters"
 fi
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "✅ Multiple IP addresses configured with ${MAIL_PREFIX}N pattern"
@@ -671,6 +703,9 @@ if [ ! -z "$DKIM_RECORD_VALUE" ]; then
         echo "   cd /etc/opendkim/keys/$DOMAIN_NAME"
         echo "   opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024"
         echo "   systemctl restart opendkim"
+    elif [ ${#DKIM_KEY} -lt 100 ]; then
+        print_warning "WARNING: Key seems too short! Check the file manually:"
+        echo "   cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
     fi
 fi
 
@@ -678,4 +713,15 @@ echo ""
 echo "DNS records saved to: /root/dns-records-$DOMAIN_NAME.txt"
 echo ""
 
+# Show the actual DKIM record value for manual addition if needed
+if [ ! -z "$DKIM_RECORD_VALUE" ]; then
+    echo "DKIM Record for manual addition (if needed):"
+    echo "----------------------------------------"
+    echo "Name: mail._domainkey"
+    echo "Type: TXT"
+    echo "Value: $DKIM_RECORD_VALUE"
+    echo "----------------------------------------"
+fi
+
+echo ""
 print_message "✓ Cloudflare DNS setup completed successfully!"
