@@ -1014,7 +1014,7 @@ if netstat -lnp 2>/dev/null | grep -q ":8891"; then
     
     # Display DKIM key info
     if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-        DKIM_KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r ')
+        DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' "')
         if [ ! -z "$DKIM_KEY" ]; then
             echo "✓ DKIM key ready: ${#DKIM_KEY} characters"
             
@@ -1074,7 +1074,7 @@ fi
 
 # Display DKIM record
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    DKIM_KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r ')
+    DDKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' "')
     if [ ! -z "$DKIM_KEY" ]; then
         echo "DKIM Record (add to DNS if not automatic):"
         echo "  Name: mail._domainkey"
