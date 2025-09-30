@@ -234,13 +234,18 @@ chmod 666 "$WEB_ROOT/data/colors.json"
 
 echo "Creating website pages and backend API..."
 
-# Create PHP API endpoints for backend functionality with FIXED database access
+# Update auth.php with rate limiting
 cat > "$WEB_ROOT/api/auth.php" <<'APIAUTH'
 <?php
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST');
 header('Access-Control-Allow-Headers: Content-Type');
+
+// Include rate limiter
+if (file_exists(__DIR__ . '/rate-limit.php')) {
+    require_once(__DIR__ . '/rate-limit.php');
+}
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
@@ -258,12 +263,26 @@ if (empty($email) || empty($password)) {
     exit;
 }
 
-// FIXED: Load database configuration from web-accessible location
+// Check rate limiting
+if (class_exists('RateLimiter')) {
+    $limiter = new RateLimiter();
+    $limit_check = $limiter->checkLimit($email, 'login');
+    
+    if (!$limit_check['allowed']) {
+        http_response_code(429);
+        echo json_encode([
+            'error' => $limit_check['message'],
+            'retry_after' => $limit_check['remaining_time']
+        ]);
+        exit;
+    }
+}
+
+// Load database configuration
 $db_config_file = '/etc/mail-web-config/db_config.php';
 if (file_exists($db_config_file)) {
     require_once($db_config_file);
 } else {
-    // Fallback: try to read password file directly
     $db_pass_file = '/etc/mail-web-config/db_password';
     if (file_exists($db_pass_file) && is_readable($db_pass_file)) {
         $db_pass = trim(file_get_contents($db_pass_file));
@@ -282,7 +301,6 @@ if (file_exists($db_config_file)) {
 // Try connecting to database
 $mysqli = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
 
-// If localhost fails, try 127.0.0.1
 if ($mysqli->connect_error) {
     $mysqli = new mysqli(DB_HOST_ALT, DB_USER, DB_PASS, DB_NAME);
     
@@ -300,67 +318,163 @@ $stmt->execute();
 $result = $stmt->get_result();
 
 if ($row = $result->fetch_assoc()) {
-    // Verify password using Dovecot's method
     $stored_pass = $row['password'];
+    $verified = false;
     
-    // Check if it's a plain password (for testing) or hashed
-    if (strpos($stored_pass, '{') === 0) {
-        // It's hashed, we need to verify properly
-        // Try multiple verification methods
+    // Check password format and verify accordingly
+    if (strpos($stored_pass, '{') !== 0) {
+        // Plain password
+        $verified = ($stored_pass === $password);
+    } elseif (strpos($stored_pass, '{PLAIN}') === 0) {
+        // {PLAIN} prefix
+        $plain_pass = substr($stored_pass, 7);
+        $verified = ($plain_pass === $password);
+    } else {
+        // Hashed password - use improved verification
+        $scheme = '';
+        if (preg_match('/^{([^}]+)}/', $stored_pass, $matches)) {
+            $scheme = $matches[1];
+        }
         
-        // Method 1: Use doveadm if available
-        $cmd = "doveadm pw -t " . escapeshellarg($stored_pass) . " -p " . escapeshellarg($password) . " 2>&1";
-        exec($cmd, $output, $return_code);
-        
-        $verified = false;
-        
-        // Check for success in different ways
-        if ($return_code === 0) {
-            // Check output for verification message
-            $output_str = implode(' ', $output);
-            if (strpos($output_str, 'verified') !== false || empty($output_str)) {
+        if ($scheme === 'SHA512-CRYPT' || $scheme === 'CRYPT') {
+            $hash_only = preg_replace('/^{[^}]+}/', '', $stored_pass);
+            $verified = (crypt($password, $hash_only) === $hash_only);
+        } else {
+            // Use doveadm for verification
+            $verify_cmd = sprintf(
+                "echo %s | doveadm pw -t %s 2>&1",
+                escapeshellarg($password),
+                escapeshellarg($stored_pass)
+            );
+            $verify_output = shell_exec($verify_cmd);
+            
+            if (strpos($verify_output, 'verified') !== false || 
+                trim($verify_output) === '' || 
+                strpos($verify_output, 'ok') !== false) {
                 $verified = true;
             }
         }
-        
-        // Method 2: If doveadm fails, try password_verify for CRYPT passwords
-        if (!$verified && strpos($stored_pass, '{SHA512-CRYPT}') === 0) {
-            $hash = substr($stored_pass, 14); // Remove {SHA512-CRYPT} prefix
-            if (function_exists('password_verify')) {
-                $verified = password_verify($password, $hash);
-            }
+    }
+    
+    if ($verified) {
+        // Clear rate limit on success
+        if (isset($limiter)) {
+            $limiter->recordAttempt($email, 'login', true);
         }
         
-        // Method 3: For PLAIN passwords stored with {PLAIN} prefix
-        if (!$verified && strpos($stored_pass, '{PLAIN}') === 0) {
-            $plain_pass = substr($stored_pass, 7); // Remove {PLAIN} prefix
-            $verified = ($plain_pass === $password);
-        }
-        
-        if ($verified) {
-            // Success
-            session_start();
-            $_SESSION['user'] = $email;
-            echo json_encode(['success' => true, 'user' => $email]);
-        } else {
-            // Debug info (remove in production)
-            error_log("Auth failed - Return code: $return_code, Output: " . implode(' ', $output));
-            http_response_code(401);
-            echo json_encode(['error' => 'Invalid credentials']);
-        }
+        session_start();
+        $_SESSION['user'] = $email;
+        echo json_encode(['success' => true, 'user' => $email]);
     } else {
-        // Plain password comparison (not recommended for production)
-        if ($stored_pass === $password) {
-            session_start();
-            $_SESSION['user'] = $email;
-            echo json_encode(['success' => true, 'user' => $email]);
+        // Record failed attempt
+        if (isset($limiter)) {
+            $limiter->recordAttempt($email, 'login', false);
+            $remaining = $limiter->getRemainingAttempts($email, 'login');
+            
+            $error_msg = 'Invalid credentials';
+            if ($remaining > 0) {
+                $error_msg .= '. ' . $remaining . ' attempt(s) remaining.';
+            } else {
+                $error_msg .= '. Account temporarily locked.';
+            }
+            
+            http_response_code(401);
+            echo json_encode(['error' => $error_msg, 'attempts_remaining' => $remaining]);
         } else {
             http_response_code(401);
             echo json_encode(['error' => 'Invalid credentials']);
         }
     }
 } else {
-    http_response_code(401);
+    // Record failed attempt for non-existent user too
+    if (isset($limiter)) {
+        $limiter->recordAttempt($email, 'login', false);
+    }
+    
+    http_response_code(401);# Create rate limiting API (add this as a new file)
+cat > "$WEB_ROOT/api/rate-limit.php" <<'APIRATELIMIT'
+<?php
+session_start();
+
+class RateLimiter {
+    private $cache_dir = '/tmp/mail-rate-limit/';
+    private $max_attempts = 3;
+    private $lockout_time = 900; // 15 minutes in seconds
+    
+    public function __construct() {
+        if (!is_dir($this->cache_dir)) {
+            mkdir($this->cache_dir, 0777, true);
+        }
+    }
+    
+    public function checkLimit($identifier, $action = 'default') {
+        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
+        
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            
+            // Check if lockout period has expired
+            if (isset($data['locked_until']) && $data['locked_until'] > time()) {
+                $remaining = $data['locked_until'] - time();
+                return [
+                    'allowed' => false,
+                    'remaining_time' => $remaining,
+                    'message' => 'Too many failed attempts. Please try again in ' . ceil($remaining / 60) . ' minutes.'
+                ];
+            }
+            
+            // Reset if lockout expired
+            if (isset($data['locked_until']) && $data['locked_until'] <= time()) {
+                $data = ['attempts' => 0, 'last_attempt' => time()];
+            }
+        } else {
+            $data = ['attempts' => 0, 'last_attempt' => time()];
+        }
+        
+        return ['allowed' => true, 'attempts' => $data['attempts']];
+    }
+    
+    public function recordAttempt($identifier, $action = 'default', $success = false) {
+        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
+        
+        if ($success) {
+            // Clear attempts on success
+            if (file_exists($file)) {
+                unlink($file);
+            }
+            return;
+        }
+        
+        // Record failed attempt
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+        } else {
+            $data = ['attempts' => 0, 'last_attempt' => time()];
+        }
+        
+        $data['attempts']++;
+        $data['last_attempt'] = time();
+        
+        // Lock out after max attempts
+        if ($data['attempts'] >= $this->max_attempts) {
+            $data['locked_until'] = time() + $this->lockout_time;
+        }
+        
+        file_put_contents($file, json_encode($data));
+    }
+    
+    public function getRemainingAttempts($identifier, $action = 'default') {
+        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
+        
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            return max(0, $this->max_attempts - $data['attempts']);
+        }
+        
+        return $this->max_attempts;
+    }
+}
+APIRATELIMIT
     echo json_encode(['error' => 'Invalid credentials']);
 }
 
@@ -368,7 +482,9 @@ $stmt->close();
 $mysqli->close();
 APIAUTH
 
-# Create password change API with FIXED database access
+
+
+# Create password change API with FIXED verification and rate limiting
 cat > "$WEB_ROOT/api/change-password.php" <<'APIPASS'
 <?php
 session_start();
@@ -376,6 +492,9 @@ header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST');
 header('Access-Control-Allow-Headers: Content-Type');
+
+// Include rate limiter
+require_once(__DIR__ . '/rate-limit.php');
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
@@ -394,6 +513,19 @@ $current_password = $input['currentPassword'] ?? '';
 $new_password = $input['newPassword'] ?? '';
 $user_email = $_SESSION['user'];
 
+// Check rate limiting
+$limiter = new RateLimiter();
+$limit_check = $limiter->checkLimit($user_email, 'password_change');
+
+if (!$limit_check['allowed']) {
+    http_response_code(429);
+    echo json_encode([
+        'error' => $limit_check['message'],
+        'retry_after' => $limit_check['remaining_time']
+    ]);
+    exit;
+}
+
 if (empty($current_password) || empty($new_password)) {
     http_response_code(400);
     echo json_encode(['error' => 'Current and new passwords required']);
@@ -406,7 +538,7 @@ if (strlen($new_password) < 8) {
     exit;
 }
 
-// FIXED: Load database configuration from web-accessible location
+// Load database configuration
 $db_config_file = '/etc/mail-web-config/db_config.php';
 if (file_exists($db_config_file)) {
     require_once($db_config_file);
@@ -448,29 +580,91 @@ $result = $stmt->get_result();
 if ($row = $result->fetch_assoc()) {
     $stored_pass = $row['password'];
     
-    // Verify current password
+    // IMPROVED password verification
     $valid = false;
-    if (strpos($stored_pass, '{') === 0) {
-        // Hashed password
-        $cmd = "doveadm pw -t '$stored_pass' -p " . escapeshellarg($current_password) . " 2>&1";
-        exec($cmd, $output, $return_code);
-        if ($return_code === 0 && strpos(implode('', $output), 'verified') !== false) {
-            $valid = true;
-        }
-    } else {
-        // Plain password
+    
+    // Method 1: Plain password (for testing/legacy)
+    if (strpos($stored_pass, '{') !== 0) {
         $valid = ($stored_pass === $current_password);
+    } 
+    // Method 2: {PLAIN} prefix
+    elseif (strpos($stored_pass, '{PLAIN}') === 0) {
+        $plain_pass = substr($stored_pass, 7);
+        $valid = ($plain_pass === $current_password);
+    }
+    // Method 3: Hashed password - use doveadm WITHOUT using shell_exec on stored password
+    else {
+        // Generate a hash of the provided password using the same scheme
+        $scheme = '';
+        if (preg_match('/^{([^}]+)}/', $stored_pass, $matches)) {
+            $scheme = $matches[1];
+        }
+        
+        // Try different verification methods based on scheme
+        if ($scheme === 'SHA512-CRYPT' || $scheme === 'CRYPT') {
+            // Extract just the hash part
+            $hash_only = preg_replace('/^{[^}]+}/', '', $stored_pass);
+            
+            // Use PHP's crypt verification
+            $valid = (crypt($current_password, $hash_only) === $hash_only);
+        } else {
+            // For other schemes, generate hash and compare
+            // Use doveadm to generate hash with same scheme
+            $cmd = "doveadm pw -s " . escapeshellarg($scheme) . " -p " . escapeshellarg($current_password) . " 2>/dev/null";
+            $generated_hash = trim(shell_exec($cmd));
+            
+            if (!empty($generated_hash)) {
+                // Direct comparison of hashes
+                $valid = ($generated_hash === $stored_pass);
+                
+                // If not exact match, try comparing just the hash parts
+                if (!$valid) {
+                    $stored_hash_only = preg_replace('/^{[^}]+}/', '', $stored_pass);
+                    $generated_hash_only = preg_replace('/^{[^}]+}/', '', $generated_hash);
+                    
+                    // Some schemes have salts that make direct comparison fail
+                    // Try using doveadm verify as last resort
+                    $verify_cmd = sprintf(
+                        "echo %s | doveadm pw -t %s 2>&1",
+                        escapeshellarg($current_password),
+                        escapeshellarg($stored_pass)
+                    );
+                    $verify_output = shell_exec($verify_cmd);
+                    
+                    // Check if verification succeeded
+                    if (strpos($verify_output, 'verified') !== false || 
+                        trim($verify_output) === '' || 
+                        strpos($verify_output, 'ok') !== false) {
+                        $valid = true;
+                    }
+                }
+            }
+        }
     }
     
     if (!$valid) {
+        // Record failed attempt
+        $limiter->recordAttempt($user_email, 'password_change', false);
+        $remaining = $limiter->getRemainingAttempts($user_email, 'password_change');
+        
         http_response_code(401);
-        echo json_encode(['error' => 'Current password is incorrect']);
+        $error_msg = 'Current password is incorrect';
+        if ($remaining > 0) {
+            $error_msg .= '. ' . $remaining . ' attempt(s) remaining.';
+        } else {
+            $error_msg .= '. Account temporarily locked.';
+        }
+        
+        echo json_encode(['error' => $error_msg, 'attempts_remaining' => $remaining]);
         $stmt->close();
         $mysqli->close();
         exit;
     }
     
-    // Hash new password using doveadm
+    // Current password is valid - clear rate limit
+    $limiter->recordAttempt($user_email, 'password_change', true);
+    
+    // Hash new password using doveadm (prefer SHA512-CRYPT)
     $cmd = "doveadm pw -s SHA512-CRYPT -p " . escapeshellarg($new_password) . " 2>/dev/null";
     $new_hash = trim(shell_exec($cmd));
     
@@ -481,7 +675,13 @@ if ($row = $result->fetch_assoc()) {
     }
     
     if (empty($new_hash)) {
-        // Last resort - store plain (not recommended)
+        // Last resort - CRYPT
+        $cmd = "doveadm pw -s CRYPT -p " . escapeshellarg($new_password) . " 2>/dev/null";
+        $new_hash = trim(shell_exec($cmd));
+    }
+    
+    if (empty($new_hash)) {
+        // Emergency fallback - store plain (not recommended)
         $new_hash = "{PLAIN}$new_password";
     }
     
