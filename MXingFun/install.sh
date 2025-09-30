@@ -2,9 +2,9 @@
 
 # =================================================================
 # BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
-# Version: 17.0.4 - FIXED DKIM KEY SIZE
+# Version: 17.0.5 - FIXED SSL certificate requests
 # Automated installation with Cloudflare DNS, compliance website, and DKIM
-# FIXED: Using 1024-bit DKIM key for DNS compatibility
+# FIXED: Only requests SSL for existing DNS records
 # =================================================================
 
 set -e  # Exit on any error
@@ -190,7 +190,7 @@ EOF
 # ===================================================================
 
 print_header "Multi-IP Bulk Mail Server Installer"
-echo "Version: 17.0.4"
+echo "Version: 17.0.5"
 echo "Starting installation at: $(date)"
 echo ""
 
@@ -743,7 +743,7 @@ else
 fi
 
 # ===================================================================
-# PHASE 11: SSL CERTIFICATES (AUTOMATIC ATTEMPT)
+# PHASE 11: SSL CERTIFICATES (SMART REQUEST - ONLY EXISTING DOMAINS)
 # ===================================================================
 
 print_header "Phase 11: SSL Certificate Setup"
@@ -751,23 +751,41 @@ print_header "Phase 11: SSL Certificate Setup"
 echo "Attempting to obtain SSL certificates..."
 echo "Note: This will work if DNS is already propagated"
 
-# FIX: Include ALL subdomains in SSL certificate request
-if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
-    echo "Getting SSL certificates for all domains and subdomains..."
-    
-    # Build certificate domain list
-    CERT_DOMAINS="-d $DOMAIN_NAME -d www.$DOMAIN_NAME -d $HOSTNAME"
-    
-    # Add additional subdomain IPs if configured
-    if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-        for i in {1..9}; do
-            if [ $i -le ${#IP_ADDRESSES[@]} ]; then
-                CERT_DOMAINS="$CERT_DOMAINS -d ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
-            fi
-        done
+# Function to check if domain resolves
+check_dns() {
+    local domain=$1
+    host "$domain" 8.8.8.8 > /dev/null 2>&1
+    return $?
+}
+
+# Build list of domains that actually resolve
+CERT_DOMAINS=""
+DOMAINS_TO_CHECK=("$DOMAIN_NAME" "www.$DOMAIN_NAME" "$HOSTNAME")
+
+# Add numbered subdomains if multiple IPs configured
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    for i in $(seq 1 $((${#IP_ADDRESSES[@]} - 1))); do
+        DOMAINS_TO_CHECK+=("${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME")
+    done
+fi
+
+echo "Checking DNS for domains..."
+for domain in "${DOMAINS_TO_CHECK[@]}"; do
+    echo -n "  $domain: "
+    if check_dns "$domain"; then
+        CERT_DOMAINS="$CERT_DOMAINS -d $domain"
+        print_message "✓ Resolving"
+    else
+        print_warning "✗ Not found (skipping)"
     fi
+done
+
+# Only request certificate if we have at least the main domain
+if [[ "$CERT_DOMAINS" == *"-d $DOMAIN_NAME"* ]]; then
+    echo ""
+    echo "Getting SSL certificates for existing domains..."
     
-    # Get certificate with nginx plugin for ALL domains
+    # Get certificate with nginx plugin for domains that exist
     certbot --nginx \
         $CERT_DOMAINS \
         --non-interactive \
@@ -776,7 +794,9 @@ if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
         --no-eff-email 2>/dev/null || \
     echo "SSL certificates pending DNS propagation"
 else
-    echo "DNS not ready yet, SSL certificates will be obtained after DNS propagates"
+    echo ""
+    print_warning "Main domain not resolving yet, SSL certificates will be obtained after DNS propagates"
+    echo "Run 'get-ssl-cert' after DNS propagation to obtain certificates"
 fi
 
 # ===================================================================
@@ -855,7 +875,6 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo ""
     echo "IP Rotation: ENABLED with sticky sessions"
     echo "  View status: ip-rotation-status"
-    echo "  Assign IP: assign-sender-ip email@domain.com"
 fi
 echo ""
 
@@ -871,10 +890,14 @@ if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     echo "DKIM Record (add to DNS if not using Cloudflare):"
     echo "  Name: mail._domainkey"
     echo "  Type: TXT"
-    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -v "(" | grep -v ")" | sed 's/.*"p=//' | sed 's/".*//' | tr -d '\n\t\r ')
-    echo "  Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
-    echo ""
-    echo "  Key length: ${#DKIM_KEY} characters (should be ~215 for 1024-bit)"
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP 'p=\K[^"]+' | tr -d '\n\t\r ')
+    if [ ! -z "$DKIM_KEY" ]; then
+        echo "  Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
+        echo ""
+        echo "  Key length: ${#DKIM_KEY} characters (should be ~215 for 1024-bit)"
+    else
+        print_warning "  Could not extract key - check manually: cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+    fi
     echo ""
 fi
 
@@ -882,14 +905,24 @@ echo "VERIFY EVERYTHING IS WORKING:"
 echo "  1. Check DKIM signing: opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
 echo "  2. System status: systemctl status opendkim postfix dovecot nginx"
 echo "  3. Send test email: test-email check-auth@verifier.port25.com"
-echo "  4. Check website: https://$DOMAIN_NAME"
+echo "  4. Check website: http://$DOMAIN_NAME"
+echo ""
+
+echo "IMPORTANT - SSL Certificates:"
+if [[ "$CERT_DOMAINS" == *"-d $DOMAIN_NAME"* ]]; then
+    echo "  ✓ SSL certificates requested for existing domains"
+else
+    echo "  ⚠ SSL certificates pending - DNS not yet propagated"
+    echo "  Run 'get-ssl-cert' after DNS propagation (5-30 minutes)"
+fi
 echo ""
 
 echo "Next Steps:"
 echo "1. Wait for DNS propagation (5-30 minutes)"
-echo "2. Test email delivery: test-email recipient@example.com"
-echo "3. Update physical address in /var/www/$DOMAIN_NAME/contact.html"
-echo "4. Update Mailwizz URL in nginx config"
+echo "2. Get SSL certificates: get-ssl-cert"
+echo "3. Test email delivery: test-email recipient@example.com"
+echo "4. Update physical address in /var/www/$DOMAIN_NAME/contact.html"
+echo "5. Update Mailwizz URL in nginx config"
 echo ""
 
 echo "Management Commands:"
@@ -908,11 +941,16 @@ echo ""
 
 echo "Installation log: $LOG_FILE"
 echo ""
-print_message "Your bulk mail server is FULLY OPERATIONAL!"
+print_message "Your bulk mail server is READY!"
 print_message "✓ DKIM signing ENABLED with 1024-bit key"
 print_message "✓ Subdomain DNS configured: $MAIL_SUBDOMAIN"
-print_message "✓ Website with SSL support ready (including subdomains)"
+if [[ "$CERT_DOMAINS" == *"-d $DOMAIN_NAME"* ]]; then
+    print_message "✓ SSL certificates obtained for existing domains"
+else
+    print_message "✓ SSL certificates will auto-retry every 30 minutes"
+fi
 echo ""
-print_message "CRITICAL FIXES APPLIED:"
-print_message "✓ 1024-bit DKIM key for DNS compatibility"
-print_message "✓ SSL certificates include ALL subdomains"
+print_message "CRITICAL REMINDER:"
+print_message "• If DNS is not propagated, run 'get-ssl-cert' in 30 minutes"
+print_message "• Verify DKIM in DNS: opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
+print_message "• Send test email: test-email check-auth@verifier.port25.com"
