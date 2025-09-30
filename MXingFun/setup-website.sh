@@ -176,7 +176,15 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     php-xml php-curl > /dev/null 2>&1
 
 # Get PHP version
-PHP_VERSION=$(php -v | head -n1 | cut -d' ' -f2 | cut -d'.' -f1,2)
+PHP_VERSION=$(php -v 2>/dev/null | head -n1 | cut -d' ' -f2 | cut -d'.' -f1,2)
+
+if [ -z "$PHP_VERSION" ]; then
+    # Try to detect PHP-FPM version
+    PHP_FPM_SERVICE=$(systemctl list-units --all | grep php.*fpm | head -1 | awk '{print $1}')
+    if [ ! -z "$PHP_FPM_SERVICE" ]; then
+        PHP_VERSION=$(echo $PHP_FPM_SERVICE | grep -oP 'php\K[0-9.]+')
+    fi
+fi
 
 if [ -z "$PHP_VERSION" ]; then
     PHP_VERSION="7.4"  # Default fallback
@@ -1509,8 +1517,153 @@ chmod 666 "$WEB_ROOT/data/colors.json"
 
 print_message "✓ Website files created with fixed database access"
 
-# Configure Nginx (rest remains the same)
-# ... [Nginx configuration section remains the same] ...
+# ===================================================================
+# 4. CONFIGURE NGINX (CRITICAL - THIS FIXES THE DEFAULT PAGE ISSUE)
+# ===================================================================
+
+print_header "Configuring Nginx"
+
+# Remove default nginx site to avoid conflicts
+echo "Removing default nginx configuration..."
+rm -f /etc/nginx/sites-enabled/default
+rm -f /etc/nginx/sites-available/default
+
+# Create nginx configuration for the domain
+echo "Creating Nginx configuration for $DOMAIN_NAME..."
+
+cat > "/etc/nginx/sites-available/$DOMAIN_NAME" <<NGINX_CONFIG
+# Mail Server Website Configuration
+# Generated: $(date)
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    
+    server_name $DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME _;
+    
+    root $WEB_ROOT;
+    index index.html index.php;
+    
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    
+    # Main location
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+    
+    # PHP handling for API
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php$PHP_VERSION-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+    
+    # API directory specific handling
+    location /api/ {
+        try_files \$uri \$uri/ =404;
+        
+        # Ensure PHP files in API directory are processed
+        location ~ \.php\$ {
+            include snippets/fastcgi-php.conf;
+            fastcgi_pass unix:/var/run/php/php$PHP_VERSION-fpm.sock;
+            fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+            include fastcgi_params;
+        }
+    }
+    
+    # Deny access to hidden files
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+    
+    # Static file caching
+    location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # Let's Encrypt challenge
+    location /.well-known/acme-challenge/ {
+        root $WEB_ROOT;
+        allow all;
+    }
+    
+    # Log files
+    access_log /var/log/nginx/${DOMAIN_NAME}_access.log;
+    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;
+}
+NGINX_CONFIG
+
+# Enable the site
+echo "Enabling website configuration..."
+ln -sf "/etc/nginx/sites-available/$DOMAIN_NAME" "/etc/nginx/sites-enabled/$DOMAIN_NAME"
+
+# Remove any other enabled sites that might conflict
+for site in /etc/nginx/sites-enabled/*; do
+    if [ -f "$site" ] && [ "$(basename $site)" != "$DOMAIN_NAME" ]; then
+        echo "Removing conflicting site: $(basename $site)"
+        rm -f "$site"
+    fi
+done
+
+# Test nginx configuration
+echo "Testing Nginx configuration..."
+nginx -t 2>/dev/null
+
+if [ $? -eq 0 ]; then
+    print_message "✓ Nginx configuration is valid"
+else
+    print_error "✗ Nginx configuration has errors"
+    echo "Attempting to fix common issues..."
+    
+    # Check if PHP-FPM socket exists
+    if [ ! -S "/var/run/php/php$PHP_VERSION-fpm.sock" ]; then
+        # Try to find the correct PHP-FPM socket
+        PHP_SOCKET=$(find /var/run/php/ -name "*.sock" 2>/dev/null | head -1)
+        if [ ! -z "$PHP_SOCKET" ]; then
+            echo "Found PHP socket: $PHP_SOCKET"
+            sed -i "s|/var/run/php/php.*-fpm.sock|$PHP_SOCKET|g" "/etc/nginx/sites-available/$DOMAIN_NAME"
+        fi
+    fi
+    
+    # Test again
+    nginx -t 2>/dev/null
+fi
+
+# Start/restart services
+echo "Starting services..."
+
+# Ensure PHP-FPM is running
+systemctl start php$PHP_VERSION-fpm 2>/dev/null || systemctl start php-fpm 2>/dev/null
+systemctl enable php$PHP_VERSION-fpm 2>/dev/null || systemctl enable php-fpm 2>/dev/null
+
+# Restart Nginx to apply all changes
+systemctl stop nginx
+sleep 2
+systemctl start nginx
+systemctl enable nginx
+
+# Verify services are running
+echo ""
+echo "Checking service status..."
+if systemctl is-active --quiet nginx; then
+    print_message "✓ Nginx is running"
+else
+    print_error "✗ Nginx is not running"
+    systemctl status nginx --no-pager | head -10
+fi
+
+if systemctl is-active --quiet php$PHP_VERSION-fpm 2>/dev/null || systemctl is-active --quiet php-fpm 2>/dev/null; then
+    print_message "✓ PHP-FPM is running"
+else
+    print_warning "⚠ PHP-FPM may not be running"
+fi
 
 # ===================================================================
 # COMPLETION
