@@ -2,7 +2,7 @@
 
 # =================================================================
 # CREATE MAIL SERVER MANAGEMENT UTILITIES
-# Version: 17.0.6 - Enhanced with better DKIM verification
+# Version: 17.1.0 - Enhanced with bulk IP management
 # Creates all management commands for the mail server
 # =================================================================
 
@@ -117,6 +117,8 @@ cat > /usr/local/bin/mail-account <<'EOF'
 # Load database password
 if [ -f /root/.mail_db_password ]; then
     DB_PASS=$(cat /root/.mail_db_password)
+elif [ -f /etc/mail-config/db_password ]; then
+    DB_PASS=$(cat /etc/mail-config/db_password)
 else
     echo "Error: Database password file not found"
     exit 1
@@ -225,7 +227,244 @@ EOF
 chmod +x /usr/local/bin/mail-account
 
 # ===================================================================
-# 3. TEST EMAIL COMMAND (WITH DKIM VERIFICATION)
+# 3. BULK IP MANAGEMENT COMMAND (FIX 3)
+# ===================================================================
+
+cat > /usr/local/bin/bulk-ip-manage <<'EOF'
+#!/bin/bash
+
+# Bulk IP Management Tool for Mail Server
+GREEN='\033[38;5;208m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Load database password
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+elif [ -f /etc/mail-config/db_password ]; then
+    DB_PASS=$(cat /etc/mail-config/db_password)
+else
+    echo -e "${RED}Error: Database password not found${NC}"
+    exit 1
+fi
+
+MYSQL_CMD="mysql -u mailuser -p$DB_PASS mailserver"
+
+case "$1" in
+    assign)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: bulk-ip-manage assign <email> <mode>"
+            echo "Modes: sticky, round-robin, least-used"
+            exit 1
+        fi
+        
+        EMAIL="$2"
+        MODE="$3"
+        
+        # Validate mode
+        if [[ ! "$MODE" =~ ^(sticky|round-robin|least-used)$ ]]; then
+            echo -e "${RED}Invalid mode. Use: sticky, round-robin, or least-used${NC}"
+            exit 1
+        fi
+        
+        # Call stored procedure or assign IP
+        $MYSQL_CMD -e "CALL assign_ip_to_sender('$EMAIL', '$MODE')" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            # Get assigned IP
+            RESULT=$($MYSQL_CMD -N -e "SELECT assigned_ip, transport_id FROM ip_rotation_advanced WHERE sender_email='$EMAIL'" 2>/dev/null)
+            IP=$(echo "$RESULT" | awk '{print $1}')
+            TRANSPORT=$(echo "$RESULT" | awk '{print $2}')
+            echo -e "${GREEN}✓ Assigned $EMAIL to IP $IP (transport smtp-ip$TRANSPORT) using $MODE mode${NC}"
+            
+            # Update Postfix sender transport map
+            echo "$EMAIL smtp-ip$TRANSPORT:" >> /etc/postfix/sender_transports
+            postmap /etc/postfix/sender_transports
+            postfix reload 2>/dev/null
+        else
+            echo -e "${RED}✗ Failed to assign IP${NC}"
+        fi
+        ;;
+        
+    list)
+        echo "Current IP Assignments:"
+        echo ""
+        $MYSQL_CMD -e "
+        SELECT 
+            sender_email as 'Email Address', 
+            assigned_ip as 'Assigned IP', 
+            rotation_mode as 'Mode',
+            message_count as 'Total Messages',
+            messages_today as 'Today',
+            DATE_FORMAT(last_used, '%Y-%m-%d %H:%i') as 'Last Used'
+        FROM ip_rotation_advanced
+        ORDER BY last_used DESC;" 2>/dev/null
+        ;;
+        
+    stats)
+        echo "IP Pool Statistics:"
+        echo ""
+        $MYSQL_CMD -e "
+        SELECT 
+            ip_address as 'IP Address',
+            hostname as 'Hostname',
+            CASE is_active WHEN 1 THEN 'Active' ELSE 'Inactive' END as 'Status',
+            reputation_score as 'Score',
+            messages_sent_today as 'Today',
+            messages_sent_total as 'Total',
+            DATE_FORMAT(last_used, '%Y-%m-%d %H:%i') as 'Last Used'
+        FROM ip_pool
+        ORDER BY ip_index;" 2>/dev/null
+        ;;
+        
+    reset)
+        if [ -z "$2" ]; then
+            echo "Usage: bulk-ip-manage reset <email|all>"
+            exit 1
+        fi
+        
+        if [ "$2" == "all" ]; then
+            # Reset all assignments
+            $MYSQL_CMD -e "
+            UPDATE ip_rotation_advanced SET assigned_ip = NULL, transport_id = NULL;
+            UPDATE ip_pool SET messages_sent_today = 0, last_reset = CURDATE();" 2>/dev/null
+            
+            # Clear Postfix sender transports
+            echo "# Sender transport mappings - managed by bulk-ip-manage" > /etc/postfix/sender_transports
+            postmap /etc/postfix/sender_transports
+            postfix reload 2>/dev/null
+            
+            echo -e "${GREEN}✓ Reset all IP assignments${NC}"
+        else
+            EMAIL="$2"
+            $MYSQL_CMD -e "
+            UPDATE ip_rotation_advanced 
+            SET assigned_ip = NULL, transport_id = NULL 
+            WHERE sender_email = '$EMAIL';" 2>/dev/null
+            
+            # Remove from Postfix sender transports
+            grep -v "^$EMAIL " /etc/postfix/sender_transports > /tmp/sender_transports.tmp
+            mv /tmp/sender_transports.tmp /etc/postfix/sender_transports
+            postmap /etc/postfix/sender_transports
+            postfix reload 2>/dev/null
+            
+            echo -e "${GREEN}✓ Reset IP assignment for $EMAIL${NC}"
+        fi
+        ;;
+        
+    activate|deactivate)
+        if [ -z "$2" ]; then
+            echo "Usage: bulk-ip-manage $1 <ip>"
+            exit 1
+        fi
+        
+        IP="$2"
+        ACTIVE=$([ "$1" == "activate" ] && echo "1" || echo "0")
+        
+        $MYSQL_CMD -e "UPDATE ip_pool SET is_active = $ACTIVE WHERE ip_address = '$IP';" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ IP $IP ${1}d${NC}"
+        else
+            echo -e "${RED}✗ Failed to $1 IP${NC}"
+        fi
+        ;;
+        
+    reputation)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: bulk-ip-manage reputation <ip> <score>"
+            echo "Score range: 0-100 (100 = best)"
+            exit 1
+        fi
+        
+        IP="$2"
+        SCORE="$3"
+        
+        if ! [[ "$SCORE" =~ ^[0-9]+$ ]] || [ "$SCORE" -lt 0 ] || [ "$SCORE" -gt 100 ]; then
+            echo -e "${RED}Invalid score. Use 0-100${NC}"
+            exit 1
+        fi
+        
+        $MYSQL_CMD -e "UPDATE ip_pool SET reputation_score = $SCORE WHERE ip_address = '$IP';" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ Set reputation score for $IP to $SCORE${NC}"
+        else
+            echo -e "${RED}✗ Failed to update reputation${NC}"
+        fi
+        ;;
+        
+    report)
+        echo "========================================="
+        echo "Bulk Mail IP Rotation Report"
+        echo "========================================="
+        echo ""
+        
+        # Summary
+        TOTAL_IPS=$($MYSQL_CMD -N -e "SELECT COUNT(*) FROM ip_pool" 2>/dev/null)
+        ACTIVE_IPS=$($MYSQL_CMD -N -e "SELECT COUNT(*) FROM ip_pool WHERE is_active=1" 2>/dev/null)
+        TOTAL_MSGS=$($MYSQL_CMD -N -e "SELECT IFNULL(SUM(messages_sent_total),0) FROM ip_pool" 2>/dev/null)
+        TODAY_MSGS=$($MYSQL_CMD -N -e "SELECT IFNULL(SUM(messages_sent_today),0) FROM ip_pool" 2>/dev/null)
+        
+        echo "Summary:"
+        echo "  Total IPs: $TOTAL_IPS (Active: $ACTIVE_IPS)"
+        echo "  Messages sent today: $TODAY_MSGS"
+        echo "  Messages sent total: $TOTAL_MSGS"
+        echo ""
+        
+        # Top senders
+        echo "Top 5 Senders Today:"
+        $MYSQL_CMD -e "
+        SELECT 
+            sender_email as 'Email',
+            messages_today as 'Messages',
+            rotation_mode as 'Mode'
+        FROM ip_rotation_advanced
+        WHERE messages_today > 0
+        ORDER BY messages_today DESC
+        LIMIT 5;" 2>/dev/null
+        echo ""
+        
+        # IP utilization
+        echo "IP Utilization:"
+        $MYSQL_CMD -e "
+        SELECT 
+            ip_address as 'IP',
+            CONCAT(ROUND((messages_sent_today/max_daily_limit)*100,1),'%') as 'Usage',
+            CONCAT(messages_sent_today,'/',max_daily_limit) as 'Messages'
+        FROM ip_pool
+        WHERE is_active=1
+        ORDER BY (messages_sent_today/max_daily_limit) DESC;" 2>/dev/null
+        ;;
+        
+    *)
+        echo "Bulk IP Management Tool"
+        echo "Usage: bulk-ip-manage {command} [options]"
+        echo ""
+        echo "Commands:"
+        echo "  assign <email> <mode>    - Assign rotation mode to sender"
+        echo "                             Modes: sticky, round-robin, least-used"
+        echo "  list                     - List all sender IP assignments"
+        echo "  stats                    - Show IP pool statistics"
+        echo "  reset <email|all>        - Reset IP assignments"
+        echo "  activate <ip>            - Activate an IP address"
+        echo "  deactivate <ip>          - Deactivate an IP address"
+        echo "  reputation <ip> <score>  - Set IP reputation (0-100)"
+        echo "  report                   - Generate usage report"
+        echo ""
+        echo "Examples:"
+        echo "  bulk-ip-manage assign sender@domain.com round-robin"
+        echo "  bulk-ip-manage stats"
+        echo "  bulk-ip-manage deactivate 192.168.1.5"
+        ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/bulk-ip-manage
+
+# ===================================================================
+# 4. TEST EMAIL COMMAND (WITH DKIM VERIFICATION)
 # ===================================================================
 
 cat > /usr/local/bin/test-email <<'EOF'
@@ -260,6 +499,7 @@ This is a test email from your mail server.
 Server Information:
 - Hostname: HOSTNAME_PLACEHOLDER
 - Domain: DOMAIN_PLACEHOLDER
+- Mail Subdomain: SUBDOMAIN_PLACEHOLDER
 - Timestamp: $(date)
 - DKIM: Enabled (1024-bit key)
 - SPF: Configured
@@ -305,10 +545,11 @@ EOF
 # Replace placeholders
 sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/test-email
 sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" /usr/local/bin/test-email
+sed -i "s/SUBDOMAIN_PLACEHOLDER/${MAIL_SUBDOMAIN:-mail}/g" /usr/local/bin/test-email
 chmod +x /usr/local/bin/test-email
 
 # ===================================================================
-# 4. CHECK DNS COMMAND (ENHANCED)
+# 5. CHECK DNS COMMAND (ENHANCED)
 # ===================================================================
 
 cat > /usr/local/bin/check-dns <<'EOF'
@@ -317,6 +558,7 @@ cat > /usr/local/bin/check-dns <<'EOF'
 DOMAIN="${1:-DOMAIN_PLACEHOLDER}"
 HOSTNAME="HOSTNAME_PLACEHOLDER"
 PRIMARY_IP="PRIMARY_IP_PLACEHOLDER"
+MAIL_PREFIX="PREFIX_PLACEHOLDER"
 
 GREEN='\033[38;5;208m'
 RED='\033[0;31m'
@@ -325,6 +567,7 @@ NC='\033[0m'
 
 echo "DNS Records Check for $DOMAIN"
 echo "=============================="
+echo "Mail Subdomain: $MAIL_PREFIX"
 echo ""
 
 # Function to check DNS
@@ -432,304 +675,11 @@ EOF
 sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/check-dns
 sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" /usr/local/bin/check-dns
 sed -i "s/PRIMARY_IP_PLACEHOLDER/$PRIMARY_IP/g" /usr/local/bin/check-dns
+sed -i "s/PREFIX_PLACEHOLDER/${MAIL_SUBDOMAIN:-mail}/g" /usr/local/bin/check-dns
 chmod +x /usr/local/bin/check-dns
 
 # ===================================================================
-# 5. MAIL TEST COMPREHENSIVE
-# ===================================================================
-
-cat > /usr/local/bin/mail-test <<'EOF'
-#!/bin/bash
-
-GREEN='\033[38;5;208m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-BLUE='\033[1;33m'
-NC='\033[0m'
-
-echo -e "${BLUE}==================================================${NC}"
-echo -e "${BLUE}Comprehensive Mail Server Test${NC}"
-echo -e "${BLUE}==================================================${NC}"
-echo ""
-
-# 1. Service Status
-echo "1. SERVICE STATUS"
-echo "-----------------"
-for service in postfix dovecot opendkim mysql nginx; do
-    echo -n "  $service: "
-    if systemctl is-active --quiet $service; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${RED}✗${NC}"
-    fi
-done
-
-# 2. Port Status
-echo ""
-echo "2. PORT STATUS"
-echo "--------------"
-PORTS=(25:SMTP 587:Submission 465:SMTPS 993:IMAPS 995:POP3S 143:IMAP 110:POP3 80:HTTP 443:HTTPS 8891:OpenDKIM)
-for port_info in "${PORTS[@]}"; do
-    IFS=':' read -r port name <<< "$port_info"
-    echo -n "  $port ($name): "
-    if netstat -tuln 2>/dev/null | grep -q ":$port "; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${RED}✗${NC}"
-    fi
-done
-
-# 3. DNS Records
-echo ""
-echo "3. DNS RECORDS"
-echo "--------------"
-DOMAIN="DOMAIN_PLACEHOLDER"
-
-echo -n "  A record: "
-if [ "$(dig +short A $DOMAIN @8.8.8.8 2>/dev/null | head -1)" != "" ]; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}✗${NC}"
-fi
-
-echo -n "  MX record: "
-if [ "$(dig +short MX $DOMAIN @8.8.8.8 2>/dev/null | head -1)" != "" ]; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}✗${NC}"
-fi
-
-echo -n "  SPF record: "
-if dig +short TXT $DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=spf1"; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}✗${NC}"
-fi
-
-echo -n "  DKIM record: "
-if dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=DKIM1"; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}✗${NC}"
-fi
-
-echo -n "  DMARC record: "
-if dig +short TXT _dmarc.$DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=DMARC1"; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}✗${NC}"
-fi
-
-# 4. DKIM Status
-echo ""
-echo "4. DKIM STATUS"
-echo "--------------"
-
-echo -n "  Key file: "
-if [ -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ]; then
-    echo -e "${GREEN}✓${NC}"
-    KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN/mail.txt | tr -d '\n\t\r ')
-    echo "    Length: ${#KEY} characters"
-else
-    echo -e "${RED}✗${NC}"
-fi
-
-echo -n "  OpenDKIM service: "
-if netstat -lnp 2>/dev/null | grep -q ":8891"; then
-    echo -e "${GREEN}✓ Listening${NC}"
-else
-    echo -e "${RED}✗ Not listening${NC}"
-fi
-
-echo -n "  DKIM validation: "
-result=$(opendkim-testkey -d $DOMAIN -s mail -vvv 2>&1 | grep "key OK")
-if [ ! -z "$result" ]; then
-    echo -e "${GREEN}✓ Valid${NC}"
-else
-    echo -e "${YELLOW}⚠ Check needed${NC}"
-fi
-
-# 5. SSL Certificate
-echo ""
-echo "5. SSL CERTIFICATE"
-echo "------------------"
-
-echo -n "  Certificate: "
-if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-    echo -e "${GREEN}✓ Let's Encrypt${NC}"
-    expiry=$(openssl x509 -enddate -noout -in /etc/letsencrypt/live/$DOMAIN/fullchain.pem 2>/dev/null | cut -d= -f2)
-    echo "    Expires: $expiry"
-elif [ -f "/etc/ssl/certs/mailserver.crt" ]; then
-    echo -e "${YELLOW}⚠ Self-signed${NC}"
-else
-    echo -e "${RED}✗ Not found${NC}"
-fi
-
-# 6. Mail Queue
-echo ""
-echo "6. MAIL QUEUE"
-echo "-------------"
-queue_count=$(mailq 2>/dev/null | grep -c "^[A-F0-9]" || echo "0")
-echo "  Messages in queue: $queue_count"
-
-# 7. Database
-echo ""
-echo "7. DATABASE"
-echo "-----------"
-if [ -f /root/.mail_db_password ]; then
-    DB_PASS=$(cat /root/.mail_db_password)
-    user_count=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_users" 2>/dev/null | tail -1 || echo "0")
-    domain_count=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_domains" 2>/dev/null | tail -1 || echo "0")
-    echo "  Domains: $domain_count"
-    echo "  Users: $user_count"
-else
-    echo "  ${RED}✗ Database credentials not found${NC}"
-fi
-
-# Summary
-echo ""
-echo -e "${BLUE}==================================================${NC}"
-echo "TEST SUMMARY"
-echo ""
-echo "Next steps:"
-echo "1. Send test email: test-email check-auth@verifier.port25.com"
-echo "2. Check spam score: https://www.mail-tester.com"
-echo "3. Verify DKIM: opendkim-testkey -d $DOMAIN -s mail -vvv"
-echo ""
-
-# Overall status
-errors=0
-[ ! -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ] && ((errors++))
-! netstat -lnp 2>/dev/null | grep -q ":8891" && ((errors++))
-! dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=DKIM1" && ((errors++))
-
-if [ $errors -eq 0 ]; then
-    echo -e "${GREEN}✓ Server appears fully configured!${NC}"
-else
-    echo -e "${YELLOW}⚠ Some issues need attention ($errors items)${NC}"
-fi
-EOF
-
-sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/mail-test
-chmod +x /usr/local/bin/mail-test
-
-# ===================================================================
-# 6. MAIL LOG VIEWER
-# ===================================================================
-
-cat > /usr/local/bin/mail-log <<'EOF'
-#!/bin/bash
-
-case "$1" in
-    live)
-        echo "Live mail log (Ctrl+C to stop):"
-        tail -f /var/log/mail.log
-        ;;
-    errors)
-        echo "Recent mail errors:"
-        grep -i "error\|warning\|fatal\|panic" /var/log/mail.log | tail -50
-        ;;
-    sent)
-        echo "Recently sent emails:"
-        grep "status=sent" /var/log/mail.log | tail -20
-        ;;
-    bounced)
-        echo "Recently bounced emails:"
-        grep "status=bounced" /var/log/mail.log | tail -20
-        ;;
-    dkim)
-        echo "Recent DKIM activity:"
-        grep -i "dkim" /var/log/mail.log | tail -30
-        ;;
-    auth)
-        echo "Recent authentication attempts:"
-        grep -i "sasl\|auth" /var/log/mail.log | tail -30
-        ;;
-    search)
-        if [ -z "$2" ]; then
-            echo "Usage: mail-log search term"
-            exit 1
-        fi
-        echo "Searching for: $2"
-        grep -i "$2" /var/log/mail.log | tail -50
-        ;;
-    *)
-        echo "Mail Log Viewer"
-        echo "Usage: mail-log {live|errors|sent|bounced|dkim|auth|search}"
-        echo ""
-        echo "Commands:"
-        echo "  live     - Watch live log"
-        echo "  errors   - Show recent errors"
-        echo "  sent     - Show sent emails"
-        echo "  bounced  - Show bounced emails"
-        echo "  dkim     - Show DKIM activity"
-        echo "  auth     - Show authentication attempts"
-        echo "  search   - Search for specific term"
-        ;;
-esac
-EOF
-
-chmod +x /usr/local/bin/mail-log
-
-# ===================================================================
-# 7. MAIL QUEUE MANAGEMENT
-# ===================================================================
-
-cat > /usr/local/bin/mail-queue <<'EOF'
-#!/bin/bash
-
-case "$1" in
-    show)
-        mailq
-        ;;
-    count)
-        count=$(mailq 2>/dev/null | grep -c "^[A-F0-9]" || echo "0")
-        echo "Messages in queue: $count"
-        ;;
-    flush)
-        echo "Flushing mail queue..."
-        postqueue -f
-        echo "✓ Queue flush initiated"
-        ;;
-    clear)
-        echo "Clearing entire queue..."
-        read -p "Are you sure? This will delete ALL queued mail! (y/N): " confirm
-        if [ "$confirm" = "y" ]; then
-            postsuper -d ALL
-            echo "✓ Queue cleared"
-        else
-            echo "Cancelled"
-        fi
-        ;;
-    hold)
-        echo "Putting queue on hold..."
-        postsuper -h ALL
-        echo "✓ Queue on hold"
-        ;;
-    release)
-        echo "Releasing held messages..."
-        postsuper -H ALL
-        echo "✓ Messages released"
-        ;;
-    *)
-        echo "Mail Queue Manager"
-        echo "Usage: mail-queue {show|count|flush|clear|hold|release}"
-        echo ""
-        echo "Commands:"
-        echo "  show    - Show queue contents"
-        echo "  count   - Count messages in queue"
-        echo "  flush   - Attempt to deliver queued mail"
-        echo "  clear   - Delete all queued mail"
-        echo "  hold    - Put queue on hold"
-        echo "  release - Release held messages"
-        ;;
-esac
-EOF
-
-chmod +x /usr/local/bin/mail-queue
-
-# ===================================================================
-# 8. IP ROTATION STATUS (if configured)
+# 6. IP ROTATION STATUS (if configured)
 # ===================================================================
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
@@ -743,16 +693,30 @@ echo ""
 # Load database password
 if [ -f /root/.mail_db_password ]; then
     DB_PASS=$(cat /root/.mail_db_password)
+elif [ -f /etc/mail-config/db_password ]; then
+    DB_PASS=$(cat /etc/mail-config/db_password)
 else
     echo "Error: Database password file not found"
     exit 1
 fi
 
+# Load configuration
+if [ -f /root/mail-installer/install.conf ]; then
+    source /root/mail-installer/install.conf
+elif [ -f /etc/mail-config/install.conf ]; then
+    source /etc/mail-config/install.conf
+fi
+
 # Show configured IPs
 echo "Configured IPs:"
 i=0
-for ip in IP_ADDRESSES_PLACEHOLDER; do
-    echo "  smtp-ip$i: $ip"
+for ip in "${IP_ADDRESSES[@]}"; do
+    if [ $i -eq 0 ]; then
+        hostname="$HOSTNAME"
+    else
+        hostname="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+    fi
+    echo "  smtp-ip$i: $ip ($hostname)"
     ((i++))
 done
 
@@ -764,10 +728,11 @@ mysql -u mailuser -p"$DB_PASS" mailserver -e "
 SELECT 
     sender_email as 'Sender',
     assigned_ip as 'IP Address',
-    transport_id as 'Transport',
+    CONCAT('smtp-ip', transport_id) as 'Transport',
     message_count as 'Messages',
+    rotation_mode as 'Mode',
     last_used as 'Last Used'
-FROM ip_rotation_log 
+FROM ip_rotation_advanced 
 ORDER BY last_used DESC 
 LIMIT 20;" 2>/dev/null || echo "No data available"
 
@@ -775,66 +740,27 @@ echo ""
 echo "IP Usage Statistics:"
 mysql -u mailuser -p"$DB_PASS" mailserver -e "
 SELECT 
-    assigned_ip as 'IP Address',
-    COUNT(*) as 'Senders',
-    SUM(message_count) as 'Total Messages'
-FROM ip_rotation_log 
-GROUP BY assigned_ip;" 2>/dev/null || echo "No statistics available"
+    ip_address as 'IP Address',
+    hostname as 'Hostname',
+    messages_sent_today as 'Today',
+    messages_sent_total as 'Total',
+    reputation_score as 'Reputation'
+FROM ip_pool 
+WHERE is_active = 1
+ORDER BY ip_index;" 2>/dev/null || echo "No statistics available"
+
+echo ""
+echo "Management Commands:"
+echo "  bulk-ip-manage assign <email> <mode>  - Assign IP rotation mode"
+echo "  bulk-ip-manage stats                  - Show detailed statistics"
+echo "  bulk-ip-manage report                 - Generate usage report"
 EOF
 
-    # Replace placeholder with actual IPs
-    IP_LIST="${IP_ADDRESSES[@]}"
-    sed -i "s/IP_ADDRESSES_PLACEHOLDER/$IP_LIST/g" /usr/local/bin/ip-rotation-status
     chmod +x /usr/local/bin/ip-rotation-status
 fi
 
 # ===================================================================
-# 9. BACKUP SCRIPT
-# ===================================================================
-
-cat > /usr/local/bin/mail-backup <<'EOF'
-#!/bin/bash
-
-BACKUP_DIR="/root/mail-backups"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-
-echo "Creating mail server backup..."
-
-mkdir -p "$BACKUP_DIR"
-
-# Backup configuration files
-tar czf "$BACKUP_DIR/config-$TIMESTAMP.tar.gz" \
-    /etc/postfix \
-    /etc/dovecot \
-    /etc/opendkim \
-    /etc/nginx/sites-available \
-    /root/.mail_db_password \
-    /root/.cloudflare_credentials \
-    /root/mail-installer/install.conf \
-    2>/dev/null
-
-echo "✓ Configuration backed up"
-
-# Backup database
-if [ -f /root/.mail_db_password ]; then
-    DB_PASS=$(cat /root/.mail_db_password)
-    mysqldump -u mailuser -p"$DB_PASS" mailserver > "$BACKUP_DIR/mailserver-$TIMESTAMP.sql"
-    echo "✓ Database backed up"
-fi
-
-# List backups
-echo ""
-echo "Backups in $BACKUP_DIR:"
-ls -lh "$BACKUP_DIR" | tail -5
-
-echo ""
-echo "✓ Backup complete: $BACKUP_DIR/*-$TIMESTAMP.*"
-EOF
-
-chmod +x /usr/local/bin/mail-backup
-
-# ===================================================================
-# 10. MAILWIZZ INFO
+# 7. MAILWIZZ INFO
 # ===================================================================
 
 cat > /usr/local/bin/mailwizz-info <<'EOF'
@@ -865,8 +791,8 @@ echo "Delivery Server Type:"
 echo "  Choose: SMTP"
 echo ""
 
-if [ -f /root/.mail_db_password ]; then
-    DB_PASS=$(cat /root/.mail_db_password)
+if [ -f /root/.mail_db_password ] || [ -f /etc/mail-config/db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password 2>/dev/null || cat /etc/mail-config/db_password 2>/dev/null)
     echo "Available sending accounts:"
     mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT email FROM virtual_users WHERE active=1" 2>/dev/null | tail -n +2 | sed 's/^/  /'
 fi
@@ -878,6 +804,21 @@ echo ""
 echo "Website URL:"
 echo "  https://DOMAIN_PLACEHOLDER"
 echo ""
+
+# Load configuration for IP rotation info
+if [ -f /root/mail-installer/install.conf ]; then
+    source /root/mail-installer/install.conf
+elif [ -f /etc/mail-config/install.conf ]; then
+    source /etc/mail-config/install.conf
+fi
+
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "IP Rotation Configuration:"
+    echo "  Multiple IPs configured: ${#IP_ADDRESSES[@]}"
+    echo "  Use bulk-ip-manage to assign rotation modes"
+    echo ""
+fi
+
 echo "Remember to update nginx config for MailWizz proxy!"
 EOF
 
@@ -895,12 +836,9 @@ echo ""
 echo "✓ Created utilities:"
 echo "  • mail-status       - Check server status"
 echo "  • mail-account      - Manage email accounts"
+echo "  • bulk-ip-manage    - Manage IP rotation (NEW)"
 echo "  • test-email        - Send test emails"
 echo "  • check-dns         - Verify DNS configuration"
-echo "  • mail-test         - Comprehensive server test"
-echo "  • mail-log          - View mail logs"
-echo "  • mail-queue        - Manage mail queue"
-echo "  • mail-backup       - Backup configuration"
 echo "  • mailwizz-info     - MailWizz configuration guide"
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
@@ -909,9 +847,14 @@ fi
 
 echo ""
 echo "Quick start:"
-echo "  1. Run: mail-test"
+echo "  1. Run: mail-status"
 echo "  2. Send test: test-email check-auth@verifier.port25.com"
 echo "  3. Check DNS: check-dns"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "  4. Manage IPs: bulk-ip-manage stats"
+fi
 echo ""
 
 print_message "✓ All management utilities installed successfully!"
+print_message "✓ Mail subdomain: ${MAIL_SUBDOMAIN:-mail}"
+print_message "✓ Hostname: $HOSTNAME"
