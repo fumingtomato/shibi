@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# CREATE MAIL SERVER UTILITIES - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.0
-# Creates helper scripts for managing the mail server
+# CREATE MAIL SERVER MANAGEMENT UTILITIES
+# Version: 17.0.6 - Enhanced with better DKIM verification
+# Creates all management commands for the mail server
 # =================================================================
 
 # Colors
@@ -21,20 +21,15 @@ print_error() {
     echo -e "${RED}$1${NC}" >&2
 }
 
+print_warning() {
+    echo -e "${YELLOW}$1${NC}"
+}
+
 print_header() {
     echo -e "${BLUE}==================================================${NC}"
     echo -e "${BLUE}$1${NC}"
     echo -e "${BLUE}==================================================${NC}"
 }
-
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    print_error "This script must be run as root"
-    exit 1
-fi
-
-print_header "Creating Mail Server Utilities"
-echo ""
 
 # Load configuration
 if [ -f "$(pwd)/install.conf" ]; then
@@ -43,559 +38,408 @@ elif [ -f "/root/mail-installer/install.conf" ]; then
     source "/root/mail-installer/install.conf"
 fi
 
-# Get domain info
-if [ -z "$DOMAIN_NAME" ]; then
-    if [ -f /etc/postfix/main.cf ]; then
-        DOMAIN_NAME=$(postconf -h mydomain 2>/dev/null || hostname -d)
-        HOSTNAME=$(postconf -h myhostname 2>/dev/null || hostname -f)
-    else
-        DOMAIN_NAME=$(hostname -d)
-        HOSTNAME=$(hostname -f)
-    fi
-else
-    # Use configured hostname with subdomain
-    if [ ! -z "$MAIL_SUBDOMAIN" ]; then
-        HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
-    else
-        HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
-    fi
-fi
+print_header "Creating Management Utilities"
 
 # ===================================================================
-# 1. MAIL ACCOUNT MANAGER
+# 1. MAIL STATUS COMMAND
 # ===================================================================
 
-echo "Creating mail-account command..."
-
-cat > /usr/local/bin/mail-account << 'EOF'
+cat > /usr/local/bin/mail-status <<'EOF'
 #!/bin/bash
-
-# Mail Account Manager
-# Version: 17.0.0
 
 GREEN='\033[38;5;208m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# Load DB password
+echo "Mail Server Status"
+echo "=================="
+echo ""
+
+# Service status
+echo "Services:"
+for service in postfix dovecot opendkim mysql nginx; do
+    echo -n "  $service: "
+    if systemctl is-active --quiet $service; then
+        echo -e "${GREEN}✓ Running${NC}"
+    else
+        echo -e "${RED}✗ Stopped${NC}"
+    fi
+done
+
+echo ""
+echo "Ports:"
+for port in 25 587 465 993 995 143 110 80 443 8891; do
+    echo -n "  Port $port: "
+    if netstat -tuln 2>/dev/null | grep -q ":$port "; then
+        echo -e "${GREEN}✓ Open${NC}"
+    else
+        echo -e "${YELLOW}✗ Closed${NC}"
+    fi
+done
+
+echo ""
+echo "Mail Queue:"
+mailq_count=$(mailq 2>/dev/null | grep -c "^[A-F0-9]" || echo "0")
+echo "  Messages in queue: $mailq_count"
+
+echo ""
+echo "Disk Usage:"
+df -h / | awk 'NR==2 {print "  Used: "$3" of "$2" ("$5")"}'
+
+echo ""
+echo "Memory Usage:"
+free -h | awk 'NR==2 {print "  Used: "$3" of "$2}'
+
+echo ""
+echo "DKIM Status:"
+if [ -f "/etc/opendkim/keys/*/mail.txt" ]; then
+    echo -e "  ${GREEN}✓ DKIM key exists${NC}"
+    if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+        echo -e "  ${GREEN}✓ OpenDKIM listening on 8891${NC}"
+    else
+        echo -e "  ${RED}✗ OpenDKIM not listening${NC}"
+    fi
+else
+    echo -e "  ${RED}✗ DKIM key not found${NC}"
+fi
+EOF
+
+chmod +x /usr/local/bin/mail-status
+
+# ===================================================================
+# 2. MAIL ACCOUNT MANAGEMENT
+# ===================================================================
+
+cat > /usr/local/bin/mail-account <<'EOF'
+#!/bin/bash
+
+# Load database password
 if [ -f /root/.mail_db_password ]; then
     DB_PASS=$(cat /root/.mail_db_password)
 else
-    echo -e "${RED}Error: Database password file not found${NC}"
+    echo "Error: Database password file not found"
     exit 1
 fi
 
-# Test database connection
-MYSQL_CMD="mysql -u mailuser -p$DB_PASS -h localhost mailserver"
-if ! $MYSQL_CMD -e "SELECT 1" >/dev/null 2>&1; then
-    MYSQL_CMD="mysql -u mailuser -p$DB_PASS -h 127.0.0.1 mailserver"
-    if ! $MYSQL_CMD -e "SELECT 1" >/dev/null 2>&1; then
-        echo -e "${RED}Error: Cannot connect to database${NC}"
-        exit 1
-    fi
-fi
+# MySQL command
+MYSQL_CMD="mysql -u mailuser -p$DB_PASS mailserver"
 
-# Functions
-add_account() {
-    EMAIL="$1"
-    PASSWORD="$2"
-    
-    if [ -z "$EMAIL" ] || [ -z "$PASSWORD" ]; then
-        echo "Usage: mail-account add user@domain.com password"
-        exit 1
-    fi
-    
-    # Validate email format
-    if ! [[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        echo -e "${RED}Invalid email format${NC}"
-        exit 1
-    fi
-    
-    # Extract domain
-    DOMAIN="${EMAIL#*@}"
-    MAILBOX="${EMAIL%@*}"
-    
-    # Hash password
-    if command -v doveadm &> /dev/null; then
-        PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD" 2>/dev/null)
-        if [ -z "$PASS_HASH" ]; then
-            PASS_HASH=$(doveadm pw -s SSHA512 -p "$PASSWORD" 2>/dev/null)
-        fi
-    else
-        PASS_HASH="{PLAIN}$PASSWORD"
-    fi
-    
-    # Add domain if not exists
-    $MYSQL_CMD <<SQL 2>/dev/null
-INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN');
-SQL
-    
-    # Add user
-    $MYSQL_CMD <<SQL 2>/dev/null
-SET @domain_id = (SELECT id FROM virtual_domains WHERE name = '$DOMAIN');
-INSERT INTO virtual_users (domain_id, email, password, quota, active)
-VALUES (@domain_id, '$EMAIL', '$PASS_HASH', 0, 1)
-ON DUPLICATE KEY UPDATE password = '$PASS_HASH', active = 1;
-SQL
-    
-    if [ $? -eq 0 ]; then
-        # Create maildir
-        MAIL_DIR="/var/vmail/$DOMAIN/$MAILBOX"
-        mkdir -p "$MAIL_DIR"
-        chown -R vmail:vmail /var/vmail/
-        
-        echo -e "${GREEN}✓ Account created: $EMAIL${NC}"
-        echo "  Maildir: $MAIL_DIR"
-        echo "  IMAP/SMTP Server: $(hostname -f)"
-        echo "  Ports: 587 (SMTP), 993 (IMAP)"
-    else
-        echo -e "${RED}✗ Failed to create account${NC}"
-        exit 1
-    fi
-}
-
-list_accounts() {
-    echo -e "${GREEN}Email Accounts:${NC}"
-    $MYSQL_CMD -e "
-    SELECT 
-        email as 'Email Address',
-        CASE active 
-            WHEN 1 THEN 'Active' 
-            ELSE 'Disabled' 
-        END as 'Status',
-        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') as 'Created'
-    FROM virtual_users 
-    ORDER BY email;" 2>/dev/null
-}
-
-delete_account() {
-    EMAIL="$1"
-    
-    if [ -z "$EMAIL" ]; then
-        echo "Usage: mail-account delete user@domain.com"
-        exit 1
-    fi
-    
-    echo -n "Are you sure you want to delete $EMAIL? (y/n): "
-    read CONFIRM
-    
-    if [ "$CONFIRM" = "y" ]; then
-        $MYSQL_CMD -e "DELETE FROM virtual_users WHERE email = '$EMAIL';" 2>/dev/null
-        
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✓ Account deleted: $EMAIL${NC}"
-        else
-            echo -e "${RED}✗ Failed to delete account${NC}"
-        fi
-    else
-        echo "Cancelled"
-    fi
-}
-
-disable_account() {
-    EMAIL="$1"
-    
-    if [ -z "$EMAIL" ]; then
-        echo "Usage: mail-account disable user@domain.com"
-        exit 1
-    fi
-    
-    $MYSQL_CMD -e "UPDATE virtual_users SET active = 0 WHERE email = '$EMAIL';" 2>/dev/null
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ Account disabled: $EMAIL${NC}"
-    else
-        echo -e "${RED}✗ Failed to disable account${NC}"
-    fi
-}
-
-enable_account() {
-    EMAIL="$1"
-    
-    if [ -z "$EMAIL" ]; then
-        echo "Usage: mail-account enable user@domain.com"
-        exit 1
-    fi
-    
-    $MYSQL_CMD -e "UPDATE virtual_users SET active = 1 WHERE email = '$EMAIL';" 2>/dev/null
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ Account enabled: $EMAIL${NC}"
-    else
-        echo -e "${RED}✗ Failed to enable account${NC}"
-    fi
-}
-
-password_change() {
-    EMAIL="$1"
-    PASSWORD="$2"
-    
-    if [ -z "$EMAIL" ] || [ -z "$PASSWORD" ]; then
-        echo "Usage: mail-account password user@domain.com newpassword"
-        exit 1
-    fi
-    
-    # Hash password
-    if command -v doveadm &> /dev/null; then
-        PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD" 2>/dev/null)
-        if [ -z "$PASS_HASH" ]; then
-            PASS_HASH=$(doveadm pw -s SSHA512 -p "$PASSWORD" 2>/dev/null)
-        fi
-    else
-        PASS_HASH="{PLAIN}$PASSWORD"
-    fi
-    
-    $MYSQL_CMD -e "UPDATE virtual_users SET password = '$PASS_HASH' WHERE email = '$EMAIL';" 2>/dev/null
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ Password updated for: $EMAIL${NC}"
-    else
-        echo -e "${RED}✗ Failed to update password${NC}"
-    fi
-}
-
-# Main command handler
 case "$1" in
     add)
-        add_account "$2" "$3"
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: mail-account add email@domain.com password"
+            exit 1
+        fi
+        
+        EMAIL="$2"
+        PASS="$3"
+        DOMAIN="${EMAIL#*@}"
+        
+        # Hash password
+        if command -v doveadm &> /dev/null; then
+            PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$PASS")
+        else
+            PASS_HASH="{PLAIN}$PASS"
+        fi
+        
+        # Add domain if not exists
+        $MYSQL_CMD -e "INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN')" 2>/dev/null
+        
+        # Add user
+        $MYSQL_CMD -e "INSERT INTO virtual_users (domain_id, email, password, active) 
+                      SELECT id, '$EMAIL', '$PASS_HASH', 1 
+                      FROM virtual_domains WHERE name = '$DOMAIN'" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            echo "✓ Account created: $EMAIL"
+            
+            # Create maildir
+            MAIL_USER="${EMAIL%@*}"
+            MAIL_DIR="/var/vmail/$DOMAIN/$MAIL_USER"
+            mkdir -p "$MAIL_DIR"
+            chown -R vmail:vmail /var/vmail
+        else
+            echo "✗ Failed to create account (may already exist)"
+        fi
         ;;
-    list)
-        list_accounts
-        ;;
+        
     delete)
-        delete_account "$2"
+        if [ -z "$2" ]; then
+            echo "Usage: mail-account delete email@domain.com"
+            exit 1
+        fi
+        
+        EMAIL="$2"
+        $MYSQL_CMD -e "DELETE FROM virtual_users WHERE email = '$EMAIL'" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            echo "✓ Account deleted: $EMAIL"
+        else
+            echo "✗ Failed to delete account"
+        fi
         ;;
-    disable)
-        disable_account "$2"
+        
+    list)
+        echo "Email Accounts:"
+        $MYSQL_CMD -e "SELECT email, active, created_at FROM virtual_users ORDER BY email" 2>/dev/null
         ;;
-    enable)
-        enable_account "$2"
-        ;;
+        
     password)
-        password_change "$2" "$3"
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: mail-account password email@domain.com newpassword"
+            exit 1
+        fi
+        
+        EMAIL="$2"
+        PASS="$3"
+        
+        if command -v doveadm &> /dev/null; then
+            PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$PASS")
+        else
+            PASS_HASH="{PLAIN}$PASS"
+        fi
+        
+        $MYSQL_CMD -e "UPDATE virtual_users SET password = '$PASS_HASH' WHERE email = '$EMAIL'" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            echo "✓ Password updated for: $EMAIL"
+        else
+            echo "✗ Failed to update password"
+        fi
         ;;
+        
     *)
         echo "Mail Account Manager"
-        echo "Usage: mail-account {add|list|delete|disable|enable|password} [options]"
+        echo "Usage: mail-account {add|delete|list|password}"
         echo ""
         echo "Commands:"
-        echo "  add user@domain.com password    - Create new email account"
-        echo "  list                            - List all accounts"
-        echo "  delete user@domain.com          - Delete account"
-        echo "  disable user@domain.com         - Disable account"
-        echo "  enable user@domain.com          - Enable account"
-        echo "  password user@domain.com newpass - Change password"
+        echo "  add email@domain.com password  - Create new account"
+        echo "  delete email@domain.com        - Delete account"
+        echo "  list                           - List all accounts"
+        echo "  password email@domain.com pass - Change password"
         ;;
 esac
 EOF
 
 chmod +x /usr/local/bin/mail-account
-print_message "✓ mail-account command created"
 
 # ===================================================================
-# 2. TEST EMAIL SENDER
+# 3. TEST EMAIL COMMAND (WITH DKIM VERIFICATION)
 # ===================================================================
 
-echo "Creating test-email command..."
-
-cat > /usr/local/bin/test-email << 'EOF'
+cat > /usr/local/bin/test-email <<'EOF'
 #!/bin/bash
 
-# Test Email Sender with DKIM
-# Version: 17.0.0
-
-GREEN='\033[38;5;208m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-# Get domain info
-DOMAIN=$(postconf -h mydomain 2>/dev/null || hostname -d)
-HOSTNAME=$(postconf -h myhostname 2>/dev/null || hostname -f)
-
-# Check if OpenDKIM is running
-if ! systemctl is-active --quiet opendkim; then
-    echo -e "${RED}Warning: OpenDKIM is not running. Starting it...${NC}"
-    systemctl start opendkim
-    sleep 2
-fi
-
-# Default values
-TO_EMAIL="${1:-check-auth@verifier.port25.com}"
-FROM_EMAIL="${2:-test@$DOMAIN}"
-SUBJECT="Test Email from $HOSTNAME - $(date '+%Y-%m-%d %H:%M:%S')"
-
-if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
-    echo "Test Email Sender"
-    echo "Usage: test-email [recipient] [from_email]"
+if [ -z "$1" ]; then
+    echo "Usage: test-email recipient@example.com [from@domain.com]"
     echo ""
-    echo "Examples:"
-    echo "  test-email                                    # Send to Port25 verifier"
-    echo "  test-email check-auth@verifier.port25.com    # Check authentication"
-    echo "  test-email user@example.com                  # Send to specific address"
-    echo "  test-email user@example.com sender@$DOMAIN   # Specify sender"
-    echo ""
-    echo "Test services:"
+    echo "Special test addresses:"
     echo "  check-auth@verifier.port25.com - Full authentication test"
-    echo "  https://www.mail-tester.com - Get test address first"
-    echo ""
-    exit 0
+    echo "  test@mail-tester.com           - Get link for spam score"
+    exit 1
 fi
 
-echo -e "${GREEN}Sending test email...${NC}"
-echo "  From: $FROM_EMAIL"
-echo "  To: $TO_EMAIL"
-echo "  Subject: $SUBJECT"
-echo ""
+TO="$1"
+FROM="${2:-postmaster@DOMAIN_PLACEHOLDER}"
+SUBJECT="Test Email from HOSTNAME_PLACEHOLDER - $(date)"
 
-# Get server IP info
-SERVER_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
-
-# Check if multiple IPs are configured
-NUM_IPS=$(postconf -h | grep -c "smtp-ip" 2>/dev/null || echo "1")
-
-# Create test message with headers for authentication
-cat <<MESSAGE | sendmail -v -f "$FROM_EMAIL" "$TO_EMAIL"
-From: $FROM_EMAIL
-To: $TO_EMAIL
+# Create test email with headers that trigger DKIM signing
+cat <<EMAIL | sendmail -f "$FROM" "$TO"
+From: $FROM
+To: $TO
 Subject: $SUBJECT
 Date: $(date -R)
-Message-ID: <$(date +%s).$RANDOM@$HOSTNAME>
+Message-ID: <$(date +%s).$(openssl rand -hex 8)@HOSTNAME_PLACEHOLDER>
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-This is a test email from your mail server at $HOSTNAME.
+This is a test email from your mail server.
 
 Server Information:
-===================
-Hostname: $HOSTNAME
-Domain: $DOMAIN
-Server IP: $SERVER_IP
-Configured IPs: $NUM_IPS
-Timestamp: $(date)
+- Hostname: HOSTNAME_PLACEHOLDER
+- Domain: DOMAIN_PLACEHOLDER
+- Timestamp: $(date)
+- DKIM: Enabled (1024-bit key)
+- SPF: Configured
+- DMARC: Configured
 
-Authentication Tests:
-====================
-SPF: Should PASS (IP authorized in SPF record)
-DKIM: Should PASS (Email signed with 2048-bit key)
-DMARC: Should PASS (SPF and DKIM aligned)
+This email should be signed with DKIM.
+Check the headers for DKIM-Signature field.
 
-OpenDKIM Status:
-================
-Service: $(systemctl is-active opendkim)
-Port 8891: $(netstat -lnp 2>/dev/null | grep -q ":8891" && echo "Listening" || echo "Not listening")
-DKIM Selector: mail
-DKIM Domain: $DOMAIN
-
-Email Headers:
-==============
-This email should contain:
-- DKIM-Signature header (added by OpenDKIM)
-- Return-Path header
-- Received headers showing the path
-
-Testing Instructions:
-=====================
-1. For Port25 verifier: Wait for the automated reply
-2. For mail-tester.com: Check your score on their website
-3. Check headers to verify DKIM signature is present
-
-If this is sent to check-auth@verifier.port25.com, you will receive
-a detailed report showing SPF, DKIM, and DMARC results.
+Authentication Test Services:
+- Port25: check-auth@verifier.port25.com
+- Mail-Tester: https://www.mail-tester.com
+- MXToolbox: https://mxtoolbox.com
 
 ---
-Sent from $HOSTNAME
-Mail Server Installation: https://github.com/fumingtomato/shibi
-MESSAGE
+Sent from HOSTNAME_PLACEHOLDER Mail Server
+EMAIL
 
-if [ $? -eq 0 ]; then
-    echo ""
-    echo -e "${GREEN}✓ Test email sent successfully!${NC}"
-    echo ""
-    
-    if [[ "$TO_EMAIL" == *"verifier.port25.com"* ]]; then
-        echo "📧 Port25 will reply with authentication results to: $FROM_EMAIL"
-        echo "   Check the inbox in a few minutes for the report."
-        echo ""
-        echo "Expected results:"
-        echo "  ✓ SPF check: PASS"
-        echo "  ✓ DKIM check: PASS"
-        echo "  ✓ DMARC check: PASS"
-    elif [[ "$TO_EMAIL" == *"mail-tester.com"* ]]; then
-        echo "📧 Check your score at: https://www.mail-tester.com"
-        echo "   Use the same testing address you got from the website."
-    else
-        echo "📧 Email sent to: $TO_EMAIL"
-        echo "   Check the inbox and verify DKIM-Signature header is present."
-    fi
-    
-    echo ""
-    echo "To view mail log:"
-    echo "  tail -n 50 /var/log/mail.log | grep -i dkim"
+echo "✓ Test email sent to: $TO"
+echo "  From: $FROM"
+echo ""
+echo "Check the recipient's inbox (and spam folder)"
+echo ""
+
+if [[ "$TO" == *"verifier.port25.com"* ]]; then
+    echo "Port25 will reply with authentication results including:"
+    echo "  - SPF check"
+    echo "  - DKIM signature verification"
+    echo "  - DMARC policy check"
+elif [[ "$TO" == *"mail-tester.com"* ]]; then
+    echo "Check https://www.mail-tester.com for your spam score"
+fi
+
+# Check if DKIM is working
+echo ""
+echo "Quick DKIM check:"
+if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+    echo "  ✓ OpenDKIM is running"
 else
-    echo -e "${RED}✗ Failed to send test email${NC}"
-    echo "Check mail log: tail -f /var/log/mail.log"
+    echo "  ✗ OpenDKIM not running - emails won't be signed!"
 fi
 EOF
 
+# Replace placeholders
+sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/test-email
+sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" /usr/local/bin/test-email
 chmod +x /usr/local/bin/test-email
-print_message "✓ test-email command created"
 
 # ===================================================================
-# 3. DNS CHECKER
+# 4. CHECK DNS COMMAND (ENHANCED)
 # ===================================================================
 
-echo "Creating check-dns command..."
-
-cat > /usr/local/bin/check-dns << EOF
+cat > /usr/local/bin/check-dns <<'EOF'
 #!/bin/bash
 
-# DNS Record Checker
-# Version: 17.0.0
+DOMAIN="${1:-DOMAIN_PLACEHOLDER}"
+HOSTNAME="HOSTNAME_PLACEHOLDER"
+PRIMARY_IP="PRIMARY_IP_PLACEHOLDER"
 
 GREEN='\033[38;5;208m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-DOMAIN="\${1:-$DOMAIN_NAME}"
-HOSTNAME="$HOSTNAME"
-SERVER_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || hostname -I | awk '{print $1}')
-
-echo -e "\${GREEN}DNS Record Check for \$DOMAIN\${NC}"
-echo "============================================"
+echo "DNS Records Check for $DOMAIN"
+echo "=============================="
 echo ""
 
-# Check A record for mail subdomain
-echo -n "A record for \$HOSTNAME: "
-A_RECORD=\$(dig +short A \$HOSTNAME @8.8.8.8 2>/dev/null | head -1)
-if [ "\$A_RECORD" == "\$SERVER_IP" ]; then
-    echo -e "\${GREEN}✓ \$A_RECORD (matches server)\${NC}"
-else
-    if [ -z "\$A_RECORD" ]; then
-        echo -e "\${RED}✗ Not found\${NC}"
+# Function to check DNS
+check_record() {
+    local type=$1
+    local record=$2
+    local expected=$3
+    local result
+    
+    echo -n "$type record for $record: "
+    
+    if [ "$type" = "MX" ]; then
+        result=$(dig +short MX "$record" @8.8.8.8 2>/dev/null | awk '{print $2}' | sed 's/\.$//' | head -1)
+    elif [ "$type" = "TXT" ]; then
+        result=$(dig +short TXT "$record" @8.8.8.8 2>/dev/null)
     else
-        echo -e "\${YELLOW}⚠ \$A_RECORD (expected: \$SERVER_IP)\${NC}"
+        result=$(dig +short "$type" "$record" @8.8.8.8 2>/dev/null | head -1)
     fi
-fi
+    
+    if [ ! -z "$result" ]; then
+        if [ ! -z "$expected" ] && [ "$result" = "$expected" ]; then
+            echo -e "${GREEN}✓ $result${NC}"
+        elif [ ! -z "$result" ]; then
+            echo -e "${GREEN}✓ Found${NC}"
+            echo "  Value: $result"
+        fi
+    else
+        echo -e "${RED}✗ Not found${NC}"
+        if [ ! -z "$expected" ]; then
+            echo "  Expected: $expected"
+        fi
+    fi
+}
 
-# Check A record for main domain
-echo -n "A record for \$DOMAIN: "
-A_RECORD=\$(dig +short A \$DOMAIN @8.8.8.8 2>/dev/null | head -1)
-if [ ! -z "\$A_RECORD" ]; then
-    echo -e "\${GREEN}✓ \$A_RECORD\${NC}"
-else
-    echo -e "\${YELLOW}⚠ Not found (needed for website)\${NC}"
-fi
+# Check A records
+check_record "A" "$HOSTNAME" "$PRIMARY_IP"
+check_record "A" "$DOMAIN" "$PRIMARY_IP"
+check_record "A" "www.$DOMAIN" "$PRIMARY_IP"
+
+echo ""
 
 # Check MX record
-echo -n "MX record: "
-MX_RECORD=\$(dig +short MX \$DOMAIN @8.8.8.8 2>/dev/null | awk '{print \$2}' | sed 's/\\.$//' | head -1)
-if [ "\$MX_RECORD" == "\$HOSTNAME" ]; then
-    echo -e "\${GREEN}✓ \$MX_RECORD\${NC}"
+check_record "MX" "$DOMAIN" "$HOSTNAME"
+
+echo ""
+
+# Check TXT records
+echo "TXT Records:"
+echo -n "  SPF: "
+SPF=$(dig +short TXT "$DOMAIN" @8.8.8.8 2>/dev/null | grep "v=spf1")
+if [ ! -z "$SPF" ]; then
+    echo -e "${GREEN}✓ Found${NC}"
+    echo "    $SPF"
 else
-    if [ -z "\$MX_RECORD" ]; then
-        echo -e "\${RED}✗ Not found\${NC}"
-    else
-        echo -e "\${YELLOW}⚠ \$MX_RECORD (expected: \$HOSTNAME)\${NC}"
-    fi
+    echo -e "${RED}✗ Not found${NC}"
 fi
 
-# Check SPF record
-echo -n "SPF record: "
-SPF=\$(dig +short TXT \$DOMAIN @8.8.8.8 2>/dev/null | grep "v=spf1")
-if [ ! -z "\$SPF" ]; then
-    echo -e "\${GREEN}✓ Found\${NC}"
-    echo "  \$SPF"
+echo -n "  DMARC: "
+DMARC=$(dig +short TXT "_dmarc.$DOMAIN" @8.8.8.8 2>/dev/null | grep "v=DMARC1")
+if [ ! -z "$DMARC" ]; then
+    echo -e "${GREEN}✓ Found${NC}"
+    echo "    $DMARC"
 else
-    echo -e "\${RED}✗ Not found\${NC}"
-    echo "  Add TXT record: v=spf1 mx a ip4:\$SERVER_IP ~all"
+    echo -e "${RED}✗ Not found${NC}"
 fi
 
-# Check DKIM record
-echo -n "DKIM record (mail._domainkey): "
-DKIM=\$(dig +short TXT mail._domainkey.\$DOMAIN @8.8.8.8 2>/dev/null | grep "v=DKIM1")
-if [ ! -z "\$DKIM" ]; then
-    echo -e "\${GREEN}✓ Found\${NC}"
-    # Check if it's a valid DKIM key
-    if echo "\$DKIM" | grep -q "k=rsa" && echo "\$DKIM" | grep -q "p="; then
-        echo "  Key type: RSA"
-        KEY_LENGTH=\$(echo "\$DKIM" | grep -oP 'p=\\K[^"]+' | tr -d ' ' | wc -c)
-        echo "  Key length: ~\$((KEY_LENGTH * 6)) bits"
-    fi
+echo -n "  DKIM: "
+DKIM=$(dig +short TXT "mail._domainkey.$DOMAIN" @8.8.8.8 2>/dev/null | grep "v=DKIM1")
+if [ ! -z "$DKIM" ]; then
+    echo -e "${GREEN}✓ Found${NC}"
+    # Extract key length
+    DKIM_KEY=$(echo "$DKIM" | sed 's/.*p=//' | sed 's/".*//' | tr -d ' ')
+    echo "    Key length: ${#DKIM_KEY} characters"
+    
+    # Verify with OpenDKIM
+    echo ""
+    echo "  OpenDKIM verification:"
+    opendkim-testkey -d "$DOMAIN" -s mail -vvv 2>&1 | grep -E "key (OK|not secure|not found)" | sed 's/^/    /'
 else
-    echo -e "\${RED}✗ Not found\${NC}"
-    if [ -f "/etc/opendkim/keys/\$DOMAIN/mail.txt" ]; then
-        echo "  Local key exists. Add this TXT record:"
-        echo "  Name: mail._domainkey"
-        echo "  Value: \$(cat /etc/opendkim/keys/\$DOMAIN/mail.txt | grep -v '(' | grep -v ')' | tr -d '\\n\\t" ')"
+    echo -e "${RED}✗ Not found${NC}"
+    echo "    Add TXT record: mail._domainkey"
+    
+    # Try to get local key
+    if [ -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ]; then
+        LOCAL_KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN/mail.txt | tr -d '\n\t\r ')
+        if [ ! -z "$LOCAL_KEY" ]; then
+            echo "    Value: v=DKIM1; k=rsa; p=$LOCAL_KEY"
+        fi
     fi
-fi
-
-# Check DMARC record
-echo -n "DMARC record: "
-DMARC=\$(dig +short TXT _dmarc.\$DOMAIN @8.8.8.8 2>/dev/null | grep "v=DMARC1")
-if [ ! -z "\$DMARC" ]; then
-    echo -e "\${GREEN}✓ Found\${NC}"
-    echo "  \$DMARC"
-else
-    echo -e "\${YELLOW}⚠ Not found (optional but recommended)\${NC}"
-    echo "  Add TXT record _dmarc.\$DOMAIN:"
-    echo "  v=DMARC1; p=quarantine; rua=mailto:dmarc@\$DOMAIN"
-fi
-
-# Check PTR record
-echo -n "PTR record (Reverse DNS): "
-PTR=\$(dig +short -x \$SERVER_IP @8.8.8.8 2>/dev/null | sed 's/\\.$//')
-if [ "\$PTR" == "\$HOSTNAME" ]; then
-    echo -e "\${GREEN}✓ \$PTR\${NC}"
-else
-    if [ -z "\$PTR" ]; then
-        echo -e "\${RED}✗ Not configured\${NC}"
-    else
-        echo -e "\${YELLOW}⚠ \$PTR (expected: \$HOSTNAME)\${NC}"
-    fi
-    echo "  Contact your hosting provider to set PTR record"
 fi
 
 echo ""
-echo "============================================"
-
-# Summary
-ISSUES=0
-[ "\$A_RECORD" != "\$SERVER_IP" ] && ISSUES=\$((ISSUES + 1))
-[ -z "\$MX_RECORD" ] && ISSUES=\$((ISSUES + 1))
-[ -z "\$SPF" ] && ISSUES=\$((ISSUES + 1))
-[ -z "\$DKIM" ] && ISSUES=\$((ISSUES + 1))
-[ "\$PTR" != "\$HOSTNAME" ] && ISSUES=\$((ISSUES + 1))
-
-if [ \$ISSUES -eq 0 ]; then
-    echo -e "\${GREEN}✓ All DNS records configured correctly!\${NC}"
+echo "Reverse DNS (PTR):"
+PTR=$(dig +short -x "$PRIMARY_IP" @8.8.8.8 2>/dev/null | sed 's/\.$//')
+echo -n "  $PRIMARY_IP: "
+if [ "$PTR" = "$HOSTNAME" ]; then
+    echo -e "${GREEN}✓ $PTR${NC}"
 else
-    echo -e "\${YELLOW}⚠ \$ISSUES DNS issues found\${NC}"
-    echo "Fix the issues above for optimal email delivery"
+    echo -e "${YELLOW}$PTR${NC}"
+    echo "  Should be: $HOSTNAME"
 fi
-
-echo ""
-echo "Test email authentication:"
-echo "  test-email check-auth@verifier.port25.com"
 EOF
 
+# Replace placeholders
+sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/check-dns
+sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" /usr/local/bin/check-dns
+sed -i "s/PRIMARY_IP_PLACEHOLDER/$PRIMARY_IP/g" /usr/local/bin/check-dns
 chmod +x /usr/local/bin/check-dns
-print_message "✓ check-dns command created"
 
 # ===================================================================
-# 4. MAIL STATUS CHECKER
+# 5. MAIL TEST COMPREHENSIVE
 # ===================================================================
 
-echo "Creating mail-status command..."
-
-cat > /usr/local/bin/mail-status << EOF
+cat > /usr/local/bin/mail-test <<'EOF'
 #!/bin/bash
-
-# Mail Server Status Checker
-# Version: 17.0.0
 
 GREEN='\033[38;5;208m'
 RED='\033[0;31m'
@@ -603,695 +447,471 @@ YELLOW='\033[1;33m'
 BLUE='\033[1;33m'
 NC='\033[0m'
 
-echo -e "\${BLUE}Mail Server Status\${NC}"
-echo "=================="
+echo -e "${BLUE}==================================================${NC}"
+echo -e "${BLUE}Comprehensive Mail Server Test${NC}"
+echo -e "${BLUE}==================================================${NC}"
 echo ""
 
-# Check services
-echo "Service Status:"
+# 1. Service Status
+echo "1. SERVICE STATUS"
+echo "-----------------"
 for service in postfix dovecot opendkim mysql nginx; do
-    printf "  %-10s: " "\$service"
-    if systemctl is-active --quiet \$service; then
-        echo -e "\${GREEN}✓ Running\${NC}"
+    echo -n "  $service: "
+    if systemctl is-active --quiet $service; then
+        echo -e "${GREEN}✓${NC}"
     else
-        echo -e "\${RED}✗ Not running\${NC}"
+        echo -e "${RED}✗${NC}"
     fi
 done
 
+# 2. Port Status
 echo ""
-echo "Port Status:"
-for port in 25:SMTP 587:Submission 465:SMTPS 143:IMAP 993:IMAPS 110:POP3 995:POP3S 80:HTTP 443:HTTPS 8891:OpenDKIM; do
-    PORT_NUM="\${port%%:*}"
-    PORT_NAME="\${port##*:}"
-    printf "  %-15s (%-4s): " "\$PORT_NAME" "\$PORT_NUM"
-    if netstat -tuln 2>/dev/null | grep -q ":\$PORT_NUM "; then
-        echo -e "\${GREEN}✓ Listening\${NC}"
+echo "2. PORT STATUS"
+echo "--------------"
+PORTS=(25:SMTP 587:Submission 465:SMTPS 993:IMAPS 995:POP3S 143:IMAP 110:POP3 80:HTTP 443:HTTPS 8891:OpenDKIM)
+for port_info in "${PORTS[@]}"; do
+    IFS=':' read -r port name <<< "$port_info"
+    echo -n "  $port ($name): "
+    if netstat -tuln 2>/dev/null | grep -q ":$port "; then
+        echo -e "${GREEN}✓${NC}"
     else
-        echo -e "\${YELLOW}✗ Not listening\${NC}"
+        echo -e "${RED}✗${NC}"
     fi
 done
 
+# 3. DNS Records
 echo ""
-echo "Mail Queue:"
-QUEUE_COUNT=\$(mailq | grep -c "^[A-Z0-9]" 2>/dev/null || echo "0")
-if [ "\$QUEUE_COUNT" -eq 0 ]; then
-    echo -e "  \${GREEN}✓ Queue is empty\${NC}"
+echo "3. DNS RECORDS"
+echo "--------------"
+DOMAIN="DOMAIN_PLACEHOLDER"
+
+echo -n "  A record: "
+if [ "$(dig +short A $DOMAIN @8.8.8.8 2>/dev/null | head -1)" != "" ]; then
+    echo -e "${GREEN}✓${NC}"
 else
-    echo -e "  \${YELLOW}⚠ \$QUEUE_COUNT messages in queue\${NC}"
-    echo "  Run 'mail-queue show' for details"
+    echo -e "${RED}✗${NC}"
 fi
 
-echo ""
-echo "DKIM Status:"
-if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    echo -e "  Key File: \${GREEN}✓ Present\${NC}"
+echo -n "  MX record: "
+if [ "$(dig +short MX $DOMAIN @8.8.8.8 2>/dev/null | head -1)" != "" ]; then
+    echo -e "${GREEN}✓${NC}"
 else
-    echo -e "  Key File: \${RED}✗ Missing\${NC}"
+    echo -e "${RED}✗${NC}"
 fi
 
-if systemctl is-active --quiet opendkim; then
-    echo -e "  Service:  \${GREEN}✓ Running\${NC}"
-    if netstat -lnp 2>/dev/null | grep -q ":8891"; then
-        echo -e "  Socket:   \${GREEN}✓ Listening on port 8891\${NC}"
-    else
-        echo -e "  Socket:   \${RED}✗ Not listening\${NC}"
-    fi
+echo -n "  SPF record: "
+if dig +short TXT $DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=spf1"; then
+    echo -e "${GREEN}✓${NC}"
 else
-    echo -e "  Service:  \${RED}✗ Not running\${NC}"
+    echo -e "${RED}✗${NC}"
 fi
 
-# Check for IP rotation
-NUM_IPS=\$(grep -c "smtp-ip" /etc/postfix/master.cf 2>/dev/null || echo "0")
-if [ "\$NUM_IPS" -gt 0 ]; then
-    echo ""
-    echo "IP Rotation:"
-    echo -e "  Status: \${GREEN}✓ Configured\${NC}"
-    echo "  Transports: \$NUM_IPS"
-    echo "  Check usage: ip-rotation-status"
+echo -n "  DKIM record: "
+if dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=DKIM1"; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗${NC}"
 fi
 
-echo ""
-echo "Disk Usage:"
-df -h /var/vmail 2>/dev/null | tail -1 | awk '{printf "  Mail storage: %s used of %s (%s)\\n", \$3, \$2, \$5}'
-df -h /var/log 2>/dev/null | tail -1 | awk '{printf "  Logs: %s used of %s (%s)\\n", \$3, \$2, \$5}'
+echo -n "  DMARC record: "
+if dig +short TXT _dmarc.$DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=DMARC1"; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗${NC}"
+fi
 
+# 4. DKIM Status
 echo ""
-echo "Recent Activity:"
-echo -n "  Emails sent (last hour): "
-grep -c "status=sent" /var/log/mail.log 2>/dev/null | tail -1 || echo "0"
-echo -n "  Authentication failures (last hour): "
-grep -c "authentication failed" /var/log/mail.log 2>/dev/null | tail -1 || echo "0"
+echo "4. DKIM STATUS"
+echo "--------------"
 
+echo -n "  Key file: "
+if [ -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ]; then
+    echo -e "${GREEN}✓${NC}"
+    KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN/mail.txt | tr -d '\n\t\r ')
+    echo "    Length: ${#KEY} characters"
+else
+    echo -e "${RED}✗${NC}"
+fi
+
+echo -n "  OpenDKIM service: "
+if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+    echo -e "${GREEN}✓ Listening${NC}"
+else
+    echo -e "${RED}✗ Not listening${NC}"
+fi
+
+echo -n "  DKIM validation: "
+result=$(opendkim-testkey -d $DOMAIN -s mail -vvv 2>&1 | grep "key OK")
+if [ ! -z "$result" ]; then
+    echo -e "${GREEN}✓ Valid${NC}"
+else
+    echo -e "${YELLOW}⚠ Check needed${NC}"
+fi
+
+# 5. SSL Certificate
 echo ""
-echo "Quick Commands:"
-echo "  View logs:        mail-log follow"
-echo "  Check DNS:        check-dns"
-echo "  Send test:        test-email"
-echo "  Manage accounts:  mail-account list"
+echo "5. SSL CERTIFICATE"
+echo "------------------"
+
+echo -n "  Certificate: "
+if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+    echo -e "${GREEN}✓ Let's Encrypt${NC}"
+    expiry=$(openssl x509 -enddate -noout -in /etc/letsencrypt/live/$DOMAIN/fullchain.pem 2>/dev/null | cut -d= -f2)
+    echo "    Expires: $expiry"
+elif [ -f "/etc/ssl/certs/mailserver.crt" ]; then
+    echo -e "${YELLOW}⚠ Self-signed${NC}"
+else
+    echo -e "${RED}✗ Not found${NC}"
+fi
+
+# 6. Mail Queue
+echo ""
+echo "6. MAIL QUEUE"
+echo "-------------"
+queue_count=$(mailq 2>/dev/null | grep -c "^[A-F0-9]" || echo "0")
+echo "  Messages in queue: $queue_count"
+
+# 7. Database
+echo ""
+echo "7. DATABASE"
+echo "-----------"
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+    user_count=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_users" 2>/dev/null | tail -1 || echo "0")
+    domain_count=$(mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT COUNT(*) FROM virtual_domains" 2>/dev/null | tail -1 || echo "0")
+    echo "  Domains: $domain_count"
+    echo "  Users: $user_count"
+else
+    echo "  ${RED}✗ Database credentials not found${NC}"
+fi
+
+# Summary
+echo ""
+echo -e "${BLUE}==================================================${NC}"
+echo "TEST SUMMARY"
+echo ""
+echo "Next steps:"
+echo "1. Send test email: test-email check-auth@verifier.port25.com"
+echo "2. Check spam score: https://www.mail-tester.com"
+echo "3. Verify DKIM: opendkim-testkey -d $DOMAIN -s mail -vvv"
+echo ""
+
+# Overall status
+errors=0
+[ ! -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ] && ((errors++))
+! netstat -lnp 2>/dev/null | grep -q ":8891" && ((errors++))
+! dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 2>/dev/null | grep -q "v=DKIM1" && ((errors++))
+
+if [ $errors -eq 0 ]; then
+    echo -e "${GREEN}✓ Server appears fully configured!${NC}"
+else
+    echo -e "${YELLOW}⚠ Some issues need attention ($errors items)${NC}"
+fi
 EOF
 
-chmod +x /usr/local/bin/mail-status
-print_message "✓ mail-status command created"
+sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/mail-test
+chmod +x /usr/local/bin/mail-test
 
 # ===================================================================
-# 5. MAIL QUEUE MANAGER
+# 6. MAIL LOG VIEWER
 # ===================================================================
 
-echo "Creating mail-queue command..."
-
-cat > /usr/local/bin/mail-queue << 'EOF'
+cat > /usr/local/bin/mail-log <<'EOF'
 #!/bin/bash
 
-# Mail Queue Manager
-# Version: 17.0.0
+case "$1" in
+    live)
+        echo "Live mail log (Ctrl+C to stop):"
+        tail -f /var/log/mail.log
+        ;;
+    errors)
+        echo "Recent mail errors:"
+        grep -i "error\|warning\|fatal\|panic" /var/log/mail.log | tail -50
+        ;;
+    sent)
+        echo "Recently sent emails:"
+        grep "status=sent" /var/log/mail.log | tail -20
+        ;;
+    bounced)
+        echo "Recently bounced emails:"
+        grep "status=bounced" /var/log/mail.log | tail -20
+        ;;
+    dkim)
+        echo "Recent DKIM activity:"
+        grep -i "dkim" /var/log/mail.log | tail -30
+        ;;
+    auth)
+        echo "Recent authentication attempts:"
+        grep -i "sasl\|auth" /var/log/mail.log | tail -30
+        ;;
+    search)
+        if [ -z "$2" ]; then
+            echo "Usage: mail-log search term"
+            exit 1
+        fi
+        echo "Searching for: $2"
+        grep -i "$2" /var/log/mail.log | tail -50
+        ;;
+    *)
+        echo "Mail Log Viewer"
+        echo "Usage: mail-log {live|errors|sent|bounced|dkim|auth|search}"
+        echo ""
+        echo "Commands:"
+        echo "  live     - Watch live log"
+        echo "  errors   - Show recent errors"
+        echo "  sent     - Show sent emails"
+        echo "  bounced  - Show bounced emails"
+        echo "  dkim     - Show DKIM activity"
+        echo "  auth     - Show authentication attempts"
+        echo "  search   - Search for specific term"
+        ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/mail-log
+
+# ===================================================================
+# 7. MAIL QUEUE MANAGEMENT
+# ===================================================================
+
+cat > /usr/local/bin/mail-queue <<'EOF'
+#!/bin/bash
 
 case "$1" in
     show)
         mailq
+        ;;
+    count)
+        count=$(mailq 2>/dev/null | grep -c "^[A-F0-9]" || echo "0")
+        echo "Messages in queue: $count"
         ;;
     flush)
         echo "Flushing mail queue..."
         postqueue -f
         echo "✓ Queue flush initiated"
         ;;
-    delete)
-        if [ -z "$2" ]; then
-            echo "Usage: mail-queue delete <queue-id>"
-            echo "       mail-queue delete ALL"
-            exit 1
-        fi
-        if [ "$2" == "ALL" ]; then
-            echo "Deleting all queued messages..."
+    clear)
+        echo "Clearing entire queue..."
+        read -p "Are you sure? This will delete ALL queued mail! (y/N): " confirm
+        if [ "$confirm" = "y" ]; then
             postsuper -d ALL
+            echo "✓ Queue cleared"
         else
-            echo "Deleting message $2..."
-            postsuper -d "$2"
+            echo "Cancelled"
         fi
         ;;
     hold)
-        echo "Putting all messages on hold..."
+        echo "Putting queue on hold..."
         postsuper -h ALL
+        echo "✓ Queue on hold"
         ;;
     release)
-        echo "Releasing all held messages..."
+        echo "Releasing held messages..."
         postsuper -H ALL
+        echo "✓ Messages released"
         ;;
     *)
         echo "Mail Queue Manager"
-        echo "Usage: mail-queue {show|flush|delete|hold|release} [options]"
+        echo "Usage: mail-queue {show|count|flush|clear|hold|release}"
         echo ""
         echo "Commands:"
-        echo "  show              - Display mail queue"
-        echo "  flush             - Attempt to deliver all queued mail"
-        echo "  delete <id>       - Delete specific message"
-        echo "  delete ALL        - Delete all queued messages"
-        echo "  hold              - Put all messages on hold"
-        echo "  release           - Release all held messages"
+        echo "  show    - Show queue contents"
+        echo "  count   - Count messages in queue"
+        echo "  flush   - Attempt to deliver queued mail"
+        echo "  clear   - Delete all queued mail"
+        echo "  hold    - Put queue on hold"
+        echo "  release - Release held messages"
         ;;
 esac
 EOF
 
 chmod +x /usr/local/bin/mail-queue
-print_message "✓ mail-queue command created"
 
 # ===================================================================
-# 6. MAIL LOG VIEWER
-# ===================================================================
-
-echo "Creating mail-log command..."
-
-cat > /usr/local/bin/mail-log << 'EOF'
-#!/bin/bash
-
-# Mail Log Viewer
-# Version: 17.0.0
-
-case "$1" in
-    follow)
-        tail -f /var/log/mail.log
-        ;;
-    today)
-        grep "$(date +'%b %e')" /var/log/mail.log
-        ;;
-    errors)
-        grep -i "error\|failed\|rejected\|warning" /var/log/mail.log | tail -50
-        ;;
-    sent)
-        grep "status=sent" /var/log/mail.log | tail -50
-        ;;
-    auth)
-        grep -i "auth\|sasl\|login" /var/log/mail.log | tail -50
-        ;;
-    dkim)
-        grep -i "dkim\|opendkim" /var/log/mail.log | tail -50
-        ;;
-    ip-rotation)
-        echo "IP Rotation Activity:"
-        for i in $(seq 1 10); do
-            count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | wc -l)
-            if [ $count -gt 0 ]; then
-                echo "  Transport smtp-ip$i: $count entries"
-            fi
-        done
-        ;;
-    search)
-        if [ -z "$2" ]; then
-            echo "Usage: mail-log search <pattern>"
-            exit 1
-        fi
-        grep -i "$2" /var/log/mail.log | tail -50
-        ;;
-    *)
-        echo "Mail Log Viewer"
-        echo "Usage: mail-log {follow|today|errors|sent|auth|dkim|ip-rotation|search} [pattern]"
-        echo ""
-        echo "Commands:"
-        echo "  follow         - Follow log in real-time"
-        echo "  today          - Show today's logs"
-        echo "  errors         - Show recent errors"
-        echo "  sent           - Show recently sent emails"
-        echo "  auth           - Show authentication logs"
-        echo "  dkim           - Show DKIM-related logs"
-        echo "  ip-rotation    - Show IP rotation activity"
-        echo "  search <text>  - Search for specific text"
-        ;;
-esac
-EOF
-
-chmod +x /usr/local/bin/mail-log
-print_message "✓ mail-log command created"
-
-# ===================================================================
-# 7. MAILWIZZ INFO
-# ===================================================================
-
-echo "Creating mailwizz-info command..."
-
-cat > /usr/local/bin/mailwizz-info << EOF
-#!/bin/bash
-
-# Mailwizz Configuration Info
-# Version: 17.0.0
-
-GREEN='\033[38;5;208m'
-BLUE='\033[1;33m'
-NC='\033[0m'
-
-echo -e "\${BLUE}Mailwizz Configuration Information\${NC}"
-echo "===================================="
-echo ""
-echo -e "\${GREEN}SMTP Settings for Mailwizz:\${NC}"
-echo "  Hostname: $HOSTNAME"
-echo "  Port: 587 (STARTTLS) or 465 (SSL/TLS)"
-echo "  Encryption: TLS (port 587) or SSL (port 465)"
-echo "  Username: Your email address (e.g., ${FIRST_EMAIL:-user@$DOMAIN_NAME})"
-echo "  Password: The password for that email account"
-echo ""
-echo -e "\${GREEN}Delivery Server Configuration:\${NC}"
-echo "  Type: SMTP"
-echo "  From Name: Your Company Name"
-echo "  From Email: ${FIRST_EMAIL:-noreply@$DOMAIN_NAME}"
-echo "  Reply-To: ${FIRST_EMAIL:-support@$DOMAIN_NAME}"
-echo "  Bounce Email: bounce@$DOMAIN_NAME"
-echo ""
-echo -e "\${GREEN}Important Settings:\${NC}"
-echo "  • Use authentication: YES"
-echo "  • Signing enabled: YES (Mailwizz will add headers)"
-echo "  • Force FROM: NO (allow different from addresses)"
-echo "  • Max connection messages: 100"
-echo "  • Max connections: 10"
-echo ""
-
-# Check if IP rotation is configured
-NUM_IPS=\$(grep -c "smtp-ip" /etc/postfix/master.cf 2>/dev/null || echo "0")
-if [ "\$NUM_IPS" -gt 0 ]; then
-    echo -e "\${GREEN}IP Rotation Configuration:\${NC}"
-    echo "  • Multiple IPs configured: \$NUM_IPS"
-    echo "  • Rotation type: Sticky sessions (sender-based)"
-    echo "  • Monitor command: ip-rotation-status"
-    echo ""
-fi
-
-echo -e "\${GREEN}Required Headers (Mailwizz should add):\${NC}"
-echo "  • List-Unsubscribe"
-echo "  • List-Unsubscribe-Post"
-echo "  • Precedence: bulk"
-echo ""
-echo -e "\${GREEN}Website Integration:\${NC}"
-echo "  Update unsubscribe URL in: /etc/nginx/sites-available/$DOMAIN_NAME"
-echo "  Change: return 302 https://your-mailwizz-domain.com/lists/unsubscribe;"
-echo "  To your actual Mailwizz URL"
-echo "  Then run: systemctl reload nginx"
-echo ""
-echo -e "\${GREEN}Compliance Checklist:\${NC}"
-echo "  ✓ DKIM signing enabled (automatic)"
-echo "  ✓ SPF record configured"
-echo "  ✓ Privacy policy at: http://$DOMAIN_NAME/privacy.html"
-echo "  ✓ Physical address: Update in /var/www/$DOMAIN_NAME/contact.html"
-echo "  ✓ Unsubscribe mechanism: Configure in Mailwizz"
-echo ""
-echo -e "\${GREEN}Testing:\${NC}"
-echo "  1. Send test from Mailwizz to: check-auth@verifier.port25.com"
-echo "  2. Check authentication passes (SPF, DKIM, DMARC)"
-echo "  3. Monitor delivery with: mail-log follow"
-echo ""
-echo -e "\${GREEN}Warm-up Recommendation:\${NC}"
-echo "  Start with 50-100 emails/day, increase by 50% weekly"
-echo "  Monitor reputation at: https://www.senderscore.org"
-EOF
-
-chmod +x /usr/local/bin/mailwizz-info
-print_message "✓ mailwizz-info command created"
-
-# ===================================================================
-# 8. COMPREHENSIVE TEST COMMAND
-# ===================================================================
-
-echo "Creating mail-test command..."
-
-cat > /usr/local/bin/mail-test << 'EOF'
-#!/bin/bash
-
-# Comprehensive Mail Server Test
-# Version: 17.0.0
-
-GREEN='\033[38;5;208m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-BLUE='\033[1;33m'
-NC='\033[0m'
-
-echo -e "${BLUE}Comprehensive Mail Server Test${NC}"
-echo "=============================="
-echo ""
-
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-# Test function
-run_test() {
-    local test_name="$1"
-    local test_cmd="$2"
-    
-    echo -n "Testing $test_name... "
-    if eval "$test_cmd" > /dev/null 2>&1; then
-        echo -e "${GREEN}✓ PASS${NC}"
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        return 0
-    else
-        echo -e "${RED}✗ FAIL${NC}"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-}
-
-# Service tests
-echo "Service Tests:"
-run_test "Postfix service" "systemctl is-active --quiet postfix"
-run_test "Dovecot service" "systemctl is-active --quiet dovecot"
-run_test "OpenDKIM service" "systemctl is-active --quiet opendkim"
-run_test "MySQL/MariaDB service" "systemctl is-active --quiet mysql || systemctl is-active --quiet mariadb"
-run_test "Nginx service" "systemctl is-active --quiet nginx"
-
-echo ""
-echo "Port Tests:"
-run_test "SMTP (25)" "netstat -tuln 2>/dev/null | grep -q ':25 '"
-run_test "Submission (587)" "netstat -tuln 2>/dev/null | grep -q ':587 '"
-run_test "IMAPS (993)" "netstat -tuln 2>/dev/null | grep -q ':993 '"
-run_test "OpenDKIM (8891)" "netstat -tuln 2>/dev/null | grep -q ':8891 '"
-run_test "HTTP (80)" "netstat -tuln 2>/dev/null | grep -q ':80 '"
-
-echo ""
-echo "Configuration Tests:"
-run_test "Postfix config" "postfix check"
-run_test "DKIM key exists" "[ -f /etc/opendkim/keys/$(hostname -d)/mail.txt ]"
-run_test "Database connection" "[ -f /root/.mail_db_password ] && mysql -u mailuser -p\$(cat /root/.mail_db_password) -h localhost mailserver -e 'SELECT 1' 2>/dev/null"
-run_test "Website exists" "[ -f /var/www/$(hostname -d)/index.html ]"
-
-# Check IP rotation
-echo ""
-echo "IP Rotation Test:"
-NUM_IPS=$(grep -c "smtp-ip" /etc/postfix/master.cf 2>/dev/null || echo "0")
-if [ "$NUM_IPS" -gt 0 ]; then
-    echo -e "  ${GREEN}✓ IP rotation configured with $NUM_IPS transports${NC}"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    echo -e "  ${YELLOW}○ Single IP configuration (no rotation)${NC}"
-fi
-
-echo ""
-echo "DNS Tests:"
-DOMAIN=$(hostname -d)
-run_test "A record for mail.$DOMAIN" "dig +short A mail.$DOMAIN @8.8.8.8 | grep -q ."
-run_test "MX record" "dig +short MX $DOMAIN @8.8.8.8 | grep -q ."
-run_test "SPF record" "dig +short TXT $DOMAIN @8.8.8.8 | grep -q 'v=spf1'"
-run_test "DKIM record" "dig +short TXT mail._domainkey.$DOMAIN @8.8.8.8 | grep -q 'v=DKIM1'"
-
-echo ""
-echo "=============================="
-echo "Results:"
-echo -e "  Passed: ${GREEN}$TESTS_PASSED${NC}"
-echo -e "  Failed: ${RED}$TESTS_FAILED${NC}"
-
-if [ $TESTS_FAILED -eq 0 ]; then
-    echo ""
-    echo -e "${GREEN}✓ All tests passed! Your mail server is ready.${NC}"
-    echo ""
-    echo "Next steps:"
-    echo "  1. Send test email: test-email check-auth@verifier.port25.com"
-    echo "  2. Check mail score: https://www.mail-tester.com"
-    echo "  3. Configure Mailwizz: mailwizz-info"
-else
-    echo ""
-    echo -e "${YELLOW}⚠ Some tests failed. Review the issues above.${NC}"
-    echo ""
-    echo "Troubleshooting:"
-    echo "  • Check service status: mail-status"
-    echo "  • View logs: mail-log errors"
-    echo "  • Check DNS: check-dns"
-fi
-EOF
-
-chmod +x /usr/local/bin/mail-test
-print_message "✓ mail-test command created"
-
-# ===================================================================
-# 9. BACKUP UTILITY
-# ===================================================================
-
-echo "Creating mail-backup command..."
-
-cat > /usr/local/bin/mail-backup << 'EOF'
-#!/bin/bash
-
-# Mail Server Backup Utility
-# Version: 17.0.0
-
-BACKUP_DIR="/root/mail-backups"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-BACKUP_FILE="$BACKUP_DIR/mailserver-backup-$TIMESTAMP.tar.gz"
-
-echo "Mail Server Backup"
-echo "=================="
-echo ""
-
-# Create backup directory
-mkdir -p "$BACKUP_DIR"
-
-echo "Creating backup..."
-
-# Load DB password
-if [ -f /root/.mail_db_password ]; then
-    DB_PASS=$(cat /root/.mail_db_password)
-else
-    echo "Error: Database password not found"
-    exit 1
-fi
-
-# Create temporary directory
-TMP_DIR="/tmp/mailbackup-$TIMESTAMP"
-mkdir -p "$TMP_DIR"
-
-# Backup database
-echo "  • Backing up database..."
-mysqldump -u mailuser -p"$DB_PASS" -h localhost mailserver > "$TMP_DIR/mailserver.sql" 2>/dev/null || \
-mysqldump -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver > "$TMP_DIR/mailserver.sql" 2>/dev/null
-
-# Backup configurations
-echo "  • Backing up configurations..."
-cp -r /etc/postfix "$TMP_DIR/" 2>/dev/null
-cp -r /etc/dovecot "$TMP_DIR/" 2>/dev/null
-cp -r /etc/opendkim "$TMP_DIR/" 2>/dev/null
-cp -r /etc/nginx/sites-available "$TMP_DIR/nginx-sites" 2>/dev/null
-
-# Backup credentials and configs
-echo "  • Backing up credentials..."
-cp /root/.mail_db_password "$TMP_DIR/" 2>/dev/null
-cp /root/mail-server-config.txt "$TMP_DIR/" 2>/dev/null || true
-cp /root/mail-installer/install.conf "$TMP_DIR/" 2>/dev/null || true
-
-# Create archive
-echo "  • Creating archive..."
-tar -czf "$BACKUP_FILE" -C /tmp "mailbackup-$TIMESTAMP" 2>/dev/null
-
-# Cleanup
-rm -rf "$TMP_DIR"
-
-# Report
-SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
-echo ""
-echo "✓ Backup completed!"
-echo "  File: $BACKUP_FILE"
-echo "  Size: $SIZE"
-echo ""
-echo "To restore, extract the archive and:"
-echo "  1. Restore database: mysql mailserver < mailserver.sql"
-echo "  2. Copy config files back to /etc/"
-echo "  3. Restart services"
-EOF
-
-chmod +x /usr/local/bin/mail-backup
-print_message "✓ mail-backup command created"
-
-# ===================================================================
-# 10. IP ROTATION STATUS (if multiple IPs configured)
+# 8. IP ROTATION STATUS (if configured)
 # ===================================================================
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "Creating ip-rotation-status command..."
-    
-    cat > /usr/local/bin/ip-rotation-status << 'EOF'
+    cat > /usr/local/bin/ip-rotation-status <<'EOF'
 #!/bin/bash
 
-# IP Rotation Status Monitor
-# Version: 17.0.0
-
-GREEN='\033[38;5;208m'
-YELLOW='\033[1;33m'
-BLUE='\033[1;33m'
-NC='\033[0m'
-
-echo -e "${BLUE}IP Rotation Status Monitor${NC}"
-echo "=========================="
+echo "IP Rotation Status"
+echo "=================="
 echo ""
 
 # Load database password
 if [ -f /root/.mail_db_password ]; then
     DB_PASS=$(cat /root/.mail_db_password)
-    HAS_DB=true
 else
-    HAS_DB=false
+    echo "Error: Database password file not found"
+    exit 1
 fi
 
-# Check configuration
-NUM_IPS=$(grep -c "smtp-ip" /etc/postfix/master.cf 2>/dev/null || echo "0")
-echo "Configured IP Transports: $NUM_IPS"
-echo ""
-
-if [ "$HAS_DB" = true ]; then
-    # Try to get stats from database
-    echo "Database Statistics:"
-    mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
-        SELECT 
-            transport_id as 'Transport',
-            assigned_ip as 'IP Address',
-            COUNT(*) as 'Active Senders',
-            SUM(message_count) as 'Total Messages',
-            MAX(last_used) as 'Last Activity'
-        FROM ip_rotation_log
-        GROUP BY transport_id, assigned_ip
-        ORDER BY transport_id
-    " 2>/dev/null || echo "  No rotation data in database yet"
-    echo ""
-fi
-
-echo "Log File Statistics (last 24 hours):"
-for i in $(seq 1 $NUM_IPS); do
-    sent_count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=sent" || echo "0")
-    deferred_count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=deferred" || echo "0")
-    bounced_count=$(grep "postfix-ip$i" /var/log/mail.log 2>/dev/null | grep -c "status=bounced" || echo "0")
-    
-    echo -e "Transport smtp-ip$i:"
-    echo "  Sent: $sent_count | Deferred: $deferred_count | Bounced: $bounced_count"
+# Show configured IPs
+echo "Configured IPs:"
+i=0
+for ip in IP_ADDRESSES_PLACEHOLDER; do
+    echo "  smtp-ip$i: $ip"
+    ((i++))
 done
 
 echo ""
-echo "Current Mail Queue:"
-QUEUE_COUNT=$(mailq | grep -c "^[A-Z0-9]" 2>/dev/null || echo "0")
-if [ "$QUEUE_COUNT" -eq 0 ]; then
-    echo -e "  ${GREEN}✓ Queue is empty${NC}"
-else
-    echo -e "  ${YELLOW}⚠ $QUEUE_COUNT messages in queue${NC}"
-fi
+echo "Current Assignments:"
+
+# Show database assignments
+mysql -u mailuser -p"$DB_PASS" mailserver -e "
+SELECT 
+    sender_email as 'Sender',
+    assigned_ip as 'IP Address',
+    transport_id as 'Transport',
+    message_count as 'Messages',
+    last_used as 'Last Used'
+FROM ip_rotation_log 
+ORDER BY last_used DESC 
+LIMIT 20;" 2>/dev/null || echo "No data available"
 
 echo ""
-echo "Recent IP Usage (last 10 sent emails):"
-grep "status=sent" /var/log/mail.log 2>/dev/null | tail -10 | while read line; do
-    if echo "$line" | grep -q "postfix-ip"; then
-        transport=$(echo "$line" | grep -oP 'postfix-ip\d+' | head -1)
-        recipient=$(echo "$line" | grep -oP 'to=<[^>]+>' | sed 's/to=<//;s/>//')
-        echo "  $transport -> $recipient"
-    fi
-done
-
-echo ""
-echo "Commands:"
-echo "  mail-log ip-rotation  - View all IP rotation logs"
-echo "  maildb ip-stats       - Database IP statistics"
-echo "  mail-queue show       - View mail queue"
+echo "IP Usage Statistics:"
+mysql -u mailuser -p"$DB_PASS" mailserver -e "
+SELECT 
+    assigned_ip as 'IP Address',
+    COUNT(*) as 'Senders',
+    SUM(message_count) as 'Total Messages'
+FROM ip_rotation_log 
+GROUP BY assigned_ip;" 2>/dev/null || echo "No statistics available"
 EOF
-    
+
+    # Replace placeholder with actual IPs
+    IP_LIST="${IP_ADDRESSES[@]}"
+    sed -i "s/IP_ADDRESSES_PLACEHOLDER/$IP_LIST/g" /usr/local/bin/ip-rotation-status
     chmod +x /usr/local/bin/ip-rotation-status
-    print_message "✓ ip-rotation-status command created"
 fi
+
+# ===================================================================
+# 9. BACKUP SCRIPT
+# ===================================================================
+
+cat > /usr/local/bin/mail-backup <<'EOF'
+#!/bin/bash
+
+BACKUP_DIR="/root/mail-backups"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+echo "Creating mail server backup..."
+
+mkdir -p "$BACKUP_DIR"
+
+# Backup configuration files
+tar czf "$BACKUP_DIR/config-$TIMESTAMP.tar.gz" \
+    /etc/postfix \
+    /etc/dovecot \
+    /etc/opendkim \
+    /etc/nginx/sites-available \
+    /root/.mail_db_password \
+    /root/.cloudflare_credentials \
+    /root/mail-installer/install.conf \
+    2>/dev/null
+
+echo "✓ Configuration backed up"
+
+# Backup database
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+    mysqldump -u mailuser -p"$DB_PASS" mailserver > "$BACKUP_DIR/mailserver-$TIMESTAMP.sql"
+    echo "✓ Database backed up"
+fi
+
+# List backups
+echo ""
+echo "Backups in $BACKUP_DIR:"
+ls -lh "$BACKUP_DIR" | tail -5
+
+echo ""
+echo "✓ Backup complete: $BACKUP_DIR/*-$TIMESTAMP.*"
+EOF
+
+chmod +x /usr/local/bin/mail-backup
+
+# ===================================================================
+# 10. MAILWIZZ INFO
+# ===================================================================
+
+cat > /usr/local/bin/mailwizz-info <<'EOF'
+#!/bin/bash
+
+echo "MailWizz Configuration Information"
+echo "==================================="
+echo ""
+echo "SMTP Settings for MailWizz:"
+echo "  Hostname: HOSTNAME_PLACEHOLDER"
+echo "  Port: 587 (STARTTLS) or 465 (SSL)"
+echo "  Encryption: TLS or SSL"
+echo "  Authentication: Required"
+echo ""
+echo "Bounce Server (IMAP):"
+echo "  Hostname: HOSTNAME_PLACEHOLDER"
+echo "  Port: 993"
+echo "  Encryption: SSL"
+echo "  Protocol: IMAP"
+echo ""
+echo "FBL Server:"
+echo "  Same as Bounce Server"
+echo ""
+echo "Email Account:"
+echo "  Use any account created with: mail-account add"
+echo ""
+echo "Delivery Server Type:"
+echo "  Choose: SMTP"
+echo ""
+
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+    echo "Available sending accounts:"
+    mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT email FROM virtual_users WHERE active=1" 2>/dev/null | tail -n +2 | sed 's/^/  /'
+fi
+
+echo ""
+echo "To create a new sending account:"
+echo "  mail-account add sender@DOMAIN_PLACEHOLDER password"
+echo ""
+echo "Website URL:"
+echo "  https://DOMAIN_PLACEHOLDER"
+echo ""
+echo "Remember to update nginx config for MailWizz proxy!"
+EOF
+
+sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" /usr/local/bin/mailwizz-info
+sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/mailwizz-info
+chmod +x /usr/local/bin/mailwizz-info
 
 # ===================================================================
 # COMPLETION
 # ===================================================================
 
-print_header "Utility Creation Complete!"
+print_header "Management Utilities Created"
 
 echo ""
-echo "Created management commands:"
-echo ""
-echo "Account Management:"
-echo "  mail-account    - Manage email accounts"
-echo ""
-echo "Testing & Monitoring:"
-echo "  test-email      - Send test emails with DKIM"
-echo "  check-dns       - Verify DNS records"
-echo "  mail-status     - Check server status"
-echo "  mail-test       - Run comprehensive tests"
-echo ""
-echo "Operations:"
-echo "  mail-queue      - Manage mail queue"
-echo "  mail-log        - View mail logs"
-echo "  mail-backup     - Backup server configuration"
-echo ""
-echo "Integration:"
-echo "  mailwizz-info   - Mailwizz configuration guide"
+echo "✓ Created utilities:"
+echo "  • mail-status       - Check server status"
+echo "  • mail-account      - Manage email accounts"
+echo "  • test-email        - Send test emails"
+echo "  • check-dns         - Verify DNS configuration"
+echo "  • mail-test         - Comprehensive server test"
+echo "  • mail-log          - View mail logs"
+echo "  • mail-queue        - Manage mail queue"
+echo "  • mail-backup       - Backup configuration"
+echo "  • mailwizz-info     - MailWizz configuration guide"
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo ""
-    echo "IP Rotation:"
-    echo "  ip-rotation-status - Monitor IP rotation"
+    echo "  • ip-rotation-status - Monitor IP rotation"
 fi
 
 echo ""
-
-# Create quick reference
-cat > /root/mail-commands.txt << EOF
-MAIL SERVER COMMAND REFERENCE
-==============================
-
-Account Management:
-  mail-account add user@domain.com password
-  mail-account list
-  mail-account delete user@domain.com
-  mail-account disable user@domain.com
-  mail-account enable user@domain.com
-  mail-account password user@domain.com newpass
-
-Testing:
-  test-email                                    # Send to Port25
-  test-email user@example.com                  # Send to address
-  check-dns                                     # Check all DNS
-  mail-test                                     # Full system test
-
-Monitoring:
-  mail-status                                   # Server status
-  mail-log follow                               # Live log view
-  mail-log errors                               # Recent errors
-  mail-log dkim                                 # DKIM logs
-  mail-log ip-rotation                          # IP rotation logs
-  mail-queue show                               # View queue
-
-Operations:
-  mail-queue flush                              # Send queued mail
-  mail-queue delete ALL                         # Clear queue
-  mail-backup                                   # Backup config
-  get-ssl-cert                                  # Get SSL certificates
-
-Integration:
-  mailwizz-info                                 # Setup guide
-
-$(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-echo "IP Rotation:
-  ip-rotation-status                            # Monitor IP usage
-  maildb ip-stats                               # Database IP stats"
-fi)
-
-Server Details:
-  Domain: $DOMAIN_NAME
-  Hostname: $HOSTNAME
-  Primary IP: $PRIMARY_IP
-$(if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-echo "  Total IPs: ${#IP_ADDRESSES[@]}"
-fi)
-
-Logs:
-  /var/log/mail.log                             # Main mail log
-  /var/log/nginx/${DOMAIN_NAME}_access.log      # Website access
-  /var/log/nginx/${DOMAIN_NAME}_error.log       # Website errors
-
-Configuration Files:
-  /etc/postfix/main.cf                          # Postfix config
-  /etc/dovecot/dovecot.conf                     # Dovecot config
-  /etc/opendkim.conf                            # OpenDKIM config
-  /etc/nginx/sites-available/$DOMAIN_NAME       # Website config
-  /root/mail-server-config.txt                  # Server summary
-
-EOF
-
-print_message "✓ All utilities created successfully!"
+echo "Quick start:"
+echo "  1. Run: mail-test"
+echo "  2. Send test: test-email check-auth@verifier.port25.com"
+echo "  3. Check DNS: check-dns"
 echo ""
-echo "Quick reference saved to: /root/mail-commands.txt"
-echo ""
-echo "Test your server now:"
-echo "  mail-test                    # Run all tests"
-echo "  test-email                   # Send test email"
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "  ip-rotation-status           # Check IP rotation"
-fi
-echo ""
-print_message "✓ Utility creation completed!"
+
+print_message "✓ All management utilities installed successfully!"
