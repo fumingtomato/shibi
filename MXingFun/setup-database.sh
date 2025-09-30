@@ -271,8 +271,7 @@ EOF
 fi
 
 # Create tables with properly terminated heredoc - FIXED
-mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'EOF_SQLTABLES' 2>/dev/null || \
-mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'EOF_SQLTABLES' 2>/dev/null || true
+{ mysql -u mailuser -p"$DB_PASS" -h localhost mailserver 2>/dev/null || mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver 2>/dev/null; } <<'EOF_SQLTABLES'
 -- Create domains table
 CREATE TABLE IF NOT EXISTS virtual_domains (
     id INT NOT NULL AUTO_INCREMENT,
