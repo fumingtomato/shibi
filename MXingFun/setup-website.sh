@@ -2,10 +2,11 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.6 - FIXED DATABASE ACCESS FOR WEB SERVER
+# Version: 17.0.7 - CORRECTED WITH RATE LIMITING AND COMPLETE PAGES
 # Creates compliance website automatically with all required pages
 # FIXED: SSL certificates include ALL subdomains properly
 # FIXED: Database password accessible to web server
+# FIXED: Rate limiting properly implemented
 # ADDED: Backend integration for user password changes and global colors
 # =================================================================
 
@@ -234,7 +235,92 @@ chmod 666 "$WEB_ROOT/data/colors.json"
 
 echo "Creating website pages and backend API..."
 
-# Update auth.php with rate limiting
+# Create rate limiting API FIRST (properly placed)
+cat > "$WEB_ROOT/api/rate-limit.php" <<'APIRATELIMIT'
+<?php
+session_start();
+
+class RateLimiter {
+    private $cache_dir = '/tmp/mail-rate-limit/';
+    private $max_attempts = 3;
+    private $lockout_time = 900; // 15 minutes in seconds
+    
+    public function __construct() {
+        if (!is_dir($this->cache_dir)) {
+            mkdir($this->cache_dir, 0777, true);
+        }
+    }
+    
+    public function checkLimit($identifier, $action = 'default') {
+        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
+        
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            
+            // Check if lockout period has expired
+            if (isset($data['locked_until']) && $data['locked_until'] > time()) {
+                $remaining = $data['locked_until'] - time();
+                return [
+                    'allowed' => false,
+                    'remaining_time' => $remaining,
+                    'message' => 'Too many failed attempts. Please try again in ' . ceil($remaining / 60) . ' minutes.'
+                ];
+            }
+            
+            // Reset if lockout expired
+            if (isset($data['locked_until']) && $data['locked_until'] <= time()) {
+                $data = ['attempts' => 0, 'last_attempt' => time()];
+            }
+        } else {
+            $data = ['attempts' => 0, 'last_attempt' => time()];
+        }
+        
+        return ['allowed' => true, 'attempts' => $data['attempts']];
+    }
+    
+    public function recordAttempt($identifier, $action = 'default', $success = false) {
+        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
+        
+        if ($success) {
+            // Clear attempts on success
+            if (file_exists($file)) {
+                unlink($file);
+            }
+            return;
+        }
+        
+        // Record failed attempt
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+        } else {
+            $data = ['attempts' => 0, 'last_attempt' => time()];
+        }
+        
+        $data['attempts']++;
+        $data['last_attempt'] = time();
+        
+        // Lock out after max attempts
+        if ($data['attempts'] >= $this->max_attempts) {
+            $data['locked_until'] = time() + $this->lockout_time;
+        }
+        
+        file_put_contents($file, json_encode($data));
+    }
+    
+    public function getRemainingAttempts($identifier, $action = 'default') {
+        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
+        
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            return max(0, $this->max_attempts - $data['attempts']);
+        }
+        
+        return $this->max_attempts;
+    }
+}
+APIRATELIMIT
+
+# Create auth.php with rate limiting
 cat > "$WEB_ROOT/api/auth.php" <<'APIAUTH'
 <?php
 header('Content-Type: application/json');
@@ -391,98 +477,13 @@ if ($row = $result->fetch_assoc()) {
         $limiter->recordAttempt($email, 'login', false);
     }
     
-    http_response_code(401);# Create rate limiting API (add this as a new file)
-cat > "$WEB_ROOT/api/rate-limit.php" <<'APIRATELIMIT'
-<?php
-session_start();
-
-class RateLimiter {
-    private $cache_dir = '/tmp/mail-rate-limit/';
-    private $max_attempts = 3;
-    private $lockout_time = 900; // 15 minutes in seconds
-    
-    public function __construct() {
-        if (!is_dir($this->cache_dir)) {
-            mkdir($this->cache_dir, 0777, true);
-        }
-    }
-    
-    public function checkLimit($identifier, $action = 'default') {
-        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
-        
-        if (file_exists($file)) {
-            $data = json_decode(file_get_contents($file), true);
-            
-            // Check if lockout period has expired
-            if (isset($data['locked_until']) && $data['locked_until'] > time()) {
-                $remaining = $data['locked_until'] - time();
-                return [
-                    'allowed' => false,
-                    'remaining_time' => $remaining,
-                    'message' => 'Too many failed attempts. Please try again in ' . ceil($remaining / 60) . ' minutes.'
-                ];
-            }
-            
-            // Reset if lockout expired
-            if (isset($data['locked_until']) && $data['locked_until'] <= time()) {
-                $data = ['attempts' => 0, 'last_attempt' => time()];
-            }
-        } else {
-            $data = ['attempts' => 0, 'last_attempt' => time()];
-        }
-        
-        return ['allowed' => true, 'attempts' => $data['attempts']];
-    }
-    
-    public function recordAttempt($identifier, $action = 'default', $success = false) {
-        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
-        
-        if ($success) {
-            // Clear attempts on success
-            if (file_exists($file)) {
-                unlink($file);
-            }
-            return;
-        }
-        
-        // Record failed attempt
-        if (file_exists($file)) {
-            $data = json_decode(file_get_contents($file), true);
-        } else {
-            $data = ['attempts' => 0, 'last_attempt' => time()];
-        }
-        
-        $data['attempts']++;
-        $data['last_attempt'] = time();
-        
-        // Lock out after max attempts
-        if ($data['attempts'] >= $this->max_attempts) {
-            $data['locked_until'] = time() + $this->lockout_time;
-        }
-        
-        file_put_contents($file, json_encode($data));
-    }
-    
-    public function getRemainingAttempts($identifier, $action = 'default') {
-        $file = $this->cache_dir . md5($identifier . $action) . '.lock';
-        
-        if (file_exists($file)) {
-            $data = json_decode(file_get_contents($file), true);
-            return max(0, $this->max_attempts - $data['attempts']);
-        }
-        
-        return $this->max_attempts;
-    }
-}
-APIRATELIMIT
+    http_response_code(401);
     echo json_encode(['error' => 'Invalid credentials']);
 }
 
 $stmt->close();
 $mysqli->close();
 APIAUTH
-
-
 
 # Create password change API with FIXED verification and rate limiting
 cat > "$WEB_ROOT/api/change-password.php" <<'APIPASS'
@@ -1186,7 +1187,7 @@ JSCOLORS
 
 print_message "✓ Backend API and dynamic color system created"
 
-# Create Privacy Policy page
+# Create Privacy Policy page (COMPLETE VERSION)
 cat > "$WEB_ROOT/privacy.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -1380,7 +1381,7 @@ sed -i "s/\$DOMAIN_NAME/$DOMAIN_NAME/g" "$WEB_ROOT/privacy.html"
 sed -i "s/\$CURRENT_DATE/$CURRENT_DATE/g" "$WEB_ROOT/privacy.html"
 sed -i "s/\$CURRENT_YEAR/$CURRENT_YEAR/g" "$WEB_ROOT/privacy.html"
 
-# Create Terms of Service page
+# Create Terms of Service page (COMPLETE VERSION)
 cat > "$WEB_ROOT/terms.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -1437,34 +1438,34 @@ cat > "$WEB_ROOT/terms.html" <<'EOF'
         <div class="container terms-content">
             <p><em>Last Updated: $CURRENT_DATE</em></p>
             
-            <p>Welcome to our website. This site is maintained as a service to our customers. By using this site, you agree to comply with and be bound by the following terms and conditions of use. Please review these terms and conditions carefully. If you do not agree to these terms and conditions, you should not use this site.</p>
+            <p>Welcome to our website. This site is maintained as a service to our customers. By using this site, you agree to comply with and be bound by the following terms and conditions of use. Please review these Terms and Conditions carefully. If you do not agree to these Terms and Conditions, you should not use this site.</p>
             
             <h2>Agreement</h2>
-            <p>This Agreement (the "Agreement") specifies the Terms and Conditions for access to and use of $DOMAIN_NAME (the "Site") and describe the terms and conditions applicable to your access of and use of the Site. This Agreement may be modified at any time by Site upon posting of the modified agreement. Any such modifications shall be effective immediately. You can view the most recent version of these terms at any time at Site. Each use by you shall constitute and be deemed your unconditional acceptance of this Agreement.</p>
+            <p>This Agreement (the "Agreement") specifies the Terms and Conditions for access to and use of $DOMAIN_NAME (the "Site") and describe the terms and conditions applicable to your access of and use of the Site. This Agreement may be modified at any time by Site upon posting of the modified Agreement. Any such modifications shall be effective immediately. You can view the most recent version of these terms at any time at $DOMAIN_NAME. Each use by you shall constitute and be deemed your unconditional acceptance of this Agreement.</p>
 
             <h2>Intellectual Property Ownership</h2>
 
             <h3>(a) Our Content</h3>
-            <p>All content included on this site is and shall continue to be the property of Site or its content suppliers and is protected under applicable copyright, patent, trademark, and other proprietary rights. Any copying, redistribution, use or publication by you of any such content or any part of the Site is prohibited without express permission by Site. Under no circumstances will you acquire any ownership rights or other interest in any content by or through your use of this site. Site is the trademark or registered trademark of Site. Other product and company names mentioned on this Site may be trademarks of their respective owners.</p>
+            <p>All content included on this site is and shall continue to be the property of Site or its content suppliers and is protected under applicable copyright, patent, trademark, and other proprietary rights. Any copying, redistribution, use or publication by you of any such content or any part of the Site is prohibited, except as expressly permitted in this Agreement. Under no circumstances will you acquire any ownership rights or other interest in any content by or through your use of this Site.</p>
 
             <h3>(b) User Supplied Content</h3>
-            <p>By accessing our forum, bulletin board, chat room, or any other user interactive area of our site, and placing any information in any of those areas, you hereby grant us a perpetual, irrevocable, royalty free license in and to such materials, including but not limited to the right to post, publish, transmit, distribute, create derivative works based upon, create translations of, modify, amend, enhance, change, display and publicly perform such materials in any form or media, whether now known or later discovered. You also grant to others who access the forum, bulletin board, chat room or any other user interactive area of our site a perpetual, non-revocable, royalty free license to view, download, store and reproduce your postings but such license is limited to the personal use and enjoyment of such other party.</p>
+            <p>By accessing our forum, bulletin board, chat room, or any other user interactive area of our site, and placing any information in any of those areas, you hereby grant us a perpetual, irrevocable, royalty free worldwide right and license to: display and use the information posted by you in any way we choose; and to prepare derivative works of, or incorporate into other works, the information posted by you, and grant and authorize sublicenses of the foregoing. Any material you post or otherwise submit to this Site may be redistributed, broadcast, or published by us in any media without limitation. Posting content on any part of the Site constitutes a material release to us of any and all rights and interest in and to such Content.</p>
 
             <h3>(c) Personal Use</h3>
             <p>Site grants you a limited, revocable, nonexclusive license to use this site solely for your own personal use and not for republication, distribution, assignment, sublicense, sale, preparation of derivative works, or other use. You agree not to copy materials on the site, reverse engineer or break into the site, or use materials, products or services in violation of any law. The use of this website is at the discretion of Site and Site may terminate your use of this website at any time.</p>
 
             <h3>(d) Other Uses</h3>
-            <p>All other use of Content from the Site, including, but not limited to uploading, downloading, modification, publication, transmission, participation in the transfer or sale of, copying, reproduction, republishing, creation of derivative works from, distribution, performance, display, incorporation into another web site, reproducing the Site (whether by linking, framing or any other method), or in any other way exploiting any of the Content, in whole or in part, is strictly prohibited without Site prior express written consent.</p>
+            <p>All other use of Content from the Site, including, but not limited to uploading, downloading, modification, publication, transmission, participation in the transfer or sale of, copying, reproduction, republication, performance, creation of derivative works from, or any other use of the Content not expressly permitted herein, is strictly prohibited without the prior written consent of Site.</p>
 
             <h2>Disclaimers</h2>
             
             <h3>(a) DISCLAIMER OF WARRANTIES</h3>
-            <p>THE INFORMATION ON THIS SITE IS PROVIDED ON AN "AS IS," "AS AVAILABLE" BASIS. YOU AGREE THAT USE OF THIS SITE IS AT YOUR SOLE RISK. Site DISCLAIMS ALL WARRANTIES OF ANY KIND, INCLUDING BUT NOT LIMITED TO ANY EXPRESS WARRANTIES, STATUTORY WARRANTIES, AND ANY IMPLIED WARRANTIES OF: MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. YOUR SOLE AND EXCLUSIVE REMEDY RELATING TO YOUR USE OF THE SITE SHALL BE TO DISCONTINUE USING THE SITE.</p>
+            <p>THE INFORMATION ON THIS SITE IS PROVIDED ON AN "AS IS," "AS AVAILABLE" BASIS. YOU AGREE THAT USE OF THIS SITE IS AT YOUR SOLE RISK. Site DISCLAIMS ALL WARRANTIES OF ANY KIND, INCLUDING BUT NOT LIMITED TO ANY EXPRESS WARRANTIES, STATUTORY WARRANTIES, AND ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. TO THE EXTENT YOUR JURISDICTION DOES NOT ALLOW LIMITATIONS ON WARRANTIES, THIS LIMITATION MAY NOT APPLY TO YOU. YOUR SOLE AND EXCLUSIVE REMEDY RELATING TO YOUR USE OF THE SITE SHALL BE TO DISCONTINUE USING THE SITE.</p>
 
-            <p>FURTHERMORE, Site DOES NOT WARRANT THAT USE OF THE SITE WILL BE UNINTERRUPTED, AVAILABLE AT ANY TIME OR FROM ANY LOCATION, SECURE OR ERROR-FREE, THAT DEFECTS WILL BE CORRECTED, OR THAT THE SERVICE IS FREE OF VIRUSES OR OTHER HARMFUL COMPONENTS. Site, ITS SUBSIDIARIES, VENDORS AND AFFILIATES DISCLAIM ANY RESPONSIBILITY FOR THE DELETION, FAILURE TO STORE, OR UNTIMELY DELIVERY OF ANY INFORMATION OR MATERIALS, AND ANY MATERIAL DOWNLOADED OR OTHERWISE OBTAINED THROUGH THE SITE. USE OF THE SITE'S SERVICES IS DONE AT YOUR OWN DISCRETION AND RISK, AND YOU WILL BE SOLELY RESPONSIBLE FOR ANY DAMAGES TO YOU COMPUTER SYSTEMS OR LOSS OF DATA THAT MAY RESULT FROM THE DOWNLOAD OF SUCH INFORMATION OR MATERIAL.</p>
+            <p>FURTHERMORE, Site DOES NOT WARRANT THAT USE OF THE SITE WILL BE UNINTERRUPTED, AVAILABLE AT ANY TIME OR FROM ANY LOCATION, SECURE OR ERROR-FREE, THAT DEFECTS WILL BE CORRECTED, OR THAT THE SITE, CONTENT, OR THE SERVERS THAT MAKE THE SITE AVAILABLE ARE FREE OF VIRUSES OR OTHER HARMFUL COMPONENTS.</p>
 
             <h3>(b) LIMITATION OF LIABILITY</h3>
-            <p>Site SHALL NOT BE RESPONSIBLE OR LIABLE TO PROVIDERS OR ANY THIRD PARTIES UNDER ANY CIRCUMSTANCES FOR ANY INDIRECT, CONSEQUENTIAL, SPECIAL, PUNITIVE OR EXEMPLARY DAMAGES OR LOSSES, INCLUDING BUT NOT LIMITED TO, DAMAGES FOR LOSS OF PROFITS, GOODWILL, USE, DATA OR OTHER INTANGIBLE LOSSES WHICH MAY BE INCURRED IN CONNECTION WITH Site OR THE SITE, OR USE THEREOF, OR ANY OF THE DATA OR OTHER MATERIALS TRANSMITTED THROUGH OR RESIDING ON THE SITE OR ANY SERVICES, OR INFORMATION PURCHASED, RECEIVED OR SOLD BY WAY OF THE SITE, REGARDLESS OF THE TYPE OF CLAIM OR THE NATURE OF THE CAUSE OF ACTION, EVEN IF Site HAS BEEN ADVISED OF THE POSSIBILITY OF DAMAGE OR LOSS.</p>
+            <p>Site SHALL NOT BE RESPONSIBLE OR LIABLE TO PROVIDERS OR ANY THIRD PARTIES UNDER ANY CIRCUMSTANCES FOR ANY INDIRECT, CONSEQUENTIAL, SPECIAL, PUNITIVE OR EXEMPLARY DAMAGES OR LOSSES, INCLUDING BUT NOT LIMITED TO, DAMAGES FOR LOSS OF PROFITS, GOODWILL, USE, DATA OR OTHER INTANGIBLE LOSSES WHICH MAY BE INCURRED IN CONNECTION WITH Site OR ANY LINKED WEBSITE OR USE THEREOF, OR INTERRUPTION OF BUSINESS, WHETHER RESULTING FROM THE USE OR INABILITY TO USE THE WEBSITE OR CONTENT, BREACH OF WARRANTY, BREACH OF CONTRACT, NEGLIGENCE, UNDER TORT OR ANY OTHER CAUSE OF ACTION WHETHER OR NOT THE DAMAGE IS FORESEEABLE AND WHETHER OR NOT WE HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. SOME JURISDICTIONS DO NOT ALLOW THE EXCLUSION OR LIMITATION OF LIABILITY FOR INCIDENTAL OR CONSEQUENTIAL DAMAGES SO THE ABOVE LIMITATION MAY NOT APPLY.</p>
 
             <h3>(c) EARNINGS DISCLAIMERS</h3>
             <p>The information presented in this Website is intended to be for your educational and entertainment purposes only.</p>
@@ -1489,19 +1490,19 @@ cat > "$WEB_ROOT/terms.html" <<'EOF'
 
             <p>There are risks in any endeavor that are not suitable for everyone. If you use capital, only "risk" capital should be used.</p>
 
-            <p>There is no guarantee that you will earn any money using any of the ideas presented in our in materials. Examples in our materials are not to be interpreted as a promise or guarantee of earnings. Many factors will be important in determining your actual results and no guarantees are made that you will achieve results similar to ours or anybody else's. No guarantee is made that you will achieve any result at all from the ideas in our material.</p>
+            <p>There is no guarantee that you will earn any money using any of the ideas presented in our in materials. Examples in our materials are not to be interpreted as a promise or guarantee of earnings. Many factors will be important in determining your actual results and no guarantees are made that you will achieve results similar to ours or anybody else's.</p>
 
             <p>You agree that we will not share in your success, nor will we be responsible for your failure or for your actions in any endeavor you may undertake.</p>
 
             <p>Please understand that past performance cannot be an indication of possible future results.</p>
 
-            <p>Materials in our product and our website may contain information that includes or is based upon forward-looking statements within the meaning of the securities litigation reform act of 1995. Forward-looking statements give our expectations or forecasts of future events. You can identify these statements by the fact that they do not relate strictly to historical or current facts. They use words such as "anticipate," "estimate," "expect," "project," "intend," "plan," "believe," and other words and terms of similar meaning in connection with a description of potential earnings or financial performance. Any and all forward looking statements in our materials are intended to express our opinion of earnings potential. They are opinions only and should not be relied upon as fact.</p>
+            <p>Materials in our product and our website may contain information that includes or is based upon forward-looking statements within the meaning of the securities litigation reform act of 1995. You can identify these statements by the fact that they do not relate strictly to historical or current facts. They use words such as "anticipate," "estimate," "expect," "project," "intend," "plan," "believe," and other words and terms of similar meaning in connection with a description of potential earnings or financial performance.</p>
 
             <h3>(g) Applicable Law</h3>
-            <p>You agree that the laws of the state of Florida, without regard to conflicts of laws provisions will govern these Terms and Condition of Use and any dispute that may arise between you and Site or its affiliates. Venue shall be in United States.</p>
+            <p>You agree that the laws of the state of Florida, without regard to conflicts of laws provisions will govern these Terms and Condition of Use and any dispute that may arise between you and Site or its affiliates.</p>
 
             <h3>(h) Arbitration</h3>
-            <p>As part of the consideration that Site requires for viewing, using or interacting with this website, you agree to the use of binding arbitration for any claim, dispute, or controversy of any kind (whether in contract, tort or otherwise) arising out of or relating to this website. Arbitration shall be conducted pursuant to the rules of the American Arbitration Association which are in effect on the date a dispute is submitted to the American Arbitration Association. Information about the American Arbitration Association, its rules, and its forms are available from the American Arbitration Association, 335 Madison Avenue, Floor 10, New York, New York, 10017-4605. Hearing will take place in the city or county of Site. In no case shall you have the right to go to court or have a jury trial. You will not have the right to engage in pre-trial discovery except as provided in the rules; you will not have the right to participate as a representative or member of any class of claimants pertaining to any claim subject to arbitration; the arbitrator's decision will be final and binding with limited rights of appeal. The prevailing party shall be reimbursed by the other party for any and all costs associated with the dispute arbitration, including attorney fees, collection fees, investigation fees, and travel expenses.</p>
+            <p>As part of the consideration that Site requires for viewing, using or interacting with this website, you agree to the use of binding arbitration for any claim, dispute, or controversy of any kind (whether in contract, tort or otherwise) arising out of or relating to this website, content, and/or products or services related thereto.</p>
 
             <h3>(i) Severability</h3>
             <p>If any provision of this Agreement shall be adjudged by any court of competent jurisdiction to be unenforceable or invalid, that provision shall be limited or eliminated to the minimum extent necessary so that this Agreement will otherwise remain in full force and effect.</p>
@@ -1509,21 +1510,9 @@ cat > "$WEB_ROOT/terms.html" <<'EOF'
             <h3>(j) Termination</h3>
             <p>Site may terminate this Agreement at any time, with or without notice, for any reason.</p>
 
-            <h3>(k) Applicable Law</h3>
-            <p>You agree that the laws of the state of Florida, without regard to conflicts of laws provisions will govern these Terms and Condition of Use and any dispute that may arise between you and Site or its affiliates. Venue shall be in Florida High Court.</p>
-
-            <h3>(l) Arbitration</h3>
-            <p>As part of the consideration that Site requires for viewing, using or interacting with this website, you agree to the use of binding arbitration for any claim, dispute, or controversy of any kind (whether in contract, tort or otherwise) arising out of or relating to this website. Arbitration shall be conducted pursuant to the rules of the American Arbitration Association which are in effect on the date a dispute is submitted to the American Arbitration Association. Information about the American Arbitration Association, its rules, and its forms are available from the American Arbitration Association, 335 Madison Avenue, Floor 10, New York, New York, 10017-4605. Hearing will take place in the city or county of Site. In no case shall you have the right to go to court or have a jury trial. You will not have the right to engage in pre-trial discovery except as provided in the rules; you will not have the right to participate as a representative or member of any class of claimants pertaining to any claim subject to arbitration; the arbitrator's decision will be final and binding with limited rights of appeal. The prevailing party shall be reimbursed by the other party for any and all costs associated with the dispute arbitration, including attorney fees, collection fees, investigation fees, and travel expenses.</p>
-
-            <h3>(m) Severability</h3>
-            <p>If any provision of this Agreement shall be adjudged by any court of competent jurisdiction to be unenforceable or invalid, that provision shall be limited or eliminated to the minimum extent necessary so that this Agreement will otherwise remain in full force and effect.</p>
-
-            <h3>(n) Termination</h3>
-            <p>Site may terminate this Agreement at any time, with or without notice, for any reason.</p>
-
             <h3>(o) Contact Information</h3>
             <p><strong>HOW TO CONTACT US:</strong><br>
-            $FIRST_EMAIL</p>
+            $ADMIN_EMAIL</p>
         </div>
     </div>
     
@@ -1540,9 +1529,9 @@ cat > "$WEB_ROOT/terms.html" <<'EOF'
 </html>
 EOF
 
-# Note: The variables $DOMAIN_NAME, $FIRST_EMAIL, $CURRENT_DATE, and $CURRENT_YEAR will be replaced by their actual values when the script runs
+# Note: The variables $DOMAIN_NAME, $ADMIN_EMAIL, $CURRENT_DATE, and $CURRENT_YEAR will be replaced by their actual values when the script runs
 sed -i "s/\$DOMAIN_NAME/$DOMAIN_NAME/g" "$WEB_ROOT/terms.html"
-sed -i "s/\$FIRST_EMAIL/$ADMIN_EMAIL/g" "$WEB_ROOT/terms.html"
+sed -i "s/\$ADMIN_EMAIL/$ADMIN_EMAIL/g" "$WEB_ROOT/terms.html"
 sed -i "s/\$CURRENT_DATE/$CURRENT_DATE/g" "$WEB_ROOT/terms.html"
 sed -i "s/\$CURRENT_YEAR/$CURRENT_YEAR/g" "$WEB_ROOT/terms.html"
 
@@ -1623,10 +1612,16 @@ cat > "$WEB_ROOT/sitemap.xml" <<EOF
         <changefreq>weekly</changefreq>
         <priority>0.7</priority>
     </url>
+    <url>
+        <loc>https://$DOMAIN_NAME/contact.html</loc>
+        <lastmod>$(date +%Y-%m-%d)</lastmod>
+        <changefreq>monthly</changefreq>
+        <priority>0.6</priority>
+    </url>
 </urlset>
 EOF
 
-# Create a simple contact page (optional but useful for compliance)
+# Create contact page (COMPLETE VERSION)
 cat > "$WEB_ROOT/contact.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -1700,43 +1695,6 @@ cat > "$WEB_ROOT/contact.html" <<EOF
     </footer>
 </body>
 </html>
-EOF
-
-# Update sitemap to include contact page
-cat > "$WEB_ROOT/sitemap.xml" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <url>
-        <loc>https://$DOMAIN_NAME/</loc>
-        <lastmod>$(date +%Y-%m-%d)</lastmod>
-        <changefreq>monthly</changefreq>
-        <priority>1.0</priority>
-    </url>
-    <url>
-        <loc>https://$DOMAIN_NAME/privacy.html</loc>
-        <lastmod>$(date +%Y-%m-%d)</lastmod>
-        <changefreq>monthly</changefreq>
-        <priority>0.8</priority>
-    </url>
-    <url>
-        <loc>https://$DOMAIN_NAME/terms.html</loc>
-        <lastmod>$(date +%Y-%m-%d)</lastmod>
-        <changefreq>monthly</changefreq>
-        <priority>0.8</priority>
-    </url>
-    <url>
-        <loc>https://$DOMAIN_NAME/user-settings.html</loc>
-        <lastmod>$(date +%Y-%m-%d)</lastmod>
-        <changefreq>weekly</changefreq>
-        <priority>0.7</priority>
-    </url>
-    <url>
-        <loc>https://$DOMAIN_NAME/contact.html</loc>
-        <lastmod>$(date +%Y-%m-%d)</lastmod>
-        <changefreq>monthly</changefreq>
-        <priority>0.6</priority>
-    </url>
-</urlset>
 EOF
 
 # Set proper permissions for all created files
@@ -2463,6 +2421,7 @@ echo "✅ Database configuration accessible to web server"
 echo "✅ Nginx configured with PHP support"
 echo "✅ Backend API integrated with mail database"
 echo "✅ User authentication system active"
+echo "✅ Rate limiting enabled (3 attempts, 15 minute lockout)"
 echo ""
 
 echo "FIXED FEATURES:"
@@ -2470,6 +2429,7 @@ echo "  ✓ Database password accessible at: /etc/mail-web-config/db_password"
 echo "  ✓ PHP config file at: /etc/mail-web-config/db_config.php"
 echo "  ✓ Web server can now connect to database"
 echo "  ✓ User Settings page will work properly"
+echo "  ✓ Rate limiting prevents brute force attacks"
 echo ""
 
 echo "TEST DATABASE CONNECTION:"
@@ -2477,4 +2437,4 @@ echo "  Visit: http://$PRIMARY_IP/api/test-db.php"
 echo "  This will show if the database connection is working"
 echo ""
 
-print_message "✓ Website setup completed with FIXED database access!"
+print_message "✓ Website setup completed with FIXED database access and rate limiting!"
