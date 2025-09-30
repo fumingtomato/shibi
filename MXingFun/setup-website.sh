@@ -2096,9 +2096,6 @@ cat > "$WEB_ROOT/user-settings.html" <<EOF
 </html>
 EOF
 
-# Create Privacy Policy and other pages (same as before, shortened for brevity)
-# ... [Privacy, Terms, robots.txt, sitemap.xml pages remain the same] ...
-
 # Set final permissions
 chown -R www-data:www-data "$WEB_ROOT" 2>/dev/null || chown -R nginx:nginx "$WEB_ROOT" 2>/dev/null
 chmod -R 755 "$WEB_ROOT"
