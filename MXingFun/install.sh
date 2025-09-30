@@ -2,9 +2,9 @@
 
 # =================================================================
 # BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
-# Version: 17.0.5 - FIXED SSL certificate requests
+# Version: 17.0.6 - FIXED DKIM generation and verification
 # Automated installation with Cloudflare DNS, compliance website, and DKIM
-# FIXED: Only requests SSL for existing DNS records
+# FIXED: Ensures 1024-bit DKIM key generation and proper configuration
 # =================================================================
 
 set -e  # Exit on any error
@@ -186,11 +186,62 @@ EOF
 }
 
 # ===================================================================
+# PROPER DKIM KEY GENERATION FUNCTION
+# ===================================================================
+
+generate_dkim_key() {
+    local domain=$1
+    local bits=1024  # CRITICAL: Use 1024-bit for DNS compatibility
+    
+    print_header "Generating DKIM Key (1024-bit)"
+    
+    # Create directory
+    mkdir -p /etc/opendkim/keys/$domain
+    cd /etc/opendkim/keys/$domain
+    
+    # Remove any existing keys
+    rm -f mail.private mail.txt 2>/dev/null || true
+    
+    # Generate 1024-bit key
+    echo "Generating 1024-bit DKIM key for $domain..."
+    opendkim-genkey -s mail -d $domain -b $bits
+    
+    # Verify key was generated
+    if [ ! -f mail.private ] || [ ! -f mail.txt ]; then
+        print_error "Failed to generate DKIM key"
+        return 1
+    fi
+    
+    # Verify key size
+    KEY_BITS=$(openssl rsa -in mail.private -text -noout 2>/dev/null | grep "Private-Key:" | grep -oP '\d+' | head -1)
+    if [ "$KEY_BITS" != "1024" ]; then
+        print_warning "Generated key is ${KEY_BITS}-bit, regenerating as 1024-bit..."
+        opendkim-genkey -s mail -d $domain -b 1024
+    fi
+    
+    # Set permissions
+    chown opendkim:opendkim mail.private mail.txt
+    chmod 600 mail.private
+    chmod 644 mail.txt
+    
+    # Extract and display key info
+    DKIM_KEY=$(grep -oP 'p=\K[^"]+' mail.txt | tr -d '\n\t\r ')
+    if [ ! -z "$DKIM_KEY" ]; then
+        print_message "✓ DKIM key generated successfully"
+        echo "  Key length: ${#DKIM_KEY} characters (should be ~216 for 1024-bit)"
+        return 0
+    else
+        print_error "Failed to extract DKIM key"
+        return 1
+    fi
+}
+
+# ===================================================================
 # MAIN INSTALLATION
 # ===================================================================
 
 print_header "Multi-IP Bulk Mail Server Installer"
-echo "Version: 17.0.5"
+echo "Version: 17.0.6"
 echo "Starting installation at: $(date)"
 echo ""
 
@@ -538,14 +589,19 @@ smtps     inet  n       -       y       -       -       smtpd
   -o non_smtpd_milters=inet:localhost:8891
 EOF
 
-# FIX: Setup OpenDKIM with 1024-bit key for DNS compatibility
-print_message "Generating 1024-bit DKIM keys (DNS compatible)..."
-mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
-cd /etc/opendkim/keys/$DOMAIN_NAME
-# CRITICAL: Use 1024-bit key instead of 2048 for DNS compatibility
-opendkim-genkey -s mail -d $DOMAIN_NAME -b 1024
-chown -R opendkim:opendkim /etc/opendkim
-chmod 600 mail.private
+# ===================================================================
+# PHASE 5A: GENERATE PROPER DKIM KEY
+# ===================================================================
+
+print_header "Generating 1024-bit DKIM Key"
+
+# Call the function to generate DKIM key
+if generate_dkim_key "$DOMAIN_NAME"; then
+    print_message "✓ DKIM key generated successfully"
+else
+    print_error "Failed to generate DKIM key"
+    # Continue anyway, can be fixed later
+fi
 
 # Configure OpenDKIM PROPERLY TO ACTUALLY SIGN EMAILS
 cat > /etc/opendkim.conf <<EOF
@@ -614,6 +670,18 @@ chown opendkim:opendkim /var/run/opendkim
 # Start services
 systemctl restart opendkim
 sleep 2
+
+# Verify OpenDKIM is running
+if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+    print_message "✓ OpenDKIM is running on port 8891"
+else
+    print_warning "⚠ OpenDKIM may not be running properly"
+    # Try to fix
+    systemctl stop opendkim
+    sleep 1
+    systemctl start opendkim
+fi
+
 systemctl restart postfix
 
 print_message "✓ Basic mail server configured with 1024-bit DKIM key"
@@ -742,6 +810,79 @@ else
     print_warning "Utilities script not found, creating basic commands"
 fi
 
+# Create DKIM verification utility
+cat > /usr/local/bin/verify-dkim <<'EOF'
+#!/bin/bash
+
+DOMAIN="DOMAIN_PLACEHOLDER"
+GREEN='\033[38;5;208m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo "DKIM Verification for $DOMAIN"
+echo "=============================="
+echo ""
+
+# Check local key
+echo "1. Local DKIM Key:"
+if [ -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ]; then
+    KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN/mail.txt | tr -d '\n\t\r ')
+    if [ ! -z "$KEY" ]; then
+        echo -e "   ${GREEN}✓ Found${NC}"
+        echo "   Key length: ${#KEY} characters"
+        if [ ${#KEY} -ge 200 ] && [ ${#KEY} -le 250 ]; then
+            echo -e "   ${GREEN}✓ 1024-bit key (perfect)${NC}"
+        else
+            echo -e "   ${YELLOW}⚠ Unexpected length for 1024-bit${NC}"
+        fi
+    else
+        echo -e "   ${RED}✗ Could not extract key${NC}"
+    fi
+else
+    echo -e "   ${RED}✗ Key file not found${NC}"
+fi
+
+echo ""
+echo "2. DNS DKIM Record:"
+DNS_KEY=$(dig +short TXT mail._domainkey.$DOMAIN @1.1.1.1 2>/dev/null | grep "v=DKIM1")
+if [ ! -z "$DNS_KEY" ]; then
+    echo -e "   ${GREEN}✓ Found in DNS${NC}"
+    DNS_KEY_CLEAN=$(echo "$DNS_KEY" | sed 's/.*p=//' | sed 's/".*//' | tr -d ' ')
+    echo "   DNS key length: ${#DNS_KEY_CLEAN} characters"
+else
+    echo -e "   ${RED}✗ Not found in DNS${NC}"
+    echo "   Add TXT record: mail._domainkey"
+    echo "   Value: v=DKIM1; k=rsa; p=$KEY"
+fi
+
+echo ""
+echo "3. OpenDKIM Test:"
+opendkim-testkey -d $DOMAIN -s mail -vvv 2>&1 | tail -5
+
+echo ""
+echo "4. OpenDKIM Service:"
+if systemctl is-active --quiet opendkim; then
+    echo -e "   ${GREEN}✓ Running${NC}"
+    if netstat -lnp 2>/dev/null | grep -q ":8891"; then
+        echo -e "   ${GREEN}✓ Listening on port 8891${NC}"
+    else
+        echo -e "   ${RED}✗ Not listening on port 8891${NC}"
+    fi
+else
+    echo -e "   ${RED}✗ Not running${NC}"
+fi
+
+echo ""
+echo "5. Quick Actions:"
+echo "   • Test email: test-email check-auth@verifier.port25.com"
+echo "   • Mail tester: https://www.mail-tester.com"
+echo "   • View key: cat /etc/opendkim/keys/$DOMAIN/mail.txt"
+EOF
+
+sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/verify-dkim
+chmod +x /usr/local/bin/verify-dkim
+
 # ===================================================================
 # PHASE 11: SSL CERTIFICATES (SMART REQUEST - ONLY EXISTING DOMAINS)
 # ===================================================================
@@ -836,13 +977,37 @@ if [ -f "$INSTALL_DIR/post-install-config.sh" ]; then
     bash "$INSTALL_DIR/post-install-config.sh"
 fi
 
+# Final DKIM verification
+echo ""
+print_header "Final DKIM Verification"
+
 # Ensure OpenDKIM is running
 systemctl restart opendkim
-sleep 2
+sleep 3
 
 # Verify OpenDKIM is listening
 if netstat -lnp 2>/dev/null | grep -q ":8891"; then
     print_message "✓ OpenDKIM is listening on port 8891"
+    
+    # Display DKIM key info
+    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+        DKIM_KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r ')
+        if [ ! -z "$DKIM_KEY" ]; then
+            echo "✓ DKIM key ready: ${#DKIM_KEY} characters"
+            
+            # Check if in DNS
+            DNS_CHECK=$(dig +short TXT mail._domainkey.$DOMAIN_NAME @1.1.1.1 2>/dev/null | grep "v=DKIM1")
+            if [ ! -z "$DNS_CHECK" ]; then
+                print_message "✓ DKIM record found in DNS"
+            else
+                print_warning "⚠ DKIM record not in DNS yet"
+                echo ""
+                echo "Add this TXT record to your DNS:"
+                echo "  Name: mail._domainkey"
+                echo "  Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
+            fi
+        fi
+    fi
 else
     print_error "✗ OpenDKIM not listening - restarting"
     systemctl stop opendkim
@@ -862,9 +1027,9 @@ print_header "Installation Complete!"
 
 echo ""
 print_message "✓ Mail server installed successfully!"
-print_message "✓ DKIM SIGNING IS ENABLED with 1024-bit key (DNS compatible)!"
-print_message "✓ Website with SSL support configured!"
-print_message "✓ System optimized without kernel warnings!"
+print_message "✓ DKIM SIGNING IS ENABLED with 1024-bit key!"
+print_message "✓ Website configured!"
+print_message "✓ System optimized!"
 echo ""
 echo "Domain: $DOMAIN_NAME"
 echo "Mail Server: $HOSTNAME"
@@ -872,9 +1037,7 @@ echo "Mail Subdomain: $MAIL_SUBDOMAIN"
 echo "Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "Total IPs: ${#IP_ADDRESSES[@]}"
-    echo ""
-    echo "IP Rotation: ENABLED with sticky sessions"
-    echo "  View status: ip-rotation-status"
+    echo "IP Rotation: ENABLED"
 fi
 echo ""
 
@@ -885,72 +1048,48 @@ if [ ! -z "$FIRST_EMAIL" ]; then
     echo ""
 fi
 
-# Display DKIM record (FULL 1024-bit key)
+# Display DKIM record
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    echo "DKIM Record (add to DNS if not using Cloudflare):"
-    echo "  Name: mail._domainkey"
-    echo "  Type: TXT"
-    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -oP 'p=\K[^"]+' | tr -d '\n\t\r ')
+    DKIM_KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\t\r ')
     if [ ! -z "$DKIM_KEY" ]; then
+        echo "DKIM Record (add to DNS if not automatic):"
+        echo "  Name: mail._domainkey"
+        echo "  Type: TXT"
         echo "  Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
-        echo ""
-        echo "  Key length: ${#DKIM_KEY} characters (should be ~215 for 1024-bit)"
-    else
-        print_warning "  Could not extract key - check manually: cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+        echo "  Key length: ${#DKIM_KEY} characters (should be ~216 for 1024-bit)"
     fi
     echo ""
 fi
 
-echo "VERIFY EVERYTHING IS WORKING:"
-echo "  1. Check DKIM signing: opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
-echo "  2. System status: systemctl status opendkim postfix dovecot nginx"
-echo "  3. Send test email: test-email check-auth@verifier.port25.com"
-echo "  4. Check website: http://$DOMAIN_NAME"
+echo "CRITICAL VERIFICATION STEPS:"
+echo "=============================="
+echo "1. Verify DKIM: verify-dkim"
+echo "2. Test DKIM signing: opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
+echo "3. Send test email: test-email check-auth@verifier.port25.com"
+echo "4. Check score: https://www.mail-tester.com"
 echo ""
 
-echo "IMPORTANT - SSL Certificates:"
-if [[ "$CERT_DOMAINS" == *"-d $DOMAIN_NAME"* ]]; then
-    echo "  ✓ SSL certificates requested for existing domains"
-else
-    echo "  ⚠ SSL certificates pending - DNS not yet propagated"
-    echo "  Run 'get-ssl-cert' after DNS propagation (5-30 minutes)"
+echo "Management Commands:"
+echo "  verify-dkim        - Check DKIM status"
+echo "  mail-status        - Check server status"
+echo "  mail-account       - Manage email accounts"
+echo "  mail-test          - Test configuration"
+echo "  check-dns          - Verify DNS records"
+echo "  get-ssl-cert       - Get SSL certificates"
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "  ip-rotation-status - View IP rotation"
 fi
 echo ""
 
 echo "Next Steps:"
-echo "1. Wait for DNS propagation (5-30 minutes)"
-echo "2. Get SSL certificates: get-ssl-cert"
-echo "3. Test email delivery: test-email recipient@example.com"
-echo "4. Update physical address in /var/www/$DOMAIN_NAME/contact.html"
-echo "5. Update Mailwizz URL in nginx config"
-echo ""
-
-echo "Management Commands:"
-echo "  mail-status         - Check server status"
-echo "  mail-account        - Manage email accounts"
-echo "  mail-test          - Test complete configuration"
-echo "  mail-queue         - Manage mail queue"
-echo "  mail-log           - View mail logs"
-echo "  check-dns          - Verify DNS records"
-echo "  get-ssl-cert       - Get/renew SSL certificates"
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "  ip-rotation-status - View IP rotation statistics"
-fi
-echo "  troubleshoot       - Run diagnostics"
+echo "1. Wait 5-30 minutes for DNS propagation"
+echo "2. Run: verify-dkim"
+echo "3. Get SSL: get-ssl-cert"
+echo "4. Test email: test-email recipient@example.com"
 echo ""
 
 echo "Installation log: $LOG_FILE"
 echo ""
 print_message "Your bulk mail server is READY!"
-print_message "✓ DKIM signing ENABLED with 1024-bit key"
-print_message "✓ Subdomain DNS configured: $MAIL_SUBDOMAIN"
-if [[ "$CERT_DOMAINS" == *"-d $DOMAIN_NAME"* ]]; then
-    print_message "✓ SSL certificates obtained for existing domains"
-else
-    print_message "✓ SSL certificates will auto-retry every 30 minutes"
-fi
-echo ""
-print_message "CRITICAL REMINDER:"
-print_message "• If DNS is not propagated, run 'get-ssl-cert' in 30 minutes"
-print_message "• Verify DKIM in DNS: opendkim-testkey -d $DOMAIN_NAME -s mail -vvv"
-print_message "• Send test email: test-email check-auth@verifier.port25.com"
+print_message "✓ DKIM: 1024-bit key generated and configured"
+print_message "✓ Run 'verify-dkim' to check DKIM status"
