@@ -1036,7 +1036,7 @@ h2 {
 
 /* Footer */
 footer {
-    background: #2c3e50;
+    background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
     color: var(--white);
     text-align: center;
     padding: 50px 0;
