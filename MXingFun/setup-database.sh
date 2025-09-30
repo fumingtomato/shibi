@@ -270,7 +270,7 @@ EOF
     fi
 fi
 
-# Create tables with properly terminated heredoc
+# Create tables with properly terminated heredoc - FIXED
 mysql -u mailuser -p"$DB_PASS" -h localhost mailserver <<'EOF_SQLTABLES' 2>/dev/null || \
 mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver <<'EOF_SQLTABLES' 2>/dev/null || true
 -- Create domains table
@@ -636,7 +636,7 @@ print_header "Ensuring 1024-bit DKIM Key"
 DKIM_KEY_FILE="/etc/opendkim/keys/$DOMAIN_NAME/mail.private"
 if [ -f "$DKIM_KEY_FILE" ]; then
     # Check key size
-    KEY_BITS=$(openssl rsa -in "$DKIM_KEY_FILE" -text -noout 2>/dev/null | grep "Private-Key:" | grep -oP '\d+' || echo "0")
+    KEY_BITS=$(openssl rsa -in "$DKIM_KEY_FILE" -text -noout 2>/dev/null | grep "Private-Key:" | grep -oP '\d+' | head -1 || echo "0")
     
     if [ "$KEY_BITS" -ne 1024 ]; then
         print_warning "⚠ Existing DKIM key is $KEY_BITS-bit, regenerating as 1024-bit..."
