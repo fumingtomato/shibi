@@ -409,7 +409,7 @@ else
     
     # Try to get local key
     if [ -f "/etc/opendkim/keys/$DOMAIN/mail.txt" ]; then
-        LOCAL_KEY=$(grep -oP 'p=\K[^"]+' /etc/opendkim/keys/$DOMAIN/mail.txt | tr -d '\n\t\r ')
+        LOCAL_KEY=$(cat /etc/opendkim/keys/$DOMAIN/mail.txt | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' "')
         if [ ! -z "$LOCAL_KEY" ]; then
             echo "    Value: v=DKIM1; k=rsa; p=$LOCAL_KEY"
         fi
