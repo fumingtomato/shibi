@@ -2,9 +2,10 @@
 
 # =================================================================
 # WEBSITE SETUP FOR BULK EMAIL COMPLIANCE - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.4 - FIXED SSL for ALL subdomains
+# Version: 17.0.5 - WITH BACKEND INTEGRATION
 # Creates compliance website automatically with all required pages
 # FIXED: SSL certificates include ALL subdomains properly
+# ADDED: Backend integration for user password changes and global colors
 # =================================================================
 
 # Colors
@@ -78,6 +79,11 @@ if [ -z "$ADMIN_EMAIL" ]; then
     ADMIN_EMAIL="${FIRST_EMAIL:-admin@$DOMAIN_NAME}"
 fi
 
+# Get database password
+if [ -f /root/.mail_db_password ]; then
+    DB_PASS=$(cat /root/.mail_db_password)
+fi
+
 # Get current date
 CURRENT_DATE=$(date +'%B %d, %Y')
 CURRENT_YEAR=$(date +%Y)
@@ -103,11 +109,12 @@ echo "SSL will be configured for: $SSL_DOMAINS"
 echo ""
 
 # ===================================================================
-# 1. INSTALL NGINX
+# 1. INSTALL NGINX AND PHP
 # ===================================================================
 
-print_header "Installing Web Server"
+print_header "Installing Web Server and PHP"
 
+# Install Nginx
 if ! command -v nginx &> /dev/null; then
     echo "Installing Nginx..."
     apt-get update > /dev/null 2>&1
@@ -122,6 +129,21 @@ if ! command -v nginx &> /dev/null; then
 else
     print_message "✓ Nginx already installed"
 fi
+
+# Install PHP for backend processing
+echo "Installing PHP and required extensions..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    php-fpm php-mysql php-json php-mbstring \
+    php-xml php-curl > /dev/null 2>&1
+
+# Get PHP version
+PHP_VERSION=$(php -v | head -n1 | cut -d' ' -f2 | cut -d'.' -f1,2)
+
+if [ -z "$PHP_VERSION" ]; then
+    PHP_VERSION="7.4"  # Default fallback
+fi
+
+print_message "✓ PHP $PHP_VERSION installed"
 
 # Stop Apache if running (conflicts with nginx)
 if systemctl is-active --quiet apache2; then
@@ -152,16 +174,300 @@ fi
 mkdir -p "$WEB_ROOT/css"
 mkdir -p "$WEB_ROOT/js"
 mkdir -p "$WEB_ROOT/images"
+mkdir -p "$WEB_ROOT/api"
+mkdir -p "$WEB_ROOT/data"
+
+# Create colors configuration file
+echo '{"primary":"#667eea","secondary":"#764ba2"}' > "$WEB_ROOT/data/colors.json"
+chmod 666 "$WEB_ROOT/data/colors.json"
 
 # ===================================================================
-# 3. CREATE WEBSITE CONTENT
+# 3. CREATE WEBSITE CONTENT WITH BACKEND API
 # ===================================================================
 
-echo "Creating website pages..."
+echo "Creating website pages and backend API..."
 
-# Create modern CSS file
+# Create PHP API endpoints for backend functionality
+cat > "$WEB_ROOT/api/auth.php" <<'APIAUTH'
+<?php
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST');
+header('Access-Control-Allow-Headers: Content-Type');
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['error' => 'Method not allowed']);
+    exit;
+}
+
+$input = json_decode(file_get_contents('php://input'), true);
+$email = $input['email'] ?? '';
+$password = $input['password'] ?? '';
+
+if (empty($email) || empty($password)) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Email and password required']);
+    exit;
+}
+
+// Database connection
+$db_pass = trim(file_get_contents('/root/.mail_db_password'));
+$mysqli = new mysqli('localhost', 'mailuser', $db_pass, 'mailserver');
+
+if ($mysqli->connect_error) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Database connection failed']);
+    exit;
+}
+
+// Query user
+$stmt = $mysqli->prepare("SELECT email, password FROM virtual_users WHERE email = ? AND active = 1");
+$stmt->bind_param("s", $email);
+$stmt->execute();
+$result = $stmt->get_result();
+
+if ($row = $result->fetch_assoc()) {
+    // Verify password using Dovecot's method
+    $stored_pass = $row['password'];
+    
+    // Check if it's a plain password (for testing) or hashed
+    if (strpos($stored_pass, '{') === 0) {
+        // It's hashed, we need to verify properly
+        $cmd = "doveadm pw -t '$stored_pass' -p " . escapeshellarg($password) . " 2>&1";
+        exec($cmd, $output, $return_code);
+        
+        if ($return_code === 0 && strpos(implode('', $output), 'verified') !== false) {
+            // Success
+            session_start();
+            $_SESSION['user'] = $email;
+            echo json_encode(['success' => true, 'user' => $email]);
+        } else {
+            http_response_code(401);
+            echo json_encode(['error' => 'Invalid credentials']);
+        }
+    } else {
+        // Plain password comparison (not recommended for production)
+        if ($stored_pass === $password) {
+            session_start();
+            $_SESSION['user'] = $email;
+            echo json_encode(['success' => true, 'user' => $email]);
+        } else {
+            http_response_code(401);
+            echo json_encode(['error' => 'Invalid credentials']);
+        }
+    }
+} else {
+    http_response_code(401);
+    echo json_encode(['error' => 'Invalid credentials']);
+}
+
+$stmt->close();
+$mysqli->close();
+APIAUTH
+
+# Create password change API
+cat > "$WEB_ROOT/api/change-password.php" <<'APIPASS'
+<?php
+session_start();
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST');
+header('Access-Control-Allow-Headers: Content-Type');
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['error' => 'Method not allowed']);
+    exit;
+}
+
+if (!isset($_SESSION['user'])) {
+    http_response_code(401);
+    echo json_encode(['error' => 'Not authenticated']);
+    exit;
+}
+
+$input = json_decode(file_get_contents('php://input'), true);
+$current_password = $input['currentPassword'] ?? '';
+$new_password = $input['newPassword'] ?? '';
+$user_email = $_SESSION['user'];
+
+if (empty($current_password) || empty($new_password)) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Current and new passwords required']);
+    exit;
+}
+
+if (strlen($new_password) < 8) {
+    http_response_code(400);
+    echo json_encode(['error' => 'New password must be at least 8 characters']);
+    exit;
+}
+
+// Database connection
+$db_pass = trim(file_get_contents('/root/.mail_db_password'));
+$mysqli = new mysqli('localhost', 'mailuser', $db_pass, 'mailserver');
+
+if ($mysqli->connect_error) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Database connection failed']);
+    exit;
+}
+
+// Verify current password first
+$stmt = $mysqli->prepare("SELECT password FROM virtual_users WHERE email = ?");
+$stmt->bind_param("s", $user_email);
+$stmt->execute();
+$result = $stmt->get_result();
+
+if ($row = $result->fetch_assoc()) {
+    $stored_pass = $row['password'];
+    
+    // Verify current password
+    $valid = false;
+    if (strpos($stored_pass, '{') === 0) {
+        // Hashed password
+        $cmd = "doveadm pw -t '$stored_pass' -p " . escapeshellarg($current_password) . " 2>&1";
+        exec($cmd, $output, $return_code);
+        if ($return_code === 0 && strpos(implode('', $output), 'verified') !== false) {
+            $valid = true;
+        }
+    } else {
+        // Plain password
+        $valid = ($stored_pass === $current_password);
+    }
+    
+    if (!$valid) {
+        http_response_code(401);
+        echo json_encode(['error' => 'Current password is incorrect']);
+        $stmt->close();
+        $mysqli->close();
+        exit;
+    }
+    
+    // Hash new password using doveadm
+    $cmd = "doveadm pw -s SHA512-CRYPT -p " . escapeshellarg($new_password) . " 2>/dev/null";
+    $new_hash = trim(shell_exec($cmd));
+    
+    if (empty($new_hash)) {
+        // Fallback to SSHA512 if SHA512-CRYPT fails
+        $cmd = "doveadm pw -s SSHA512 -p " . escapeshellarg($new_password) . " 2>/dev/null";
+        $new_hash = trim(shell_exec($cmd));
+    }
+    
+    if (empty($new_hash)) {
+        // Last resort - store plain (not recommended)
+        $new_hash = "{PLAIN}$new_password";
+    }
+    
+    // Update password
+    $update_stmt = $mysqli->prepare("UPDATE virtual_users SET password = ? WHERE email = ?");
+    $update_stmt->bind_param("ss", $new_hash, $user_email);
+    
+    if ($update_stmt->execute()) {
+        echo json_encode(['success' => true, 'message' => 'Password changed successfully']);
+    } else {
+        http_response_code(500);
+        echo json_encode(['error' => 'Failed to update password']);
+    }
+    
+    $update_stmt->close();
+} else {
+    http_response_code(404);
+    echo json_encode(['error' => 'User not found']);
+}
+
+$stmt->close();
+$mysqli->close();
+APIPASS
+
+# Create colors API (global for all visitors)
+cat > "$WEB_ROOT/api/colors.php" <<'APICOLORS'
+<?php
+session_start();
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST');
+header('Access-Control-Allow-Headers: Content-Type');
+
+$colors_file = dirname(__DIR__) . '/data/colors.json';
+
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    // Get current colors
+    if (file_exists($colors_file)) {
+        $colors = json_decode(file_get_contents($colors_file), true);
+        echo json_encode($colors);
+    } else {
+        // Default colors
+        echo json_encode(['primary' => '#667eea', 'secondary' => '#764ba2']);
+    }
+} elseif ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Check if user is logged in
+    if (!isset($_SESSION['user'])) {
+        http_response_code(401);
+        echo json_encode(['error' => 'Authentication required to change colors']);
+        exit;
+    }
+    
+    // Update colors (only logged in users can change)
+    $input = json_decode(file_get_contents('php://input'), true);
+    $primary = $input['primary'] ?? '#667eea';
+    $secondary = $input['secondary'] ?? '#764ba2';
+    
+    // Validate hex colors
+    if (!preg_match('/^#[0-9A-Fa-f]{6}$/', $primary) || !preg_match('/^#[0-9A-Fa-f]{6}$/', $secondary)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid color format']);
+        exit;
+    }
+    
+    $colors = ['primary' => $primary, 'secondary' => $secondary];
+    
+    if (file_put_contents($colors_file, json_encode($colors))) {
+        echo json_encode(['success' => true, 'colors' => $colors]);
+    } else {
+        http_response_code(500);
+        echo json_encode(['error' => 'Failed to save colors']);
+    }
+} else {
+    http_response_code(405);
+    echo json_encode(['error' => 'Method not allowed']);
+}
+APICOLORS
+
+# Create session check API
+cat > "$WEB_ROOT/api/session.php" <<'APISESSION'
+<?php
+session_start();
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+
+if (isset($_SESSION['user'])) {
+    echo json_encode(['authenticated' => true, 'user' => $_SESSION['user']]);
+} else {
+    echo json_encode(['authenticated' => false]);
+}
+APISESSION
+
+# Create logout API
+cat > "$WEB_ROOT/api/logout.php" <<'APILOGOUT'
+<?php
+session_start();
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+
+session_destroy();
+echo json_encode(['success' => true, 'message' => 'Logged out successfully']);
+APILOGOUT
+
+# Set permissions for API files
+chown -R www-data:www-data "$WEB_ROOT/api" 2>/dev/null || chown -R nginx:nginx "$WEB_ROOT/api" 2>/dev/null
+chmod 755 "$WEB_ROOT/api"
+chmod 644 "$WEB_ROOT/api/"*.php
+
+# Create modern CSS file with dynamic colors support
 cat > "$WEB_ROOT/css/style.css" <<'EOF'
-/* Modern Email Service Website Styles */
+/* Modern Email Service Website Styles with Dynamic Colors */
 :root {
     --primary-color: #667eea;
     --secondary-color: #764ba2;
@@ -312,10 +618,12 @@ h2 {
     font-weight: 600;
     transition: background 0.3s, transform 0.3s;
     margin-top: 20px;
+    border: none;
+    cursor: pointer;
 }
 
 .btn:hover {
-    background: #5a67d8;
+    background: var(--secondary-color);
     transform: translateY(-2px);
 }
 
@@ -365,6 +673,85 @@ footer a:hover {
     color: var(--primary-color);
 }
 
+/* Login Form Styles */
+.login-form {
+    max-width: 500px;
+    margin: 0 auto;
+    padding: 40px;
+    background: var(--white);
+    border-radius: 10px;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+}
+
+.form-group {
+    margin-bottom: 25px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 600;
+    color: var(--text-color);
+}
+
+.form-group input {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    font-size: 16px;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+.color-picker-group {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin: 30px 0;
+}
+
+.color-input {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.color-input input[type="color"] {
+    width: 50px;
+    height: 50px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.user-info {
+    background: var(--bg-light);
+    padding: 15px;
+    border-radius: 5px;
+    margin-bottom: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.logout-btn {
+    background: #dc3545;
+    color: white;
+    border: none;
+    padding: 8px 20px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.logout-btn:hover {
+    background: #c82333;
+}
+
 /* Responsive Design */
 @media (max-width: 768px) {
     header h1 {
@@ -384,25 +771,70 @@ footer a:hover {
     .features {
         grid-template-columns: 1fr;
     }
+    
+    .color-picker-group {
+        grid-template-columns: 1fr;
+    }
 }
 EOF
 
-# Homepage with professional design
+# ===================================================================
+# 4. CREATE JAVASCRIPT FOR GLOBAL COLOR LOADING
+# ===================================================================
+
+# Create JavaScript file for loading global colors on all pages
+cat > "$WEB_ROOT/js/colors.js" <<'JSCOLORS'
+// Load and apply global colors for all visitors
+(function() {
+    // Function to load colors from API
+    function loadGlobalColors() {
+        fetch('/api/colors.php')
+            .then(response => response.json())
+            .then(data => {
+                if (data.primary) {
+                    document.documentElement.style.setProperty('--primary-color', data.primary);
+                }
+                if (data.secondary) {
+                    document.documentElement.style.setProperty('--secondary-color', data.secondary);
+                }
+            })
+            .catch(error => {
+                console.error('Failed to load colors:', error);
+            });
+    }
+    
+    // Load colors when page loads
+    loadGlobalColors();
+    
+    // Reload colors every 30 seconds to catch updates
+    setInterval(loadGlobalColors, 30000);
+})();
+JSCOLORS
+
+print_message "✓ Backend API and dynamic color system created"
+
+# ===================================================================
+# 5. CREATE HTML PAGES WITH BACKEND INTEGRATION
+# ===================================================================
+
+echo "Creating HTML pages with backend integration..."
+
+# Homepage with only Manage Your Preferences section
 cat > "$WEB_ROOT/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Professional email services by $DOMAIN_NAME">
-    <title>$DOMAIN_NAME - Professional Email Services</title>
+    <meta name="description" content="Email services by $DOMAIN_NAME">
+    <title>$DOMAIN_NAME</title>
     <link rel="stylesheet" href="/css/style.css">
+    <script src="/js/colors.js"></script>
 </head>
 <body>
     <header>
         <div class="container">
             <h1>$DOMAIN_NAME</h1>
-            <p>Professional Email Services • Reliable Delivery • Full Compliance</p>
         </div>
     </header>
     
@@ -411,71 +843,12 @@ cat > "$WEB_ROOT/index.html" <<EOF
             <li><a href="/">Home</a></li>
             <li><a href="/privacy.html">Privacy Policy</a></li>
             <li><a href="/terms.html">Terms of Service</a></li>
-            <li><a href="/contact.html">Contact</a></li>
-            <li><a href="/unsubscribe">Unsubscribe</a></li>
+            <li><a href="/user-settings.html">User Settings</a></li>
         </ul>
     </nav>
     
     <div class="content">
         <div class="container">
-            <div class="section">
-                <h2>Welcome to $DOMAIN_NAME</h2>
-                <div class="card">
-                    <h3>Professional Email Infrastructure</h3>
-                    <p>We provide reliable email services with a focus on deliverability, compliance, and respect for recipient preferences.</p>
-                    <p>Our infrastructure ensures your communications reach their intended recipients while maintaining the highest standards of email best practices.</p>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2>Our Commitment</h2>
-                <div class="features">
-                    <div class="feature">
-                        <div class="feature-icon">🔒</div>
-                        <h3>Privacy First</h3>
-                        <p>Your data is protected with industry-standard encryption and security measures.</p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">✉️</div>
-                        <h3>Reliable Delivery</h3>
-                        <p>Advanced infrastructure ensures your emails reach their destination.</p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">⚖️</div>
-                        <h3>Full Compliance</h3>
-                        <p>CAN-SPAM, GDPR, and all major email regulations compliance.</p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">🚀</div>
-                        <h3>High Performance</h3>
-                        <p>Optimized servers for fast, efficient email delivery.</p>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2>Email Compliance</h2>
-                <div class="card">
-                    <h3>Industry Standards</h3>
-                    <div class="compliance-badges">
-                        <span class="badge">CAN-SPAM Compliant</span>
-                        <span class="badge">GDPR Compliant</span>
-                        <span class="badge">DKIM Authenticated</span>
-                        <span class="badge">SPF Authorized</span>
-                        <span class="badge">DMARC Enabled</span>
-                    </div>
-                    <p>We maintain strict compliance with international email regulations. All emails sent through our service include:</p>
-                    <ul style="margin-left: 20px; margin-top: 15px; line-height: 2;">
-                        <li>✓ Clear sender identification</li>
-                        <li>✓ Accurate subject lines</li>
-                        <li>✓ Physical mailing address</li>
-                        <li>✓ One-click unsubscribe options</li>
-                        <li>✓ Prompt honor of opt-out requests</li>
-                        <li>✓ No deceptive practices</li>
-                    </ul>
-                </div>
-            </div>
-            
             <div class="section">
                 <h2>Manage Your Preferences</h2>
                 <div class="card">
@@ -490,7 +863,6 @@ cat > "$WEB_ROOT/index.html" <<EOF
                     <div class="notice">
                         <strong>Important:</strong> To unsubscribe or manage your email preferences, please use the unsubscribe link provided in any email you've received from us.
                     </div>
-                    <a href="/unsubscribe" class="btn">Unsubscribe Center</a>
                 </div>
             </div>
         </div>
@@ -501,12 +873,7 @@ cat > "$WEB_ROOT/index.html" <<EOF
             <p>&copy; $CURRENT_YEAR $DOMAIN_NAME - All Rights Reserved</p>
             <p style="margin-top: 15px;">
                 <a href="/privacy.html">Privacy Policy</a> | 
-                <a href="/terms.html">Terms of Service</a> | 
-                <a href="/contact.html">Contact Us</a> |
-                <a href="/unsubscribe">Unsubscribe</a>
-            </p>
-            <p style="margin-top: 30px; font-size: 0.9em; opacity: 0.8;">
-                Professional Email Services • Powered by Enterprise Infrastructure
+                <a href="/terms.html">Terms of Service</a>
             </p>
         </div>
     </footer>
@@ -514,30 +881,78 @@ cat > "$WEB_ROOT/index.html" <<EOF
 </html>
 EOF
 
-# Create Privacy Policy
-cat > "$WEB_ROOT/privacy.html" <<EOF
+# Create User Settings page with REAL backend integration
+cat > "$WEB_ROOT/user-settings.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Policy - $DOMAIN_NAME</title>
+    <title>User Settings - $DOMAIN_NAME</title>
     <link rel="stylesheet" href="/css/style.css">
+    <script src="/js/colors.js"></script>
     <style>
-        .content { max-width: 900px; margin: 40px auto; }
-        .date { color: #6c757d; margin-bottom: 30px; font-size: 1.1em; }
-        .highlight { background: #f8f9fa; padding: 20px; border-left: 4px solid #667eea; margin: 20px 0; }
-        .back-link { 
-            display: inline-block;
-            margin-top: 40px;
-            padding: 12px 30px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 50px;
-            font-weight: 600;
+        .settings-container {
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 40px;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.1);
         }
-        .back-link:hover { background: #5a67d8; }
+        .tab-buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+        }
+        .tab-button {
+            flex: 1;
+            padding: 12px;
+            background: #f8f9fa;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        .tab-button.active {
+            background: var(--primary-color);
+            color: white;
+        }
+        .tab-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .success-message, .error-message {
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .success-message {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error-message {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        .loading.show {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -546,13 +961,418 @@ cat > "$WEB_ROOT/privacy.html" <<EOF
             <li><a href="/">Home</a></li>
             <li><a href="/privacy.html">Privacy Policy</a></li>
             <li><a href="/terms.html">Terms of Service</a></li>
-            <li><a href="/contact.html">Contact</a></li>
-            <li><a href="/unsubscribe">Unsubscribe</a></li>
+            <li><a href="/user-settings.html">User Settings</a></li>
+        </ul>
+    </nav>
+    
+    <div class="settings-container">
+        <h1 style="color: var(--primary-color); margin-bottom: 30px;">User Settings</h1>
+        
+        <div class="success-message" id="successMessage"></div>
+        <div class="error-message" id="errorMessage"></div>
+        
+        <div class="user-info" id="userInfo" style="display: none;">
+            <span>Logged in as: <strong id="userEmail"></strong></span>
+            <button class="logout-btn" onclick="logout()">Logout</button>
+        </div>
+        
+        <div class="tab-buttons">
+            <button class="tab-button active" onclick="showTab('login')" id="loginTabBtn">Login</button>
+            <button class="tab-button" onclick="showTab('colors')" id="colorsTabBtn" disabled>Theme Colors</button>
+            <button class="tab-button" onclick="showTab('password')" id="passwordTabBtn" disabled>Change Password</button>
+        </div>
+        
+        <!-- Login Tab -->
+        <div class="tab-content active" id="loginTab">
+            <h2>Login to Your Account</h2>
+            <p style="margin-bottom: 20px; color: #666;">Use your email account credentials to login.</p>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="loginEmail">Email Address:</label>
+                    <input type="email" id="loginEmail" name="email" required placeholder="user@$DOMAIN_NAME">
+                </div>
+                <div class="form-group">
+                    <label for="loginPassword">Password:</label>
+                    <input type="password" id="loginPassword" name="password" required>
+                </div>
+                <button type="submit" class="btn">Login</button>
+            </form>
+            <div class="loading" id="loginLoading">Authenticating...</div>
+        </div>
+        
+        <!-- Colors Tab -->
+        <div class="tab-content" id="colorsTab">
+            <h2>Customize Theme Colors</h2>
+            <p style="margin-bottom: 20px; color: #666;">Changes will be visible to all website visitors.</p>
+            <form id="colorForm">
+                <div class="color-picker-group">
+                    <div class="form-group">
+                        <label>Primary Color:</label>
+                        <div class="color-input">
+                            <input type="color" id="primaryColor" value="#667eea">
+                            <input type="text" value="#667eea" id="primaryHex" pattern="^#[0-9A-Fa-f]{6}$">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Secondary Color:</label>
+                        <div class="color-input">
+                            <input type="color" id="secondaryColor" value="#764ba2">
+                            <input type="text" value="#764ba2" id="secondaryHex" pattern="^#[0-9A-Fa-f]{6}$">
+                        </div>
+                    </div>
+                </div>
+                <button type="submit" class="btn">Save Colors (Global)</button>
+                <button type="button" class="btn" style="background: #6c757d; margin-left: 10px;" onclick="resetColors()">Reset to Default</button>
+            </form>
+            <div class="loading" id="colorLoading">Saving colors...</div>
+        </div>
+        
+        <!-- Password Tab -->
+        <div class="tab-content" id="passwordTab">
+            <h2>Change Password</h2>
+            <p style="margin-bottom: 20px; color: #666;">Change your email account password.</p>
+            <form id="passwordForm">
+                <div class="form-group">
+                    <label for="currentPassword">Current Password:</label>
+                    <input type="password" id="currentPassword" name="currentPassword" required>
+                </div>
+                <div class="form-group">
+                    <label for="newPassword">New Password:</label>
+                    <input type="password" id="newPassword" name="newPassword" required minlength="8">
+                </div>
+                <div class="form-group">
+                    <label for="confirmPassword">Confirm New Password:</label>
+                    <input type="password" id="confirmPassword" name="confirmPassword" required minlength="8">
+                </div>
+                <button type="submit" class="btn">Change Password</button>
+            </form>
+            <div class="loading" id="passwordLoading">Changing password...</div>
+        </div>
+    </div>
+    
+    <script>
+        let currentUser = null;
+        
+        // Check session on page load
+        window.addEventListener('DOMContentLoaded', function() {
+            checkSession();
+            loadCurrentColors();
+        });
+        
+        // Check if user is already logged in
+        function checkSession() {
+            fetch('/api/session.php')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.authenticated) {
+                        currentUser = data.user;
+                        showLoggedInState();
+                    }
+                })
+                .catch(error => console.error('Session check failed:', error));
+        }
+        
+        // Show logged in state
+        function showLoggedInState() {
+            document.getElementById('userInfo').style.display = 'flex';
+            document.getElementById('userEmail').textContent = currentUser;
+            document.getElementById('colorsTabBtn').disabled = false;
+            document.getElementById('passwordTabBtn').disabled = false;
+            document.getElementById('loginTabBtn').textContent = 'Account';
+            
+            // Clear login form
+            document.getElementById('loginForm').reset();
+        }
+        
+        // Tab switching
+        function showTab(tabName) {
+            if (tabName !== 'login' && !currentUser) {
+                showError('Please login first');
+                return;
+            }
+            
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            document.getElementById(tabName + 'Tab').classList.add('active');
+            document.getElementById(tabName + 'TabBtn').classList.add('active');
+        }
+        
+        // Login form
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const email = document.getElementById('loginEmail').value;
+            const password = document.getElementById('loginPassword').value;
+            
+            document.getElementById('loginLoading').classList.add('show');
+            hideMessages();
+            
+            try {
+                const response = await fetch('/api/auth.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                const data = await response.json();
+                document.getElementById('loginLoading').classList.remove('show');
+                
+                if (response.ok && data.success) {
+                    currentUser = data.user;
+                    showLoggedInState();
+                    showSuccess('Login successful! You can now change settings.');
+                    
+                    // Switch to colors tab
+                    setTimeout(() => showTab('colors'), 1000);
+                } else {
+                    showError(data.error || 'Login failed. Please check your credentials.');
+                }
+            } catch (error) {
+                document.getElementById('loginLoading').classList.remove('show');
+                showError('Connection error. Please try again.');
+                console.error('Login error:', error);
+            }
+        });
+        
+        // Load current colors
+        function loadCurrentColors() {
+            fetch('/api/colors.php')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.primary) {
+                        document.getElementById('primaryColor').value = data.primary;
+                        document.getElementById('primaryHex').value = data.primary;
+                    }
+                    if (data.secondary) {
+                        document.getElementById('secondaryColor').value = data.secondary;
+                        document.getElementById('secondaryHex').value = data.secondary;
+                    }
+                })
+                .catch(error => console.error('Failed to load colors:', error));
+        }
+        
+        // Color form
+        document.getElementById('colorForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const primary = document.getElementById('primaryColor').value;
+            const secondary = document.getElementById('secondaryColor').value;
+            
+            document.getElementById('colorLoading').classList.add('show');
+            hideMessages();
+            
+            try {
+                const response = await fetch('/api/colors.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ primary, secondary })
+                });
+                
+                const data = await response.json();
+                document.getElementById('colorLoading').classList.remove('show');
+                
+                if (response.ok && data.success) {
+                    // Apply colors immediately
+                    document.documentElement.style.setProperty('--primary-color', primary);
+                    document.documentElement.style.setProperty('--secondary-color', secondary);
+                    
+                    showSuccess('Colors saved successfully! All visitors will see the new theme.');
+                } else {
+                    showError(data.error || 'Failed to save colors.');
+                }
+            } catch (error) {
+                document.getElementById('colorLoading').classList.remove('show');
+                showError('Failed to save colors. Please try again.');
+                console.error('Color save error:', error);
+            }
+        });
+        
+        // Password form
+        document.getElementById('passwordForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const currentPassword = document.getElementById('currentPassword').value;
+            const newPassword = document.getElementById('newPassword').value;
+            const confirmPassword = document.getElementById('confirmPassword').value;
+            
+            if (newPassword !== confirmPassword) {
+                showError('New passwords do not match!');
+                return;
+            }
+            
+            document.getElementById('passwordLoading').classList.add('show');
+            hideMessages();
+            
+            try {
+                const response = await fetch('/api/change-password.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ currentPassword, newPassword })
+                });
+                
+                const data = await response.json();
+                document.getElementById('passwordLoading').classList.remove('show');
+                
+                if (response.ok && data.success) {
+                    showSuccess('Password changed successfully!');
+                    document.getElementById('passwordForm').reset();
+                } else {
+                    showError(data.error || 'Failed to change password.');
+                }
+            } catch (error) {
+                document.getElementById('passwordLoading').classList.remove('show');
+                showError('Failed to change password. Please try again.');
+                console.error('Password change error:', error);
+            }
+        });
+        
+        // Logout function
+        function logout() {
+            fetch('/api/logout.php')
+                .then(response => response.json())
+                .then(data => {
+                    currentUser = null;
+                    document.getElementById('userInfo').style.display = 'none';
+                    document.getElementById('colorsTabBtn').disabled = true;
+                    document.getElementById('passwordTabBtn').disabled = true;
+                    document.getElementById('loginTabBtn').textContent = 'Login';
+                    showTab('login');
+                    showSuccess('Logged out successfully.');
+                })
+                .catch(error => console.error('Logout error:', error));
+        }
+        
+        // Color picker sync
+        document.getElementById('primaryColor').addEventListener('input', function(e) {
+            document.getElementById('primaryHex').value = e.target.value;
+        });
+        
+        document.getElementById('secondaryColor').addEventListener('input', function(e) {
+            document.getElementById('secondaryHex').value = e.target.value;
+        });
+        
+        document.getElementById('primaryHex').addEventListener('input', function(e) {
+            if (e.target.validity.valid) {
+                document.getElementById('primaryColor').value = e.target.value;
+            }
+        });
+        
+        document.getElementById('secondaryHex').addEventListener('input', function(e) {
+            if (e.target.validity.valid) {
+                document.getElementById('secondaryColor').value = e.target.value;
+            }
+        });
+        
+        // Reset colors
+        function resetColors() {
+            if (!currentUser) {
+                showError('Please login first');
+                return;
+            }
+            
+            document.getElementById('primaryColor').value = '#667eea';
+            document.getElementById('primaryHex').value = '#667eea';
+            document.getElementById('secondaryColor').value = '#764ba2';
+            document.getElementById('secondaryHex').value = '#764ba2';
+            
+            // Save default colors to server
+            fetch('/api/colors.php', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ primary: '#667eea', secondary: '#764ba2' })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    document.documentElement.style.setProperty('--primary-color', '#667eea');
+                    document.documentElement.style.setProperty('--secondary-color', '#764ba2');
+                    showSuccess('Colors reset to default!');
+                }
+            })
+            .catch(error => {
+                console.error('Reset colors error:', error);
+                showError('Failed to reset colors.');
+            });
+        }
+        
+        // Message functions
+        function showSuccess(message) {
+            const elem = document.getElementById('successMessage');
+            elem.textContent = message;
+            elem.style.display = 'block';
+            document.getElementById('errorMessage').style.display = 'none';
+            setTimeout(() => elem.style.display = 'none', 5000);
+        }
+        
+        function showError(message) {
+            const elem = document.getElementById('errorMessage');
+            elem.textContent = message;
+            elem.style.display = 'block';
+            document.getElementById('successMessage').style.display = 'none';
+            setTimeout(() => elem.style.display = 'none', 5000);
+        }
+        
+        function hideMessages() {
+            document.getElementById('successMessage').style.display = 'none';
+            document.getElementById('errorMessage').style.display = 'none';
+        }
+    </script>
+</body>
+</html>
+EOF
+
+# Create Privacy Policy with color loading
+cat > "$WEB_ROOT/privacy.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Policy - $DOMAIN_NAME</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <script src="/js/colors.js"></script>
+    <style>
+        .content { max-width: 900px; margin: 40px auto; }
+        .date { color: #6c757d; margin-bottom: 30px; font-size: 1.1em; }
+        .highlight { background: #f8f9fa; padding: 20px; border-left: 4px solid var(--primary-color); margin: 20px 0; }
+        .back-link { 
+            display: inline-block;
+            margin-top: 40px;
+            padding: 12px 30px;
+            background: var(--primary-color);
+            color: white;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: 600;
+        }
+        .back-link:hover { background: var(--secondary-color); }
+    </style>
+</head>
+<body>
+    <nav>
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/privacy.html">Privacy Policy</a></li>
+            <li><a href="/terms.html">Terms of Service</a></li>
+            <li><a href="/user-settings.html">User Settings</a></li>
         </ul>
     </nav>
     
     <div class="content">
-        <h1 style="color: #667eea;">Privacy Policy</h1>
+        <h1 style="color: var(--primary-color);">Privacy Policy</h1>
         <div class="date">Last Updated: $CURRENT_DATE</div>
         
         <div class="highlight">
@@ -599,16 +1419,7 @@ cat > "$WEB_ROOT/privacy.html" <<EOF
             <li>Regular backups and disaster recovery procedures</li>
         </ul>
         
-        <h2>5. Data Sharing</h2>
-        <p>We do not sell, rent, or trade your personal information. We may share data only:</p>
-        <ul>
-            <li>With your explicit consent</li>
-            <li>To comply with legal obligations</li>
-            <li>To protect rights, safety, or property</li>
-            <li>With service providers under strict confidentiality agreements</li>
-        </ul>
-        
-        <h2>6. Your Rights</h2>
+        <h2>5. Your Rights</h2>
         <p>You have the right to:</p>
         <ul>
             <li><strong>Access:</strong> Request a copy of your personal information</li>
@@ -619,17 +1430,8 @@ cat > "$WEB_ROOT/privacy.html" <<EOF
             <li><strong>Restriction:</strong> Limit how we process your data</li>
         </ul>
         
-        <h2>7. Data Retention</h2>
-        <p>We retain your information only as long as necessary to:</p>
-        <ul>
-            <li>Provide the services you've requested</li>
-            <li>Comply with legal obligations</li>
-            <li>Resolve disputes and enforce agreements</li>
-        </ul>
-        <p>You may request deletion of your data at any time.</p>
-        
-        <h2>8. Contact Us</h2>
-        <p>If you have questions about this Privacy Policy or our data practices, please contact us:</p>
+        <h2>6. Contact Us</h2>
+        <p>If you have questions about this Privacy Policy, please contact us:</p>
         <div class="highlight">
             <p><strong>Email:</strong> privacy@$DOMAIN_NAME</p>
             <p><strong>Website:</strong> <a href="/">$DOMAIN_NAME</a></p>
@@ -642,7 +1444,7 @@ cat > "$WEB_ROOT/privacy.html" <<EOF
 </html>
 EOF
 
-# Create Terms of Service
+# Create Terms of Service with color loading
 cat > "$WEB_ROOT/terms.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -651,17 +1453,19 @@ cat > "$WEB_ROOT/terms.html" <<EOF
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Terms of Service - $DOMAIN_NAME</title>
     <link rel="stylesheet" href="/css/style.css">
+    <script src="/js/colors.js"></script>
     <style>
         .content { max-width: 900px; margin: 40px auto; padding: 40px; }
         .back-link { 
             display: inline-block;
             margin-top: 40px;
             padding: 12px 30px;
-            background: #667eea;
+            background: var(--primary-color);
             color: white;
             text-decoration: none;
             border-radius: 50px;
         }
+        .back-link:hover { background: var(--secondary-color); }
     </style>
 </head>
 <body>
@@ -670,13 +1474,12 @@ cat > "$WEB_ROOT/terms.html" <<EOF
             <li><a href="/">Home</a></li>
             <li><a href="/privacy.html">Privacy Policy</a></li>
             <li><a href="/terms.html">Terms of Service</a></li>
-            <li><a href="/contact.html">Contact</a></li>
-            <li><a href="/unsubscribe">Unsubscribe</a></li>
+            <li><a href="/user-settings.html">User Settings</a></li>
         </ul>
     </nav>
     
     <div class="content">
-        <h1 style="color: #667eea;">Terms of Service</h1>
+        <h1 style="color: var(--primary-color);">Terms of Service</h1>
         <p>Last Updated: $CURRENT_DATE</p>
         
         <h2>1. Acceptance of Terms</h2>
@@ -686,134 +1489,21 @@ cat > "$WEB_ROOT/terms.html" <<EOF
         <p>Our email services are provided to subscribers who have explicitly opted in. You may unsubscribe at any time using the unsubscribe link in any email.</p>
         
         <h2>3. Anti-Spam Compliance</h2>
-        <p>We maintain strict compliance with CAN-SPAM Act, GDPR, and other international anti-spam regulations. We never:</p>
-        <ul>
-            <li>Send unsolicited commercial emails</li>
-            <li>Use deceptive subject lines or headers</li>
-            <li>Hide or obscure sender information</li>
-            <li>Sell or rent email addresses to third parties</li>
-        </ul>
+        <p>We maintain strict compliance with CAN-SPAM Act, GDPR, and other international anti-spam regulations.</p>
         
         <h2>4. User Responsibilities</h2>
-        <p>When subscribing to our services, you agree to:</p>
-        <ul>
-            <li>Provide accurate and current information</li>
-            <li>Maintain the security of your account credentials</li>
-            <li>Notify us of any unauthorized use</li>
-            <li>Use our services in compliance with all applicable laws</li>
-        </ul>
+        <p>When subscribing to our services, you agree to provide accurate information and use our services in compliance with all applicable laws.</p>
         
         <h2>5. Intellectual Property</h2>
         <p>All content provided through our email services is protected by copyright and other intellectual property laws.</p>
         
         <h2>6. Limitation of Liability</h2>
-        <p>Our services are provided "as is" without warranties of any kind. We are not liable for any indirect, incidental, or consequential damages.</p>
+        <p>Our services are provided "as is" without warranties of any kind.</p>
         
-        <h2>7. Modifications</h2>
-        <p>We reserve the right to modify these terms at any time. Continued use of our services constitutes acceptance of modified terms.</p>
-        
-        <h2>8. Contact Information</h2>
+        <h2>7. Contact Information</h2>
         <p>For questions about these Terms, contact us at:</p>
         <p><strong>Email:</strong> legal@$DOMAIN_NAME</p>
         <p><strong>Website:</strong> $DOMAIN_NAME</p>
-        
-        <a href="/" class="back-link">← Back to Home</a>
-    </div>
-</body>
-</html>
-EOF
-
-# Create Contact Page with placeholder for physical address
-cat > "$WEB_ROOT/contact.html" <<EOF
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Contact Us - $DOMAIN_NAME</title>
-    <link rel="stylesheet" href="/css/style.css">
-    <style>
-        .content { max-width: 900px; margin: 40px auto; padding: 40px; }
-        .contact-card {
-            background: #f8f9fa;
-            padding: 30px;
-            border-radius: 10px;
-            margin: 30px 0;
-        }
-        .address-box {
-            background: white;
-            border: 2px solid #667eea;
-            padding: 25px;
-            border-radius: 10px;
-            margin: 30px 0;
-        }
-        .important-notice {
-            background: #fff3cd;
-            border: 1px solid #ffc107;
-            color: #856404;
-            padding: 20px;
-            border-radius: 5px;
-            margin: 30px 0;
-        }
-        .back-link {
-            display: inline-block;
-            margin-top: 40px;
-            padding: 12px 30px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 50px;
-        }
-    </style>
-</head>
-<body>
-    <nav>
-        <ul>
-            <li><a href="/">Home</a></li>
-            <li><a href="/privacy.html">Privacy Policy</a></li>
-            <li><a href="/terms.html">Terms of Service</a></li>
-            <li><a href="/contact.html">Contact</a></li>
-            <li><a href="/unsubscribe">Unsubscribe</a></li>
-        </ul>
-    </nav>
-    
-    <div class="content">
-        <h1 style="color: #667eea;">Contact Us</h1>
-        
-        <div class="contact-card">
-            <h2>General Inquiries</h2>
-            <p><strong>Domain:</strong> $DOMAIN_NAME</p>
-            <p><strong>Email Server:</strong> $HOSTNAME</p>
-            <p><strong>Contact Email:</strong> contact@$DOMAIN_NAME</p>
-            <p><strong>Privacy Inquiries:</strong> privacy@$DOMAIN_NAME</p>
-            <p><strong>Abuse Reports:</strong> abuse@$DOMAIN_NAME</p>
-        </div>
-        
-        <div class="address-box">
-            <h2>Mailing Address</h2>
-            <p><strong>CAN-SPAM Compliance Physical Address:</strong></p>
-            <p>
-                [YOUR COMPANY NAME]<br>
-                [STREET ADDRESS]<br>
-                [CITY, STATE ZIP CODE]<br>
-                [COUNTRY]
-            </p>
-            <div class="important-notice">
-                <strong>⚠️ IMPORTANT:</strong> You must update this address with your actual physical mailing address to comply with CAN-SPAM Act requirements. Edit this file at: $WEB_ROOT/contact.html
-            </div>
-        </div>
-        
-        <div class="contact-card">
-            <h2>Technical Information</h2>
-            <p><strong>Mail Server:</strong> $HOSTNAME</p>
-            <p><strong>Server IP:</strong> $PRIMARY_IP</p>
-            <p><strong>Email Authentication:</strong></p>
-            <ul style="margin-left: 20px;">
-                <li>SPF: Enabled</li>
-                <li>DKIM: Enabled (Selector: mail, 1024-bit)</li>
-                <li>DMARC: Configured</li>
-            </ul>
-        </div>
         
         <a href="/" class="back-link">← Back to Home</a>
     </div>
@@ -825,7 +1515,9 @@ EOF
 cat > "$WEB_ROOT/robots.txt" <<EOF
 User-agent: *
 Allow: /
-Disallow: /unsubscribe
+Disallow: /api/
+Disallow: /data/
+Disallow: /user-settings.html
 Sitemap: https://$DOMAIN_NAME/sitemap.xml
 EOF
 
@@ -848,25 +1540,21 @@ cat > "$WEB_ROOT/sitemap.xml" <<EOF
         <lastmod>$(date +%Y-%m-%d)</lastmod>
         <priority>0.8</priority>
     </url>
-    <url>
-        <loc>https://$DOMAIN_NAME/contact.html</loc>
-        <lastmod>$(date +%Y-%m-%d)</lastmod>
-        <priority>0.8</priority>
-    </url>
 </urlset>
 EOF
 
 # Set permissions
 chown -R www-data:www-data "$WEB_ROOT" 2>/dev/null || chown -R nginx:nginx "$WEB_ROOT" 2>/dev/null
 chmod -R 755 "$WEB_ROOT"
+chmod 666 "$WEB_ROOT/data/colors.json"
 
-print_message "✓ Website files created"
+print_message "✓ Website files created with backend integration"
 
 # ===================================================================
-# 4. CONFIGURE NGINX - WITH SSL SUPPORT FOR ALL SUBDOMAINS
+# 6. CONFIGURE NGINX WITH PHP SUPPORT
 # ===================================================================
 
-print_header "Configuring Nginx"
+print_header "Configuring Nginx with PHP Support"
 
 # Stop nginx first to clean everything
 systemctl stop nginx 2>/dev/null
@@ -881,11 +1569,9 @@ rm -f /etc/nginx/sites-available/default 2>/dev/null
 
 # Fix nginx.conf to include sites-enabled
 if ! grep -q "include /etc/nginx/sites-enabled" /etc/nginx/nginx.conf; then
-    # Add include inside http block
     sed -i '/^http {/a\    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
 fi
 
-# Create COMPREHENSIVE nginx configuration
 # Build server_name list for nginx
 SERVER_NAMES="$DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
@@ -896,8 +1582,9 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     done
 fi
 
+# Create nginx configuration with PHP support
 cat > /etc/nginx/sites-available/${DOMAIN_NAME}.conf <<EOF
-# BULK EMAIL COMPLIANCE WEBSITE
+# BULK EMAIL COMPLIANCE WEBSITE WITH PHP BACKEND
 # Handles all domains and subdomains with SSL support
 
 # HTTP server block - redirects to HTTPS when certificate exists
@@ -909,7 +1596,7 @@ server {
     server_name $SERVER_NAMES _;
     
     root $WEB_ROOT;
-    index index.html index.htm;
+    index index.html index.htm index.php;
     
     # Character set
     charset utf-8;
@@ -930,18 +1617,26 @@ server {
         try_files \$uri \$uri/ /index.html;
     }
     
-    # Unsubscribe redirects
-    location /unsubscribe {
-        # UPDATE THIS WITH YOUR ACTUAL MAILWIZZ URL
-        return 302 https://your-mailwizz-domain.com/lists/unsubscribe;
+    # PHP processing for API
+    location ~ ^/api/.*\.php$ {
+        try_files \$uri =404;
+        fastcgi_pass unix:/var/run/php/php$PHP_VERSION-fpm.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+        
+        # PHP session handling
+        fastcgi_param PHP_VALUE "session.save_path=/var/lib/php/sessions
+                                 session.gc_maxlifetime=3600
+                                 session.cookie_httponly=On
+                                 session.cookie_secure=Off
+                                 session.use_only_cookies=On";
     }
     
-    location /unsub {
-        return 302 /unsubscribe;
-    }
-    
-    location /optout {
-        return 302 /unsubscribe;
+    # Protect data directory
+    location ~ ^/data/ {
+        deny all;
+        return 404;
     }
     
     # Static file caching
@@ -977,13 +1672,12 @@ server {
 }
 
 # HTTPS server block will be auto-configured by Certbot when certificate is obtained
-# Certbot will add SSL configuration here automatically
 EOF
 
 # Enable the site
 ln -sf /etc/nginx/sites-available/${DOMAIN_NAME}.conf /etc/nginx/sites-enabled/${DOMAIN_NAME}.conf
 
-# Create simple error pages if they don't exist
+# Create error pages if they don't exist
 if [ ! -f "$WEB_ROOT/404.html" ]; then
     cat > "$WEB_ROOT/404.html" <<EOF
 <!DOCTYPE html>
@@ -991,38 +1685,23 @@ if [ ! -f "$WEB_ROOT/404.html" ]; then
 <head>
     <title>404 - Page Not Found</title>
     <link rel="stylesheet" href="/css/style.css">
+    <script src="/js/colors.js"></script>
 </head>
 <body>
     <div style="text-align: center; padding: 100px 20px;">
-        <h1 style="color: #667eea; font-size: 72px;">404</h1>
+        <h1 style="color: var(--primary-color); font-size: 72px;">404</h1>
         <p style="font-size: 24px; margin: 20px 0;">Page Not Found</p>
         <p>The page you are looking for doesn't exist.</p>
-        <a href="/" style="display: inline-block; margin-top: 30px; padding: 15px 40px; background: #667eea; color: white; text-decoration: none; border-radius: 50px;">Go Home</a>
+        <a href="/" style="display: inline-block; margin-top: 30px; padding: 15px 40px; background: var(--primary-color); color: white; text-decoration: none; border-radius: 50px;">Go Home</a>
     </div>
 </body>
 </html>
 EOF
 fi
 
-if [ ! -f "$WEB_ROOT/50x.html" ]; then
-    cat > "$WEB_ROOT/50x.html" <<EOF
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Server Error</title>
-    <link rel="stylesheet" href="/css/style.css">
-</head>
-<body>
-    <div style="text-align: center; padding: 100px 20px;">
-        <h1 style="color: #dc3545; font-size: 72px;">500</h1>
-        <p style="font-size: 24px; margin: 20px 0;">Server Error</p>
-        <p>Something went wrong. Please try again later.</p>
-        <a href="/" style="display: inline-block; margin-top: 30px; padding: 15px 40px; background: #667eea; color: white; text-decoration: none; border-radius: 50px;">Go Home</a>
-    </div>
-</body>
-</html>
-EOF
-fi
+# Start PHP-FPM
+systemctl restart php$PHP_VERSION-fpm 2>/dev/null || systemctl restart php-fpm 2>/dev/null
+systemctl enable php$PHP_VERSION-fpm 2>/dev/null || systemctl enable php-fpm 2>/dev/null
 
 # Test nginx configuration
 echo -n "Testing Nginx configuration... "
@@ -1037,7 +1716,6 @@ if nginx -t 2>/dev/null; then
         print_message "✓ Nginx is running"
     else
         print_error "✗ Nginx failed to start"
-        # Show error
         journalctl -xe -u nginx --no-pager | tail -10
     fi
 else
@@ -1046,7 +1724,7 @@ else
 fi
 
 # ===================================================================
-# 5. ATTEMPT SSL CERTIFICATE SETUP FOR ALL DOMAINS
+# 7. ATTEMPT SSL CERTIFICATE SETUP FOR ALL DOMAINS
 # ===================================================================
 
 print_header "SSL Certificate Setup"
@@ -1087,9 +1765,6 @@ if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
         echo "  https://$DOMAIN_NAME"
         echo "  https://www.$DOMAIN_NAME"
         echo "  https://$HOSTNAME"
-        if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-            echo "  And all mail subdomains with HTTPS"
-        fi
     else
         print_warning "⚠ Could not get SSL certificate yet"
         echo "Certificate will be obtained automatically when DNS propagates"
@@ -1119,46 +1794,12 @@ else
 fi
 
 # ===================================================================
-# 6. CREATE REMINDER FILES
-# ===================================================================
-
-# Create a prominent reminder file
-cat > "$WEB_ROOT/IMPORTANT-UPDATE-ADDRESS.txt" <<EOF
-CRITICAL COMPLIANCE REQUIREMENT
-================================
-
-YOU MUST UPDATE THE PHYSICAL ADDRESS IN contact.html
-
-CAN-SPAM Act REQUIRES a valid physical postal address in all commercial emails.
-
-TO UPDATE:
-1. Edit: $WEB_ROOT/contact.html
-2. Find: [YOUR COMPANY NAME]
-3. Replace with your actual business address
-
-ACCEPTABLE ADDRESSES:
-- Your current street address
-- A post office box registered with USPS
-- A private mailbox registered with a commercial mail receiving agency
-
-This is a LEGAL REQUIREMENT for sending bulk email.
-
-ALSO UPDATE:
-1. Mailwizz unsubscribe URL in: /etc/nginx/sites-available/${DOMAIN_NAME}.conf
-2. Find: https://your-mailwizz-domain.com/lists/unsubscribe
-3. Replace with your actual Mailwizz URL
-4. Run: systemctl reload nginx
-
-Generated: $(date)
-EOF
-
-# ===================================================================
-# 7. VERIFY WEBSITE IS WORKING
+# 8. VERIFY WEBSITE IS WORKING
 # ===================================================================
 
 print_header "Verifying Website"
 
-# Wait a moment for nginx to fully start
+# Wait a moment for services to fully start
 sleep 2
 
 # Test local access
@@ -1169,29 +1810,16 @@ if [ "$HTTP_CODE" == "200" ]; then
     print_message "✓ Website is responding (HTTP $HTTP_CODE)"
 elif [ "$HTTP_CODE" == "000" ]; then
     print_error "✗ Website not responding (connection failed)"
-    
-    # Debug
-    echo "Debugging:"
-    echo -n "  Nginx status: "
-    systemctl is-active nginx
-    echo -n "  Port 80: "
-    netstat -lnp 2>/dev/null | grep -q ":80" && echo "listening" || echo "not listening"
-    echo "  Check logs: tail /var/log/nginx/error.log"
 else
     print_warning "⚠ Website returned HTTP $HTTP_CODE"
 fi
 
-# Test with domain if DNS is working
-echo -n "Testing with domain name... "
-if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN_NAME" --connect-timeout 5 2>/dev/null || echo "000")
-    if [ "$HTTP_CODE" == "200" ]; then
-        print_message "✓ http://$DOMAIN_NAME is working"
-    else
-        print_warning "⚠ Domain not accessible yet (DNS may be propagating)"
-    fi
+# Test PHP functionality
+echo -n "Testing PHP backend... "
+if curl -s "http://localhost/api/colors.php" | grep -q "primary"; then
+    print_message "✓ PHP backend is working"
 else
-    print_warning "⚠ DNS not configured yet"
+    print_warning "⚠ PHP backend may not be working correctly"
 fi
 
 # ===================================================================
@@ -1202,9 +1830,11 @@ print_header "Website Setup Complete!"
 
 echo ""
 echo "✅ Website created at: $WEB_ROOT"
-echo "✅ Nginx configured and running"
-echo "✅ Compliance pages created"
-echo "✅ Modern responsive design implemented"
+echo "✅ Nginx configured with PHP support"
+echo "✅ Backend API integrated with mail database"
+echo "✅ User authentication system active"
+echo "✅ Password change functionality enabled"
+echo "✅ Global color customization system active"
 echo "✅ SSL configuration for ALL domains: $SSL_DOMAINS"
 echo ""
 
@@ -1222,38 +1852,41 @@ if systemctl is-active --quiet nginx; then
         echo "  https://$DOMAIN_NAME"
         echo "  https://www.$DOMAIN_NAME"
         echo "  https://$HOSTNAME"
-        if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-            for i in {1..9}; do
-                if [ $i -lt ${#IP_ADDRESSES[@]} ]; then
-                    echo "  https://${MAIL_PREFIX}${i}.$DOMAIN_NAME"
-                fi
-            done
-        fi
     else
         echo "  SSL: Pending (will auto-retry every 15 minutes)"
     fi
     echo ""
 fi
 
-print_warning "⚠️ REQUIRED ACTIONS:"
+echo "FEATURES AVAILABLE:"
+echo "  ✓ User Login: Email users can login with their credentials"
+echo "  ✓ Password Change: Users can change their email passwords"
+echo "  ✓ Global Colors: Logged-in users can change site colors for ALL visitors"
+echo "  ✓ Session Management: Secure PHP sessions for authenticated users"
 echo ""
-echo "1. UPDATE YOUR PHYSICAL ADDRESS (LEGALLY REQUIRED):"
-echo "   nano $WEB_ROOT/contact.html"
-echo "   Find: [YOUR COMPANY NAME]"
-echo "   Replace with your actual physical address"
+
+echo "PAGES AVAILABLE:"
+echo "  Home: /"
+echo "  Privacy Policy: /privacy.html"
+echo "  Terms of Service: /terms.html"
+echo "  User Settings: /user-settings.html"
 echo ""
-echo "2. UPDATE MAILWIZZ UNSUBSCRIBE URL:"
-echo "   nano /etc/nginx/sites-available/${DOMAIN_NAME}.conf"
-echo "   Find: https://your-mailwizz-domain.com/lists/unsubscribe"
-echo "   Replace with your actual Mailwizz URL"
-echo "   Then run: systemctl reload nginx"
+
+echo "API ENDPOINTS:"
+echo "  /api/auth.php - User authentication"
+echo "  /api/change-password.php - Password changes"
+echo "  /api/colors.php - Global color management"
+echo "  /api/session.php - Session status"
+echo "  /api/logout.php - User logout"
 echo ""
+
 if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
-    echo "3. SSL CERTIFICATE (after DNS propagates):"
-    echo "   Will auto-retry every 15 minutes, or run manually:"
-    echo "   certbot --nginx $CERT_ARGS"
+    echo "SSL CERTIFICATE (after DNS propagates):"
+    echo "  Will auto-retry every 15 minutes, or run manually:"
+    echo "  certbot --nginx $CERT_ARGS"
     echo ""
 fi
 
-print_message "✓ Website setup completed successfully!"
-print_message "✓ SSL configured for ALL subdomains!"
+print_message "✓ Website setup completed with full backend integration!"
+print_message "✓ Email users can now login and manage their passwords!"
+print_message "✓ Site colors are saved globally for all visitors!"
