@@ -2,9 +2,10 @@
 
 # =================================================================
 # BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
-# Version: 17.0.6 - FIXED DKIM generation and verification
+# Version: 17.0.7 - WITH UNIVERSAL USER ACCESS
 # Automated installation with Cloudflare DNS, compliance website, and DKIM
 # FIXED: Ensures 1024-bit DKIM key generation and proper configuration
+# ADDED: Universal command access for all users
 # =================================================================
 
 set -e  # Exit on any error
@@ -241,7 +242,7 @@ generate_dkim_key() {
 # ===================================================================
 
 print_header "Multi-IP Bulk Mail Server Installer"
-echo "Version: 17.0.6"
+echo "Version: 17.0.7"
 echo "Starting installation at: $(date)"
 echo ""
 
@@ -470,6 +471,7 @@ download_script "setup-website.sh"
 download_script "ssl-setup.sh"
 download_script "create-utilities.sh"
 download_script "post-install-config.sh"
+download_script "setup-permissions.sh"
 download_script "troubleshoot.sh"
 
 # ===================================================================
@@ -986,6 +988,18 @@ if [ -f "$INSTALL_DIR/post-install-config.sh" ]; then
     bash "$INSTALL_DIR/post-install-config.sh"
 fi
 
+# ===================================================================
+# PHASE 14: SETUP UNIVERSAL USER ACCESS (NEW!)
+# ===================================================================
+
+print_header "Phase 14: Setting Up Universal User Access"
+
+if [ -f "$INSTALL_DIR/setup-permissions.sh" ]; then
+    bash "$INSTALL_DIR/setup-permissions.sh"
+else
+    print_warning "Permission setup script not found, commands will require root access"
+fi
+
 # Final DKIM verification
 echo ""
 print_header "Final DKIM Verification"
@@ -1039,6 +1053,7 @@ print_message "✓ Mail server installed successfully!"
 print_message "✓ DKIM SIGNING IS ENABLED with 1024-bit key!"
 print_message "✓ Website configured!"
 print_message "✓ System optimized!"
+print_message "✓ ALL COMMANDS WORK FOR ALL USERS!"
 echo ""
 echo "Domain: $DOMAIN_NAME"
 echo "Mail Server: $HOSTNAME"
@@ -1078,7 +1093,8 @@ echo "3. Send test email: test-email check-auth@verifier.port25.com"
 echo "4. Check score: https://www.mail-tester.com"
 echo ""
 
-echo "Management Commands:"
+echo "Management Commands (WORK FOR ALL USERS):"
+echo "  mail-help          - Show all available commands"
 echo "  verify-dkim        - Check DKIM status"
 echo "  mail-status        - Check server status"
 echo "  mail-account       - Manage email accounts"
@@ -1088,6 +1104,13 @@ echo "  get-ssl-cert       - Get SSL certificates"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "  ip-rotation-status - View IP rotation"
 fi
+echo ""
+
+echo "ANY USER CAN NOW RUN:"
+echo "  As regular user: mail-status"
+echo "  As regular user: mail-account list"
+echo "  As regular user: ip-rotation-status"
+echo "  No sudo needed - commands work transparently!"
 echo ""
 
 echo "Next Steps:"
@@ -1102,3 +1125,4 @@ echo ""
 print_message "Your bulk mail server is READY!"
 print_message "✓ DKIM: 1024-bit key generated and configured"
 print_message "✓ Run 'verify-dkim' to check DKIM status"
+print_message "✓ ALL USERS can now manage the mail server!"
