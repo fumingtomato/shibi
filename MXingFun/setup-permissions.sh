@@ -139,13 +139,25 @@ esac
 if [ -f "$ACTUAL_COMMAND" ]; then
     bash "$ACTUAL_COMMAND" "$@"
 else
-    # Fallback to original command if wrapper not set up
-    ORIGINAL="/usr/local/bin/${COMMAND_NAME}-original"
-    if [ -f "$ORIGINAL" ]; then
-        bash "$ORIGINAL" "$@"
-    else
-        echo "Error: Command not found: $COMMAND_NAME"
+    # Check if it's a command that only exists with certain configurations
+    if [ "$COMMAND_NAME" == "ip-rotation-status" ]; then
+        echo "Error: IP rotation is not configured (single IP setup)"
+        echo "This command is only available when multiple IPs are configured"
         exit 1
+    elif [ "$COMMAND_NAME" == "assign-ip" ]; then
+        echo "Error: IP assignment is not configured (single IP setup)"
+        echo "This command is only available when multiple IPs are configured"
+        exit 1
+    else
+        # Fallback to original command if wrapper not set up
+        ORIGINAL="/usr/local/bin/${COMMAND_NAME}-original"
+        if [ -f "$ORIGINAL" ]; then
+            bash "$ORIGINAL" "$@"
+        else
+            echo "Error: Command not found: $COMMAND_NAME"
+            echo "This command may not be installed or configured"
+            exit 1
+        fi
     fi
 fi
 WRAPPER
@@ -171,6 +183,7 @@ COMMANDS=(
     "mailwizz-info"
     "ip-rotation-status"
     "verify-dns"
+    "verify-dkim"
     "get-ssl-cert"
     "assign-ip"
 )
@@ -179,16 +192,35 @@ for cmd in "${COMMANDS[@]}"; do
     if [ -f "/usr/local/bin/$cmd" ]; then
         echo -n "  Wrapping $cmd... "
         
-        # Move original command
-        mv "/usr/local/bin/$cmd" "/usr/local/bin/.${cmd}-real" 2>/dev/null
+        # Check if already wrapped
+        if [ -L "/usr/local/bin/$cmd" ] && [ -f "/usr/local/bin/.${cmd}-real" ]; then
+            echo "already wrapped ✓"
+            continue
+        fi
         
-        # Create symlink to wrapper
-        ln -sf /usr/local/bin/mail-wrapper "/usr/local/bin/$cmd"
-        
-        # Make the real command accessible
-        chmod 755 "/usr/local/bin/.${cmd}-real" 2>/dev/null
-        
-        print_message "✓"
+        # Move original command only if it's not already a symlink
+        if [ ! -L "/usr/local/bin/$cmd" ]; then
+            mv "/usr/local/bin/$cmd" "/usr/local/bin/.${cmd}-real" 2>/dev/null
+            
+            # Create symlink to wrapper
+            ln -sf /usr/local/bin/mail-wrapper "/usr/local/bin/$cmd"
+            
+            # Make the real command accessible
+            chmod 755 "/usr/local/bin/.${cmd}-real" 2>/dev/null
+            
+            print_message "✓"
+        else
+            print_warning "skipped (already a symlink)"
+        fi
+    else
+        # Command doesn't exist - don't create wrapper
+        if [ "$cmd" == "ip-rotation-status" ]; then
+            # This is expected if only single IP configured
+            continue
+        else
+            # For other commands, note if missing
+            echo "  $cmd not found (skipping)"
+        fi
     fi
 done
 
@@ -365,7 +397,7 @@ echo "Users can now run:"
 echo "  mail-help          - Show all available commands"
 echo "  mail-status        - Check server status"
 echo "  mail-account list  - List email accounts"
-echo "  ip-rotation-status - Check IP rotation"
+echo "  ip-rotation-status - Check IP rotation (if configured)"
 echo ""
 echo "No 'sudo' prefix needed - commands work for everyone!"
 echo ""
