@@ -2,7 +2,7 @@
 
 # =================================================================
 # DATABASE SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.4 - FIXED with 1024-bit DKIM key generation
+# Version: 17.1.0 - Fixed with advanced IP rotation tables
 # Sets up MySQL/MariaDB with virtual users automatically
 # Creates first email account from configuration
 # =================================================================
@@ -58,12 +58,17 @@ if [ -z "$DOMAIN_NAME" ]; then
         exit 1
     fi
 else
-    # Use configured hostname with subdomain
-    HOSTNAME=${HOSTNAME:-"$MAIL_SUBDOMAIN.$DOMAIN_NAME"}
+    # FIX: Use configured hostname with custom subdomain
+    if [ ! -z "$MAIL_SUBDOMAIN" ]; then
+        HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
+    else
+        HOSTNAME=${HOSTNAME:-"mail.$DOMAIN_NAME"}
+    fi
 fi
 
 echo "Domain: $DOMAIN_NAME"
 echo "Hostname: $HOSTNAME"
+echo "Mail Subdomain: ${MAIL_SUBDOMAIN:-mail}"
 if [ ! -z "$FIRST_EMAIL" ]; then
     echo "First email account: $FIRST_EMAIL"
 fi
@@ -270,7 +275,7 @@ EOF
     fi
 fi
 
-# Create tables with properly terminated heredoc - FIXED
+# FIX 5: Create tables with advanced IP rotation support
 { mysql -u mailuser -p"$DB_PASS" -h localhost mailserver 2>/dev/null || mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver 2>/dev/null; } <<'EOF_SQLTABLES'
 -- Create domains table
 CREATE TABLE IF NOT EXISTS virtual_domains (
@@ -308,7 +313,45 @@ CREATE TABLE IF NOT EXISTS virtual_aliases (
     FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Create IP rotation tracking table (NEW)
+-- FIX 5: Advanced IP rotation table for bulk mailing
+CREATE TABLE IF NOT EXISTS ip_rotation_advanced (
+    id INT NOT NULL AUTO_INCREMENT,
+    sender_email VARCHAR(255) NOT NULL,
+    assigned_ip VARCHAR(45),
+    transport_id INT,
+    message_count BIGINT DEFAULT 0,
+    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    rotation_mode ENUM('sticky', 'round-robin', 'least-used') DEFAULT 'sticky',
+    max_messages_per_day INT DEFAULT 1000,
+    messages_today INT DEFAULT 0,
+    last_reset DATE,
+    PRIMARY KEY (id),
+    UNIQUE KEY sender_unique (sender_email),
+    INDEX idx_sender (sender_email),
+    INDEX idx_ip (assigned_ip),
+    INDEX idx_last_used (last_used)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- FIX 5: IP pool management table
+CREATE TABLE IF NOT EXISTS ip_pool (
+    ip_address VARCHAR(45) NOT NULL,
+    ip_index INT NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    reputation_score INT DEFAULT 100,
+    messages_sent_today INT DEFAULT 0,
+    messages_sent_total BIGINT DEFAULT 0,
+    last_used TIMESTAMP NULL DEFAULT NULL,
+    max_daily_limit INT DEFAULT 5000,
+    last_reset DATE,
+    hostname VARCHAR(255),
+    notes TEXT,
+    PRIMARY KEY (ip_address),
+    INDEX idx_active (is_active),
+    INDEX idx_reputation (reputation_score),
+    INDEX idx_index (ip_index)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Legacy IP rotation table for backward compatibility
 CREATE TABLE IF NOT EXISTS ip_rotation_log (
     id INT NOT NULL AUTO_INCREMENT,
     sender_email VARCHAR(255) NOT NULL,
@@ -318,13 +361,71 @@ CREATE TABLE IF NOT EXISTS ip_rotation_log (
     message_count INT DEFAULT 1,
     PRIMARY KEY (id),
     UNIQUE KEY sender_unique (sender_email),
-    INDEX idx_last_used (last_used)
+    INDEX idx_last_used (last_used),
+    INDEX idx_sender (sender_email)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Add indexes for performance
 CREATE INDEX IF NOT EXISTS idx_email ON virtual_users(email);
 CREATE INDEX IF NOT EXISTS idx_domain ON virtual_domains(name);
-CREATE INDEX IF NOT EXISTS idx_sender ON ip_rotation_log(sender_email);
+
+-- Create stored procedure for IP assignment
+DELIMITER $$
+CREATE PROCEDURE IF NOT EXISTS assign_ip_to_sender(
+    IN p_sender_email VARCHAR(255),
+    IN p_mode VARCHAR(20)
+)
+BEGIN
+    DECLARE v_ip VARCHAR(45);
+    DECLARE v_transport_id INT;
+    
+    -- Get IP based on mode
+    IF p_mode = 'least-used' THEN
+        SELECT ip_address, ip_index INTO v_ip, v_transport_id
+        FROM ip_pool 
+        WHERE is_active = 1 
+        ORDER BY messages_sent_today ASC, last_used ASC
+        LIMIT 1;
+    ELSEIF p_mode = 'round-robin' THEN
+        SELECT ip_address, ip_index INTO v_ip, v_transport_id
+        FROM ip_pool 
+        WHERE is_active = 1 
+        ORDER BY last_used ASC
+        LIMIT 1;
+    ELSE -- sticky mode
+        -- Check if already assigned
+        SELECT assigned_ip, transport_id INTO v_ip, v_transport_id
+        FROM ip_rotation_advanced
+        WHERE sender_email = p_sender_email;
+        
+        IF v_ip IS NULL THEN
+            -- Assign new IP
+            SELECT ip_address, ip_index INTO v_ip, v_transport_id
+            FROM ip_pool 
+            WHERE is_active = 1 
+            ORDER BY messages_sent_today ASC
+            LIMIT 1;
+        END IF;
+    END IF;
+    
+    -- Update or insert assignment
+    INSERT INTO ip_rotation_advanced 
+        (sender_email, assigned_ip, transport_id, rotation_mode)
+    VALUES 
+        (p_sender_email, v_ip, v_transport_id, p_mode)
+    ON DUPLICATE KEY UPDATE 
+        assigned_ip = v_ip, 
+        transport_id = v_transport_id,
+        rotation_mode = p_mode;
+    
+    -- Update IP pool
+    UPDATE ip_pool 
+    SET last_used = NOW() 
+    WHERE ip_address = v_ip;
+    
+    SELECT v_ip AS assigned_ip, v_transport_id AS transport_id;
+END$$
+DELIMITER ;
 EOF_SQLTABLES
 
 # Verify tables were created
@@ -356,7 +457,36 @@ else
 fi
 
 # ===================================================================
-# 5. CREATE FIRST EMAIL ACCOUNT (AUTOMATIC)
+# 5. POPULATE IP POOL
+# ===================================================================
+
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    echo "Populating IP pool with ${#IP_ADDRESSES[@]} addresses..."
+    
+    for i in "${!IP_ADDRESSES[@]}"; do
+        IP="${IP_ADDRESSES[$i]}"
+        # FIX: Generate proper hostname for each IP using configured subdomain
+        if [ $i -eq 0 ]; then
+            IP_HOSTNAME="$HOSTNAME"
+        else
+            IP_HOSTNAME="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+        fi
+        
+        { mysql -u mailuser -p"$DB_PASS" -h localhost mailserver 2>/dev/null || \
+          mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver 2>/dev/null || true; } <<ADDIP
+INSERT INTO ip_pool (ip_address, ip_index, hostname, is_active, max_daily_limit)
+VALUES ('$IP', $i, '$IP_HOSTNAME', 1, 5000)
+ON DUPLICATE KEY UPDATE 
+    ip_index = $i,
+    hostname = '$IP_HOSTNAME';
+ADDIP
+    done
+    
+    print_message "✓ IP pool populated"
+fi
+
+# ===================================================================
+# 6. CREATE FIRST EMAIL ACCOUNT (AUTOMATIC)
 # ===================================================================
 
 if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
@@ -432,7 +562,7 @@ else
 fi
 
 # ===================================================================
-# 6. CONFIGURE POSTFIX
+# 7. CONFIGURE POSTFIX
 # ===================================================================
 
 print_header "Configuring Postfix for Virtual Users"
@@ -469,13 +599,25 @@ VALIAS
 
 # Virtual email to transport lookup (for IP rotation)
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    # FIX: Use advanced rotation table
     cat > /etc/postfix/mysql/sender_transport.cf <<STRANSPORT
 user = mailuser
 password = $DB_PASS
 hosts = 127.0.0.1
 dbname = mailserver
-query = SELECT CONCAT('smtp-ip', transport_id, ':') FROM ip_rotation_log WHERE sender_email='%s'
+query = SELECT CONCAT('smtp-ip', transport_id, ':') FROM ip_rotation_advanced WHERE sender_email='%s'
 STRANSPORT
+
+    # Create sender-specific transport lookup
+    cat > /etc/postfix/sender_transports <<EOF
+# Sender transport mappings - managed by bulk-ip-manage
+# Format: sender@domain transport:
+# This file is updated automatically by bulk-ip-manage command
+EOF
+    postmap /etc/postfix/sender_transports
+    
+    # Configure Postfix for sender-dependent transport
+    postconf -e "sender_dependent_default_transport_maps = hash:/etc/postfix/sender_transports, mysql:/etc/postfix/mysql/sender_transport.cf"
 fi
 
 # Set permissions
@@ -495,15 +637,10 @@ postconf -e "smtpd_sasl_path = private/auth"
 postconf -e "smtpd_sasl_auth_enable = yes"
 postconf -e "smtpd_recipient_restrictions = permit_sasl_authenticated,permit_mynetworks,reject_unauth_destination"
 
-# If multiple IPs, add sender transport lookup
-if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    postconf -e "sender_dependent_default_transport_maps = mysql:/etc/postfix/mysql/sender_transport.cf"
-fi
-
 print_message "✓ Postfix configured for virtual users"
 
 # ===================================================================
-# 7. CONFIGURE DOVECOT
+# 8. CONFIGURE DOVECOT
 # ===================================================================
 
 print_header "Configuring Dovecot"
@@ -626,7 +763,7 @@ chown root:root /etc/dovecot/dovecot-sql.conf.ext
 print_message "✓ Dovecot configured"
 
 # ===================================================================
-# 8. REGENERATE DKIM KEY AS 1024-BIT (CRITICAL)
+# 9. REGENERATE DKIM KEY AS 1024-BIT (CRITICAL)
 # ===================================================================
 
 print_header "Ensuring 1024-bit DKIM Key"
@@ -729,6 +866,12 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     for ip in "${IP_ADDRESSES[@]}"; do
         echo "$ip" >> /etc/opendkim/TrustedHosts
     done
+    # FIX: Add hostnames for additional IPs
+    for i in "${!IP_ADDRESSES[@]}"; do
+        if [ $i -ne 0 ]; then
+            echo "${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
+        fi
+    done
 fi
 
 # Fix SigningTable to be comprehensive
@@ -760,11 +903,12 @@ sleep 2
 print_message "✓ OpenDKIM configured for SIGNING with 1024-bit key"
 
 # ===================================================================
-# 9. CREATE DATABASE MANAGEMENT SCRIPT
+# 10. CREATE DATABASE MANAGEMENT SCRIPT
 # ===================================================================
 
 echo "Creating database management utility..."
 
+# FIX: Enhanced maildb script with IP rotation support
 cat > /usr/local/bin/maildb <<'MAILDBSCRIPT'
 #!/bin/bash
 
@@ -790,7 +934,9 @@ case "$1" in
             (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
             (SELECT COUNT(*) FROM virtual_users) as 'Users',
             (SELECT COUNT(*) FROM virtual_users WHERE active=1) as 'Active Users',
-            (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';"
+            (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases',
+            (SELECT COUNT(*) FROM ip_pool) as 'IP Addresses',
+            (SELECT COUNT(*) FROM ip_rotation_advanced) as 'IP Assignments';"
         ;;
         
     users)
@@ -812,16 +958,32 @@ case "$1" in
         ;;
         
     ip-stats)
-        echo "IP Rotation Statistics:"
+        echo "IP Pool Statistics:"
         $MYSQL_CMD -e "
         SELECT 
-            assigned_ip as 'IP Address',
-            COUNT(*) as 'Senders',
-            SUM(message_count) as 'Total Messages',
-            MAX(last_used) as 'Last Used'
-        FROM ip_rotation_log 
-        GROUP BY assigned_ip
-        ORDER BY assigned_ip;"
+            ip_address as 'IP Address',
+            hostname as 'Hostname',
+            CASE is_active WHEN 1 THEN 'Active' ELSE 'Inactive' END as 'Status',
+            reputation_score as 'Reputation',
+            messages_sent_today as 'Today',
+            messages_sent_total as 'Total',
+            last_used as 'Last Used'
+        FROM ip_pool 
+        ORDER BY ip_index;"
+        ;;
+        
+    ip-assignments)
+        echo "Current IP Assignments:"
+        $MYSQL_CMD -e "
+        SELECT 
+            sender_email as 'Sender',
+            assigned_ip as 'IP',
+            rotation_mode as 'Mode',
+            message_count as 'Messages',
+            messages_today as 'Today',
+            last_used as 'Last Used'
+        FROM ip_rotation_advanced
+        ORDER BY last_used DESC;"
         ;;
         
     backup)
@@ -833,14 +995,15 @@ case "$1" in
         
     *)
         echo "Mail Database Manager"
-        echo "Usage: maildb {stats|users|domains|ip-stats|backup}"
+        echo "Usage: maildb {stats|users|domains|ip-stats|ip-assignments|backup}"
         echo ""
         echo "Commands:"
-        echo "  stats    - Show database statistics"
-        echo "  users    - List all email users"
-        echo "  domains  - List all domains"
-        echo "  ip-stats - Show IP rotation statistics"
-        echo "  backup   - Backup database"
+        echo "  stats           - Show database statistics"
+        echo "  users           - List all email users"
+        echo "  domains         - List all domains"
+        echo "  ip-stats        - Show IP pool statistics"
+        echo "  ip-assignments  - Show current IP assignments"
+        echo "  backup          - Backup database"
         ;;
 esac
 MAILDBSCRIPT
@@ -848,7 +1011,7 @@ MAILDBSCRIPT
 chmod +x /usr/local/bin/maildb
 
 # ===================================================================
-# 10. RESTART SERVICES
+# 11. RESTART SERVICES
 # ===================================================================
 
 print_header "Restarting Services"
@@ -863,7 +1026,7 @@ echo -n "Restarting OpenDKIM... "
 systemctl restart opendkim 2>/dev/null && echo "✓" || echo "✗"
 
 # ===================================================================
-# 11. TEST DATABASE CONNECTION
+# 12. TEST DATABASE CONNECTION
 # ===================================================================
 
 echo ""
@@ -884,12 +1047,14 @@ mysql -u mailuser -p"$DB_PASS" -h localhost mailserver -e "
 SELECT 
     (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
     (SELECT COUNT(*) FROM virtual_users) as 'Users',
-    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null || \
+    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases',
+    (SELECT COUNT(*) FROM ip_pool) as 'IPs';" 2>/dev/null || \
 mysql -u mailuser -p"$DB_PASS" -h 127.0.0.1 mailserver -e "
 SELECT 
     (SELECT COUNT(*) FROM virtual_domains) as 'Domains',
     (SELECT COUNT(*) FROM virtual_users) as 'Users',
-    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases';" 2>/dev/null || \
+    (SELECT COUNT(*) FROM virtual_aliases) as 'Aliases',
+    (SELECT COUNT(*) FROM ip_pool) as 'IPs';" 2>/dev/null || \
 echo "No statistics available yet"
 
 # ===================================================================
@@ -904,11 +1069,14 @@ echo "✓ Database created: mailserver"
 echo "✓ Database user: mailuser"
 echo "✓ Password saved in: /root/.mail_db_password"
 echo "✓ OpenDKIM configured for SIGNING with 1024-bit key"
+echo "✓ Mail subdomain: $MAIL_SUBDOMAIN"
+echo "✓ Hostname: $HOSTNAME"
 if [ ! -z "$FIRST_EMAIL" ]; then
     echo "✓ First account: $FIRST_EMAIL"
 fi
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "✓ IP rotation tracking table created"
+    echo "✓ IP rotation tracking tables created"
+    echo "✓ IP pool populated with ${#IP_ADDRESSES[@]} addresses"
 fi
 echo ""
 echo "DKIM KEY STATUS:"
@@ -921,13 +1089,15 @@ if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
 fi
 echo ""
 echo "Database management commands:"
-echo "  maildb stats    - Show statistics"
-echo "  maildb users    - List users"
-echo "  maildb domains  - List domains"
+echo "  maildb stats            - Show statistics"
+echo "  maildb users            - List users"
+echo "  maildb domains          - List domains"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "  maildb ip-stats - Show IP rotation statistics"
+    echo "  maildb ip-stats         - Show IP pool statistics"
+    echo "  maildb ip-assignments   - Show IP assignments"
+    echo "  bulk-ip-manage          - Manage IP rotation"
 fi
-echo "  maildb backup   - Backup database"
+echo "  maildb backup           - Backup database"
 echo ""
 echo "Email account management:"
 echo "  mail-account add user@domain.com password"
@@ -943,4 +1113,4 @@ if [ ! -z "$FIRST_EMAIL" ]; then
     echo "  Ports: 587 (SMTP), 993 (IMAP)"
 fi
 
-print_message "✓ Database setup completed with 1024-bit DKIM key!"
+print_message "✓ Database setup completed with advanced IP rotation support!"
