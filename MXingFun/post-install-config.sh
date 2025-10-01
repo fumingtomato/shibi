@@ -251,14 +251,12 @@ fi
 # Setup KeyTable
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 
-# Setup comprehensive SigningTable
-cat > /etc/opendkim/SigningTable <<EOF
-*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
-*@$HOSTNAME mail._domainkey.$DOMAIN_NAME
-$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
-*@localhost mail._domainkey.$DOMAIN_NAME
-*@localhost.localdomain mail._domainkey.$DOMAIN_NAME
-EOF
+# Setup comprehensive SigningTable using the reliable wildcard method.
+# We use 'echo' to ensure the file contains only this single, powerful rule.
+echo "* mail._domainkey" > /etc/opendkim/SigningTable
+
+# Also fix the KeyTable to use the wildcard pattern.
+echo "* *:%d:/etc/opendkim/keys/%d/mail.private" > /etc/opendkim/KeyTable
 
 # Set proper permissions
 chown -R opendkim:opendkim /etc/opendkim
