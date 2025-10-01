@@ -988,5 +988,3 @@ fi
 echo ""
 print_warning "REMINDER: Update physical address in /var/www/$DOMAIN_NAME/contact.html"
 print_warning "REMINDER: Update Mailwizz URL in /etc/nginx/sites-available/$DOMAIN_NAME.conf"
-
-
