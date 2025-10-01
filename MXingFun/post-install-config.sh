@@ -265,8 +265,23 @@ chown -R opendkim:opendkim /etc/opendkim
 chmod 644 /etc/opendkim/TrustedHosts
 chmod 644 /etc/opendkim/KeyTable
 chmod 644 /etc/opendkim/SigningTable
-# CRITICAL FIX: Ensure the private key is NOT world-readable
-chmod 600 /etc/opendkim/keys/$DOMAIN_NAME/mail.private
+
+# --- START OF THE DEFINITIVE FIX ---
+# SECURE THE KEY DIRECTORY AND THE PRIVATE KEY ITSELF
+# This prevents the "key not secure" error by securing the entire path.
+if [ ! -z "$DOMAIN_NAME" ] && [ -d "/etc/opendkim/keys/$DOMAIN_NAME" ]; then
+    # Set secure permissions on the parent directory
+    # Owner (opendkim) can read/write/execute, Group (opendkim) can read/execute. Others have NO access.
+    chmod 750 /etc/opendkim/keys/$DOMAIN_NAME
+
+    # Set strict permissions on the private key file
+    # Owner (opendkim) can read/write. Group and Others have NO access.
+    chmod 600 /etc/opendkim/keys/$DOMAIN_NAME/mail.private
+
+    # Ensure the public key remains readable
+    chmod 644 /etc/opendkim/keys/$DOMAIN_NAME/mail.txt
+fi
+# --- END OF THE DEFINITIVE FIX ---
 
 # Configure Postfix to use OpenDKIM
 postconf -e "milter_protocol = 6"
