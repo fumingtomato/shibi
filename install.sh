@@ -567,6 +567,11 @@ print_message "✓ All packages installed"
 # DATABASE SETUP
 # ===================================================================
 
+#!/bin/bash
+
+# Fix for install.sh - Database Setup Section
+# Replace the problematic MySQL security section with this:
+
 print_header "Database Configuration"
 
 # Start MariaDB
@@ -582,19 +587,38 @@ echo "$DB_ROOT_PASSWORD" > /root/.db_root_password
 echo "$DB_MAIL_PASSWORD" > /root/.mail_db_password
 chmod 600 /root/.db_root_password /root/.mail_db_password
 
-# Secure MariaDB installation
-mysql -e "UPDATE mysql.user SET Password=PASSWORD('$DB_ROOT_PASSWORD') WHERE User='root'"
-mysql -e "DELETE FROM mysql.user WHERE User=''"
-mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1')"
-mysql -e "DROP DATABASE IF EXISTS test"
-mysql -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'"
-mysql -e "FLUSH PRIVILEGES"
+# FIX: Use ALTER USER for newer MariaDB versions
+mysql <<EOF
+-- Set root password using modern syntax
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$DB_ROOT_PASSWORD';
+ALTER USER 'root'@'127.0.0.1' IDENTIFIED BY '$DB_ROOT_PASSWORD';
+ALTER USER 'root'@'::1' IDENTIFIED BY '$DB_ROOT_PASSWORD';
 
-# Create mail database and user
+-- Remove anonymous users
+DELETE FROM mysql.user WHERE User='';
+
+-- Remove remote root access
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+
+-- Remove test database
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+
+-- Flush privileges
+FLUSH PRIVILEGES;
+EOF
+
+# Create mail database and user with modern syntax
 mysql -u root -p"$DB_ROOT_PASSWORD" <<EOF
 CREATE DATABASE IF NOT EXISTS mailserver CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost' IDENTIFIED BY '$DB_MAIL_PASSWORD';
-GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_MAIL_PASSWORD';
+
+-- Create user with modern syntax
+CREATE USER IF NOT EXISTS 'mailuser'@'localhost' IDENTIFIED BY '$DB_MAIL_PASSWORD';
+CREATE USER IF NOT EXISTS 'mailuser'@'127.0.0.1' IDENTIFIED BY '$DB_MAIL_PASSWORD';
+
+-- Grant privileges
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'localhost';
+GRANT ALL PRIVILEGES ON mailserver.* TO 'mailuser'@'127.0.0.1';
 FLUSH PRIVILEGES;
 EOF
 
