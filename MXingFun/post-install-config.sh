@@ -265,6 +265,8 @@ chown -R opendkim:opendkim /etc/opendkim
 chmod 644 /etc/opendkim/TrustedHosts
 chmod 644 /etc/opendkim/KeyTable
 chmod 644 /etc/opendkim/SigningTable
+# CRITICAL FIX: Ensure the private key is NOT world-readable
+chmod 600 /etc/opendkim/keys/$DOMAIN_NAME/mail.private
 
 # Configure Postfix to use OpenDKIM
 postconf -e "milter_protocol = 6"
@@ -986,3 +988,5 @@ fi
 echo ""
 print_warning "REMINDER: Update physical address in /var/www/$DOMAIN_NAME/contact.html"
 print_warning "REMINDER: Update Mailwizz URL in /etc/nginx/sites-available/$DOMAIN_NAME.conf"
+
+
