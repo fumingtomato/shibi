@@ -448,7 +448,7 @@ echo ""
 
 print_header "Phase 2: Downloading Components"
 
-GITHUB_BASE="https://raw.githubusercontent.com/fumingtomato/shibi/main/MXingFun"
+GITHUB_BASE="https://raw.githubusercontent.com/fumingtomato/shibi/dude/MXingFun"
 
 download_script() {
     local script_name=$1
