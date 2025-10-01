@@ -665,16 +665,16 @@ for ip in "${IP_ADDRESSES[@]}"; do
     echo "$ip" >> /etc/opendkim/TrustedHosts
 done
 
-echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
+# This is the NEW block that replaces the old one
 
-# COMPREHENSIVE SigningTable for ALL scenarios
-cat > /etc/opendkim/SigningTable <<EOF
-*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
-*@$HOSTNAME mail._domainkey.$DOMAIN_NAME
-*@localhost mail._domainkey.$DOMAIN_NAME
-*@localhost.localdomain mail._domainkey.$DOMAIN_NAME
-$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
-EOF
+# KeyTable for multi-domain support. It maps a domain to its key.
+# The pattern means "for any domain, look for a key in /etc/opendkim/keys/DOMAIN/mail.private"
+echo "mail._domainkey.%d %d:mail:/etc/opendkim/keys/%d/mail.private" > /etc/opendkim/KeyTable
+
+# SigningTable that matches ANY email address.
+# The %d will be replaced by the sender's domain.
+# It tells OpenDKIM: "For any sender, sign with the key that matches their domain."
+echo "*@%d mail._domainkey.%d" > /etc/opendkim/SigningTable
 
 # Create systemd directory
 mkdir -p /var/run/opendkim
