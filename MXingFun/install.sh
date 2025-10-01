@@ -587,6 +587,7 @@ submission inet n       -       y       -       -       smtpd
   -o smtpd_tls_security_level=encrypt
   -o smtpd_sasl_auth_enable=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o receive_override_options=no_milters
   -o smtpd_milters=inet:localhost:8891
   -o non_smtpd_milters=inet:localhost:8891
 
@@ -596,6 +597,7 @@ smtps     inet  n       -       y       -       -       smtpd
   -o smtpd_tls_wrappermode=yes
   -o smtpd_sasl_auth_enable=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o receive_override_options=no_milters
   -o smtpd_milters=inet:localhost:8891
   -o non_smtpd_milters=inet:localhost:8891
 EOF
