@@ -504,8 +504,8 @@ cat > /etc/hosts <<EOF
 127.0.0.1   localhost
 127.0.1.1   $HOSTNAME $MAIL_SUBDOMAIN
 
-# Primary IP
-$PRIMARY_IP $HOSTNAME $MAIL_SUBDOMAIN
+# Primary IP (first IP in the array)
+${IP_ADDRESSES[0]} $HOSTNAME $MAIL_SUBDOMAIN
 
 # The following lines are desirable for IPv6 capable hosts
 ::1         localhost ip6-localhost ip6-loopback
@@ -515,9 +515,9 @@ EOF
 
 # Add additional IPs to hosts if configured
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    for i in "${!IP_ADDRESSES[@]:1}"; do
+    for i in "${!IP_ADDRESSES[@]}"; do
         if [ $i -ne 0 ]; then
-            echo "${IP_ADDRESSES[$i]} ${MAIL_SUBDOMAIN}$((i)).$DOMAIN_NAME" >> /etc/hosts
+            echo "${IP_ADDRESSES[$i]} ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME" >> /etc/hosts
         fi
     done
 fi
