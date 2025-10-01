@@ -386,59 +386,62 @@ if [ "$CONFIG_LOADED" = false ]; then
         fi
     fi
     
-    # Initialize IP array
-    IP_ADDRESSES=("$PRIMARY_IP")
-    
-    # Multi-IP configuration
+# Initialize IP array
+IP_ADDRESSES=("$PRIMARY_IP")
+
+# Multi-IP configuration
+echo ""
+read -p "Do you want to configure additional IPs? (y/n) [n]: " MULTI_IP
+
+if [[ "${MULTI_IP,,}" == "y" ]]; then
     echo ""
-    read -p "Do you want to configure additional IPs? (y/n) [n]: " MULTI_IP
+    echo "Enter additional IPs (one per line, empty line to finish)"
+    echo "Formats supported: single IP, range (1.2.3.4-1.2.3.10), CIDR (1.2.3.0/24)"
     
-    if [[ "${MULTI_IP,,}" == "y" ]]; then
-        echo ""
-        echo "Enter additional IPs (one per line, empty line to finish)"
-        echo "Formats supported: single IP, range (1.2.3.4-1.2.3.10), CIDR (1.2.3.0/24)"
+    while true; do
+        read -p "IP/Range/CIDR: " ip_input
+        [ -z "$ip_input" ] && break
         
-        while true; do
-            read -p "IP/Range/CIDR: " ip_input
-            [ -z "$ip_input" ] && break
-            
-            # Process based on input type
-            if [[ "$ip_input" =~ / ]]; then
-                # CIDR notation
-                echo "Processing CIDR: $ip_input"
-                while IFS= read -r ip; do
-                    if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then
-                        IP_ADDRESSES+=("$ip")
-                        echo "  Added: $ip"
-                    fi
-                done < <(expand_cidr "$ip_input")
-            elif [[ "$ip_input" =~ - ]]; then
-                # Range notation
-                echo "Processing range: $ip_input"
-                while IFS= read -r ip; do
-                    if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then
-                        IP_ADDRESSES+=("$ip")
-                        echo "  Added: $ip"
-                    fi
-                done < <(expand_ip_range "$ip_input")
-            else
-                # Single IP
-                if validate_ip "$ip_input"; then
-                    if [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip_input " ]]; then
-                        IP_ADDRESSES+=("$ip_input")
-                        echo "  Added: $ip_input"
-                    else
-                        echo "  IP already in list"
-                    fi
-                else
-                    print_error "  Invalid IP: $ip_input"
+        # Process based on input type
+        if [[ "$ip_input" =~ / ]]; then
+            # CIDR notation
+            echo "Processing CIDR: $ip_input"
+            while IFS= read -r ip; do
+                if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then
+                    IP_ADDRESSES+=("$ip")
+                    echo "  Added: $ip"
                 fi
+            done < <(expand_cidr "$ip_input")
+        elif [[ "$ip_input" =~ - ]]; then
+            # Range notation
+            echo "Processing range: $ip_input"
+            while IFS= read -r ip; do
+                if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then
+                    IP_ADDRESSES+=("$ip")
+                    echo "  Added: $ip"
+                fi
+            done < <(expand_ip_range "$ip_input")
+        else
+            # Single IP
+            if validate_ip "$ip_input"; then
+                if [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip_input " ]]; then
+                    IP_ADDRESSES+=("$ip_input")
+                    echo "  Added: $ip_input"
+                else
+                    echo "  IP already in list"
+                fi
+            else
+                print_error "  Invalid IP: $ip_input"
             fi
-        done
-        
-        echo ""
-        echo "Total IPs configured: ${#IP_ADDRESSES[@]}"
-    fi
+        fi
+    done
+    
+    echo ""
+    echo "Total IPs configured: ${#IP_ADDRESSES[@]}"
+fi
+
+# Export the array for use in other scripts
+export IP_ADDRESSES
     
     # Cloudflare configuration (optional)
     echo ""
