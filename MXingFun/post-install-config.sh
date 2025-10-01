@@ -248,15 +248,16 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     done
 fi
 
-# Setup KeyTable
+# --- START: DEFINITIVE DKIM TABLE FIX ---
+# This ensures a static, reliable configuration that matches the installer.
+
+# Setup KeyTable: Statically map the key to the specific private key file.
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 
-# Setup comprehensive SigningTable using the reliable wildcard method.
-# We use 'echo' to ensure the file contains only this single, powerful rule.
-echo "* mail._domainkey" > /etc/opendkim/SigningTable
+# Setup SigningTable: Statically tell OpenDKIM to sign emails from this domain.
+echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
 
-# Also fix the KeyTable to use the wildcard pattern.
-echo "* *:%d:/etc/opendkim/keys/%d/mail.private" > /etc/opendkim/KeyTable
+# --- END: DEFINITIVE DKIM TABLE FIX ---
 
 # Set proper permissions
 chown -R opendkim:opendkim /etc/opendkim
@@ -264,7 +265,6 @@ chmod 644 /etc/opendkim/TrustedHosts
 chmod 644 /etc/opendkim/KeyTable
 chmod 644 /etc/opendkim/SigningTable
 
-# --- START OF THE DEFINITIVE FIX ---
 # SECURE THE KEY DIRECTORY AND THE PRIVATE KEY ITSELF
 # This prevents the "key not secure" error by securing the entire path.
 if [ ! -z "$DOMAIN_NAME" ] && [ -d "/etc/opendkim/keys/$DOMAIN_NAME" ]; then
@@ -279,7 +279,6 @@ if [ ! -z "$DOMAIN_NAME" ] && [ -d "/etc/opendkim/keys/$DOMAIN_NAME" ]; then
     # Ensure the public key remains readable
     chmod 644 /etc/opendkim/keys/$DOMAIN_NAME/mail.txt
 fi
-# --- END OF THE DEFINITIVE FIX ---
 
 # Configure Postfix to use OpenDKIM
 postconf -e "milter_protocol = 6"
