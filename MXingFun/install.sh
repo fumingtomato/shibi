@@ -606,11 +606,17 @@ EOF
 # PHASE 5A: GENERATE PROPER DKIM KEY
 # ===================================================================
 
-print_header "Generating 1024-bit DKIM Key"
+print_header "Ensuring 1024-bit DKIM Key"
 
 # Call the function to generate DKIM key
 if generate_dkim_key "$DOMAIN_NAME"; then
-    print_message "✓ DKIM key generated successfully"
+    # CRITICAL FIX: Reformat mail.txt to ensure it's a single line for reliable parsing
+    # This removes line breaks and extra spaces within the TXT record content.
+    if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
+        RAW_DKIM_CONTENT=$(cat "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" | grep -o '".*"' | tr -d '\n\r\t' | sed 's/ //g')
+        echo "mail._domainkey IN TXT $RAW_DKIM_CONTENT" > "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt"
+        print_message "✓ DKIM key file reformatted for consistency"
+    fi
 else
     print_error "Failed to generate DKIM key"
     # Continue anyway, can be fixed later
