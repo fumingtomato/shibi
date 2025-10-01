@@ -671,19 +671,12 @@ for ip in "${IP_ADDRESSES[@]}"; do
     echo "$ip" >> /etc/opendkim/TrustedHosts
 done
 
-# --- START OF THE DEFINITIVE FIX ---
-# This is the NEW, CORRECTED block that replaces the old one
+# KeyTable: Use a wildcard pattern to find keys for any domain.
+echo "* *:%d:/etc/opendkim/keys/%d/mail.private" > /etc/opendkim/KeyTable
 
-# KeyTable: Statically map the key to the domain.
-echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
-
-# SigningTable: Statically and explicitly tell OpenDKIM to sign for the domain and its subdomains.
-# This is far more reliable than the dynamic '%d' matching.
-cat > /etc/opendkim/SigningTable <<EOF
-*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
-*@*.$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME
-EOF
-# --- END OF THE DEFINITIVE FIX ---
+# SigningTable: Use a wildcard to sign any email from any domain.
+# This is the most flexible and reliable method.
+echo "* mail._domainkey" > /etc/opendkim/SigningTable
 
 # Create systemd directory
 mkdir -p /var/run/opendkim
