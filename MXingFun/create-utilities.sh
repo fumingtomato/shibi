@@ -93,7 +93,8 @@ free -h | awk 'NR==2 {print "  Used: "$3" of "$2}'
 
 echo ""
 echo "DKIM Status:"
-if [ -f "/etc/opendkim/keys/*/mail.txt" ]; then
+# CRITICAL FIX: Use the specific domain name instead of a generic wildcard
+if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
     echo -e "  ${GREEN}✓ DKIM key exists${NC}"
     if netstat -lnp 2>/dev/null | grep -q ":8891"; then
         echo -e "  ${GREEN}✓ OpenDKIM listening on 8891${NC}"
