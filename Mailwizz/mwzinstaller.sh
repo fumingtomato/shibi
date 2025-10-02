@@ -1,12 +1,12 @@
 #!/bin/bash
 #
-# Mailwizz Professional Installer for Ubuntu 24.04
+# Mailwizz Professional Installer (Direct SMTP Edition) for Ubuntu 24.04
 #
 # Description:
 # This script provides a secure, efficient, and production-ready automated installation
-# of Mailwizz on a fresh Ubuntu 24.04 server. It includes a hardened environment
-# with PHP-FPM, Apache (mpm_event), Postfix, Certbot SSL, a chrooted SFTP user,
-# and an intelligently configured firewall (UFW) and WAF (ModSecurity).
+# of Mailwizz on a fresh Ubuntu 24.04 server. It is specifically designed for a
+# "Direct SMTP" environment where Mailwizz connects directly to external SMTP servers,
+# and therefore DOES NOT install a local MTA like Postfix.
 #
 # --- Created by @Copilot, based on a script by fumingtomato ---
 # --- Date: 2025-10-02 ---
@@ -74,7 +74,7 @@ get_public_ip() {
 # =================================================================
 
 clear
-print_header "Mailwizz Professional Installer"
+print_header "Mailwizz Professional Installer (Direct SMTP Edition)"
 echo -e "${YELLOW}Current User: ${CURRENT_USER} | Home: ${USER_HOME}${NC}"
 echo
 
@@ -120,7 +120,7 @@ ufw --force enable >/dev/null
 print_success "Firewall enabled and configured."
 
 # =================================================================
-# SECTION 4: INSTALL CORE PACKAGES (WEB, DB, PHP, MTA)
+# SECTION 4: INSTALL CORE PACKAGES (WEB, DB, PHP)
 # =================================================================
 
 print_header "Installing Core Production Environment Packages"
@@ -134,9 +134,9 @@ fi
 print_status "Detected latest available PHP version: ${PHP_VERSION}"
 
 # --- Consolidated Package Installation ---
-print_status "Installing Apache, MySQL, Postfix, PHP-FPM, and all extensions..."
+print_status "Installing Apache, MySQL, PHP-FPM, and all extensions..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    apache2 mysql-server postfix \
+    apache2 mysql-server \
     "${PHP_VERSION}" "${PHP_VERSION}-fpm" "${PHP_VERSION}-mysql" "${PHP_VERSION}-curl" \
     "${PHP_VERSION}-zip" "${PHP_VERSION}-imap" "${PHP_VERSION}-mbstring" "${PHP_VERSION}-xml" \
     "${PHP_VERSION}-gd" "${PHP_VERSION}-cli" "${PHP_VERSION}-common" "${PHP_VERSION}-intl" \
@@ -355,8 +355,12 @@ cat > /root/secure_and_finish.sh <<EOF
 #!/bin/bash
 echo "Securing Mailwizz post-installation..."
 # Protect sensitive config files
-chmod 400 ${WEB_ROOT}/apps/common/config/main-custom.php
-chmod 400 ${WEB_ROOT}/apps/common/config/main.php
+if [ -f "${WEB_ROOT}/apps/common/config/main-custom.php" ]; then
+    chmod 400 ${WEB_ROOT}/apps/common/config/main-custom.php
+fi
+if [ -f "${WEB_ROOT}/apps/common/config/main.php" ]; then
+    chmod 400 ${WEB_ROOT}/apps/common/config/main.php
+fi
 # Remove install directory
 if [ -d "${WEB_ROOT}/install" ]; then
     rm -rf "${WEB_ROOT}/install"
@@ -372,7 +376,7 @@ chmod +x /root/secure_and_finish.sh
 CRED_FILE="${USER_HOME}/mailwizz_credentials.txt"
 cat > "$CRED_FILE" <<EOF
 ==================================================
- Mailwizz Server Credentials
+ Mailwizz Server Credentials (Direct SMTP Edition)
 ==================================================
 Date: $(date)
 Server IP: ${SERVER_IP}
@@ -410,5 +414,10 @@ echo "   - Use the database credentials from the file above."
 echo "2. After the web install is complete, log in to the server and run:"
 echo -e "   ${YELLOW}sudo /root/secure_and_finish.sh${NC}"
 echo "   This will remove the install directory and finalize security."
+echo "3. Log in to Mailwizz and configure your external SMTP servers under"
+echo "   'Servers > Delivery Servers' for sending campaigns."
+echo -e "4. ${YELLOW}CRITICAL:${NC} For system emails (password resets, notifications),"
+echo "   you MUST configure a delivery server for transactional emails under"
+echo "   'Settings > Common > Caching/Email' and select it."
 echo
 print_header "Thank you for using the Mailwizz Professional Installer!"
