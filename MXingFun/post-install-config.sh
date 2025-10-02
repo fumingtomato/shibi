@@ -254,8 +254,9 @@ fi
 # Setup KeyTable: Statically map the key to the specific private key file.
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 
-# Setup SigningTable: Statically tell OpenDKIM to sign emails from this domain.
+# Setup SigningTable: Statically tell OpenDKIM to sign emails from this domain AND ANY SUBDOMAIN.
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
+echo "*@*.$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" >> /etc/opendkim/SigningTable
 
 # --- END: DEFINITIVE DKIM TABLE FIX ---
 
