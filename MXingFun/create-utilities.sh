@@ -730,7 +730,70 @@ EOF
 chmod +x /usr/local/bin/mail-queue
 
 # ===================================================================
-# 8. IP ROTATION STATUS (if configured)
+# 8. RECIPIENT IP STICKINESS MANAGEMENT
+# ===================================================================
+
+cat > /usr/local/bin/recipient-ip-stick <<'EOF'
+#!/bin/bash
+
+# Manages sticky IP assignments for specific recipients.
+RECIPIENT_MAP="/etc/postfix/recipient_transports"
+
+case "$1" in
+    add)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: recipient-ip-stick add <email> <transport>"
+            echo "Example: recipient-ip-stick add bob@email.com smtp-ip3"
+            exit 1
+        fi
+        
+        EMAIL="$2"
+        TRANSPORT="$3"
+        
+        # Remove old entry if it exists
+        sed -i "/^${EMAIL} /d" "$RECIPIENT_MAP" 2>/dev/null
+        
+        # Add new entry
+        echo "$EMAIL    $TRANSPORT:" >> "$RECIPIENT_MAP"
+        postmap "$RECIPIENT_MAP"
+        
+        echo "✓ Rule added: Emails to $EMAIL will now use $TRANSPORT."
+        ;;
+        
+    remove)
+        if [ -z "$2" ]; then
+            echo "Usage: recipient-ip-stick remove <email>"
+            exit 1
+        fi
+        
+        EMAIL="$2"
+        sed -i "/^${EMAIL} /d" "$RECIPIENT_MAP" 2>/dev/null
+        postmap "$RECIPIENT_MAP"
+        
+        echo "✓ Rule removed for $EMAIL."
+        ;;
+        
+    list)
+        echo "Recipient-based IP Stickiness Rules:"
+        cat "$RECIPIENT_MAP"
+        ;;
+        
+    *)
+        echo "Usage: recipient-ip-stick {add|remove|list}"
+        ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/recipient-ip-stick
+# Also add the new command to the sudoers file in setup-permissions.sh
+echo "www-data ALL=(root) NOPASSWD: /usr/local/bin/recipient-ip-stick" >> /etc/sudoers.d/mail-commands
+
+# Create the file initially
+touch /etc/postfix/recipient_transports
+postmap /etc/postfix/recipient_transports
+
+# ===================================================================
+# 9. IP ROTATION STATUS (if configured)
 # ===================================================================
 
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
@@ -790,7 +853,7 @@ EOF
 fi
 
 # ===================================================================
-# 9. BACKUP SCRIPT
+# 10. BACKUP SCRIPT
 # ===================================================================
 
 cat > /usr/local/bin/mail-backup <<'EOF'
@@ -835,7 +898,7 @@ EOF
 chmod +x /usr/local/bin/mail-backup
 
 # ===================================================================
-# 10. MAILWIZZ INFO
+# 11. MAILWIZZ INFO
 # ===================================================================
 
 cat > /usr/local/bin/mailwizz-info <<'EOF'
