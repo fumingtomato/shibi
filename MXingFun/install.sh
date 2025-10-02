@@ -164,7 +164,7 @@ EOF
         cat >> /etc/postfix/master.cf <<EOF
 smtp-ip${transport_id}    unix  -       -       n       -       -       smtp
     -o smtp_bind_address=$ip
-    -o smtp_helo_name=mail-${transport_id}.\$myhostname
+    -o smtp_helo_name=${MAIL_SUBDOMAIN}${transport_id}.$DOMAIN_NAME
     -o syslog_name=postfix-ip${transport_id}
 EOF
     done
