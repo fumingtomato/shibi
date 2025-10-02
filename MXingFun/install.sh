@@ -2,10 +2,10 @@
 
 # =================================================================
 # BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
-# Version: 17.0.7 - WITH UNIVERSAL USER ACCESS
+# Version: 17.0.8 - WITH ADVANCED IP ROTATION
 # Automated installation with Cloudflare DNS, compliance website, and DKIM
 # FIXED: Ensures 1024-bit DKIM key generation and proper configuration
-# ADDED: Universal command access for all users
+# ADDED: Universal command access and advanced bulk IP rotation management
 # =================================================================
 
 set -e  # Exit on any error
@@ -140,50 +140,177 @@ expand_cidr() {
     printf '%s\n' "${ips[@]}"
 }
 
-# IP rotation configuration with database-backed sticky sessions
-configure_ip_rotation() {
-    local -a ips=("$@")
-    local num_ips=${#ips[@]}
-    
-    print_message "Configuring IP rotation for $num_ips addresses with sticky sessions..."
-    
-    # Add transport configurations to master.cf
-    cat >> /etc/postfix/master.cf <<EOF
+# ===================================================================
+# INTEGRATED BULK IP ROTATION SETUP (FROM bulkIPfix.sh)
+# ===================================================================
+configure_bulk_ip_rotation() {
+    print_message "Configuring Advanced IP Rotation for ${#IP_ADDRESSES[@]} addresses..."
 
-# IP Rotation Transports - Generated $(date)
+    # Get DB Password
+    local DB_PASS=$(cat /root/.mail_db_password)
+
+    # 1. Create advanced database tables
+    mysql -u mailuser -p"$DB_PASS" mailserver <<EOF 2>/dev/null
+CREATE TABLE IF NOT EXISTS ip_rotation_advanced (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sender_email VARCHAR(255) UNIQUE,
+    assigned_ip VARCHAR(45),
+    transport_id INT,
+    message_count BIGINT DEFAULT 0,
+    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    rotation_mode ENUM('sticky', 'round-robin', 'least-used') DEFAULT 'sticky',
+    max_messages_per_day INT DEFAULT 1000,
+    messages_today INT DEFAULT 0,
+    last_reset DATE,
+    INDEX idx_sender (sender_email),
+    INDEX idx_ip (assigned_ip)
+);
+CREATE TABLE IF NOT EXISTS ip_pool (
+    ip_address VARCHAR(45) PRIMARY KEY,
+    ip_index INT,
+    is_active BOOLEAN DEFAULT TRUE,
+    reputation_score INT DEFAULT 100,
+    messages_sent_today INT DEFAULT 0,
+    messages_sent_total BIGINT DEFAULT 0,
+    last_used TIMESTAMP,
+    max_daily_limit INT DEFAULT 5000,
+    last_reset DATE
+);
 EOF
-    
-    local count=0
-    for ip in "${ips[@]}"; do
-        # Calculate transport ID (starting from 0)
-        local transport_id=$count
-        count=$((count + 1))
-        
-        echo "  Adding transport smtp-ip${transport_id} for IP: $ip"
-        
-        cat >> /etc/postfix/master.cf <<EOF
-smtp-ip${transport_id}    unix  -       -       n       -       -       smtp
-    -o smtp_bind_address=$ip
-    -o smtp_helo_name=${MAIL_SUBDOMAIN}${transport_id}.$DOMAIN_NAME
-    -o syslog_name=postfix-ip${transport_id}
-EOF
+    print_message "✓ Advanced IP rotation database tables created"
+
+    # 2. Populate the IP pool table
+    for i in "${!IP_ADDRESSES[@]}"; do
+        local IP="${IP_ADDRESSES[$i]}"
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT IGNORE INTO ip_pool (ip_address, ip_index) VALUES ('$IP', $i);" 2>/dev/null
     done
-    
-    # Create MySQL-based sender transport lookup
-    cat > /etc/postfix/mysql/sender_transport.cf <<EOF
-user = mailuser
-password = $(cat /root/.mail_db_password 2>/dev/null || echo "password")
-hosts = 127.0.0.1
-dbname = mailserver
-query = SELECT CONCAT('smtp-ip', transport_id, ':') FROM ip_rotation_log WHERE sender_email='%s'
+    print_message "✓ IP pool populated in database"
+
+    # 3. Add transport entries to master.cf
+    for i in "${!IP_ADDRESSES[@]}"; do
+        local IP="${IP_ADDRESSES[$i]}"
+        # Check if transport already exists to prevent duplication
+        if ! grep -q "^smtp-ip$i" /etc/postfix/master.cf; then
+            cat >> /etc/postfix/master.cf <<EOF
+
+# Transport for IP $IP (index $i)
+smtp-ip$i unix - - n - - smtp
+  -o smtp_bind_address=$IP
+  -o smtp_helo_name=${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME
+  -o syslog_name=postfix-ip$i
 EOF
-    
-    # Configure Postfix to use sender-based transport
-    postconf -e "sender_dependent_default_transport_maps = mysql:/etc/postfix/mysql/sender_transport.cf"
-    postconf -e "smtp_sender_dependent_authentication = yes"
-    postconf -e "sender_dependent_relayhost_maps = mysql:/etc/postfix/mysql/sender_transport.cf"
-    
-    print_message "✓ IP rotation configured with ${num_ips} addresses"
+        fi
+    done
+    print_message "✓ Postfix transports created for all IPs"
+
+    # 4. Create the advanced IP management command
+    cat > /usr/local/bin/bulk-ip-manage <<'BIM'
+#!/bin/bash
+# Bulk Mailer IP Management Tool
+DB_PASS=$(cat /etc/mail-config/db_password 2>/dev/null || cat /root/.mail_db_password)
+source /etc/mail-config/install.conf
+case "$1" in
+    assign)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: bulk-ip-manage assign <email> <mode>"
+            echo "Modes: sticky, round-robin, least-used, specific:<ip>"
+            exit 1
+        fi
+        EMAIL="$2"
+        MODE="$3"
+        if [[ "$MODE" == specific:* ]]; then
+            SPECIFIC_IP="${MODE#specific:}"
+            IP_INDEX=-1
+            for i in "${!IP_ADDRESSES[@]}"; do
+                if [ "${IP_ADDRESSES[$i]}" == "$SPECIFIC_IP" ]; then
+                    IP_INDEX=$i
+                    break
+                fi
+            done
+            if [ $IP_INDEX -eq -1 ]; then
+                echo "Error: IP $SPECIFIC_IP not found in pool"
+                exit 1
+            fi
+            ASSIGNED_IP="$SPECIFIC_IP"
+            ROTATION_MODE="sticky"
+        else
+            case "$MODE" in
+                sticky)
+                    ASSIGNED_IP=$(mysql -u mailuser -p"$DB_PASS" mailserver -sN -e "SELECT ip_address FROM ip_pool WHERE is_active = TRUE ORDER BY messages_sent_total ASC, messages_sent_today ASC LIMIT 1" 2>/dev/null)
+                    ROTATION_MODE="sticky"
+                    ;;
+                round-robin)
+                    ASSIGNED_IP="${IP_ADDRESSES[0]}"
+                    ROTATION_MODE="round-robin"
+                    ;;
+                least-used)
+                    ASSIGNED_IP="${IP_ADDRESSES[0]}"
+                    ROTATION_MODE="least-used"
+                    ;;
+                *) echo "Unknown mode: $MODE"; exit 1 ;;
+            esac
+            IP_INDEX=-1
+            for i in "${!IP_ADDRESSES[@]}"; do
+                if [ "${IP_ADDRESSES[$i]}" == "$ASSIGNED_IP" ]; then
+                    IP_INDEX=$i
+                    break
+                fi
+            done
+        fi
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT INTO ip_rotation_advanced (sender_email, assigned_ip, transport_id, rotation_mode) VALUES ('$EMAIL', '$ASSIGNED_IP', $IP_INDEX, '$ROTATION_MODE') ON DUPLICATE KEY UPDATE assigned_ip = '$ASSIGNED_IP', transport_id = $IP_INDEX, rotation_mode = '$ROTATION_MODE'" 2>/dev/null
+        (grep -v "^$EMAIL " /etc/postfix/sender_transports 2>/dev/null || true) > /tmp/sender_transport_tmp
+        echo "$EMAIL    smtp-ip$IP_INDEX" >> /tmp/sender_transport_tmp
+        mv /tmp/sender_transport_tmp /etc/postfix/sender_transports
+        postmap hash:/etc/postfix/sender_transports
+        echo "✓ Assigned $EMAIL to IP $ASSIGNED_IP (mode: $ROTATION_MODE)"
+        ;;
+    status)
+        echo "=== IP POOL STATUS ==="
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT ip_address AS 'IP Address', is_active AS 'Active', messages_sent_today AS 'Today', messages_sent_total AS 'Total', reputation_score AS 'Score' FROM ip_pool ORDER BY ip_index" 2>/dev/null
+        echo ""
+        echo "=== SENDER ASSIGNMENTS ==="
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT sender_email AS 'Sender', assigned_ip AS 'IP', rotation_mode AS 'Mode', message_count AS 'Messages', last_used AS 'Last Used' FROM ip_rotation_advanced ORDER BY last_used DESC LIMIT 20" 2>/dev/null
+        ;;
+    rotate)
+        EMAIL="$2"
+        if [ -z "$EMAIL" ]; then echo "Usage: bulk-ip-manage rotate <email>"; exit 1; fi
+        CURRENT=$(mysql -u mailuser -p"$DB_PASS" mailserver -sN -e "SELECT transport_id, rotation_mode FROM ip_rotation_advanced WHERE sender_email = '$EMAIL'" 2>/dev/null)
+        if [ -z "$CURRENT" ]; then echo "Error: $EMAIL not found"; exit 1; fi
+        IFS=$'\t' read -r CURRENT_ID MODE <<< "$CURRENT"
+        if [ "$MODE" != "round-robin" ]; then echo "Email is in $MODE mode, not rotating"; exit 0; fi
+        NEXT_ID=$(( (CURRENT_ID + 1) % ${#IP_ADDRESSES[@]} ))
+        NEXT_IP="${IP_ADDRESSES[$NEXT_ID]}"
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "UPDATE ip_rotation_advanced SET assigned_ip = '$NEXT_IP', transport_id = $NEXT_ID WHERE sender_email = '$EMAIL'" 2>/dev/null
+        sed -i "/^$EMAIL /d" /etc/postfix/sender_transports 2>/dev/null
+        echo "$EMAIL    smtp-ip$NEXT_ID" >> /etc/postfix/sender_transports
+        postmap hash:/etc/postfix/sender_transports
+        echo "✓ Rotated $EMAIL to IP $NEXT_IP"
+        ;;
+    *)
+        echo "Bulk IP Management Tool"
+        echo "Usage: bulk-ip-manage {assign|status|rotate}"
+        echo "Commands:"
+        echo "  assign <email> <mode>  - Assign IP with mode (sticky, round-robin, least-used, specific:<ip>)"
+        echo "  status                 - Show IP pool and assignments"
+        echo "  rotate <email>         - Force rotation (for round-robin accounts only)"
+        ;;
+esac
+if [ "$1" == "assign" ] || [ "$1" == "rotate" ]; then
+    postfix reload 2>/dev/null
+fi
+BIM
+    chmod 755 /usr/local/bin/bulk-ip-manage
+    print_message "✓ 'bulk-ip-manage' command created"
+
+    # 5. Configure Postfix main.cf and create transport map
+    postconf -e "sender_dependent_default_transport_maps = hash:/etc/postfix/sender_transports"
+    postconf -e "smtp_bind_address =" # Clear global binding
+    touch /etc/postfix/sender_transports
+    postmap hash:/etc/postfix/sender_transports
+    print_message "✓ Postfix configured for advanced IP routing"
+
+    # 6. Final reload
+    postfix reload
 }
 
 # ===================================================================
@@ -242,7 +369,7 @@ generate_dkim_key() {
 # ===================================================================
 
 print_header "Multi-IP Bulk Mail Server Installer"
-echo "Version: 17.0.7"
+echo "Version: 17.0.8"
 echo "Starting installation at: $(date)"
 echo ""
 
@@ -280,16 +407,6 @@ done
 read -p "Enter mail server subdomain (default: mx): " MAIL_SUBDOMAIN
 MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mx}
 HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
-
-# Admin email
-#while true; do
-#    read -p "Enter admin email address: " ADMIN_EMAIL
-#    if [[ "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-#        break
-#    else
-#        print_error "Invalid email format"
-#    fi
-#done
 
 # First email account
 while true; do
@@ -731,13 +848,10 @@ fi
 # ===================================================================
 
 if [ "$CONFIGURE_IP_ROTATION" == "true" ] && [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    print_header "Phase 7: IP Rotation Setup"
+    print_header "Phase 7: Advanced IP Rotation Setup"
     
-    # Create MySQL directory if not exists
-    mkdir -p /etc/postfix/mysql
-    
-    # Call the IP rotation configuration function
-    configure_ip_rotation "${IP_ADDRESSES[@]}"
+    # Call the new bulk IP rotation configuration function
+    configure_bulk_ip_rotation
     
     # Reload Postfix
     systemctl reload postfix
@@ -1065,7 +1179,7 @@ echo "Mail Subdomain: $MAIL_SUBDOMAIN"
 echo "Primary IP: $PRIMARY_IP"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     echo "Total IPs: ${#IP_ADDRESSES[@]}"
-    echo "IP Rotation: ENABLED"
+    echo "IP Rotation: ENABLED (Advanced)"
 fi
 echo ""
 
@@ -1078,7 +1192,7 @@ fi
 
 # Display DKIM record
 if [ -f "/etc/opendkim/keys/$DOMAIN_NAME/mail.txt" ]; then
-    DDKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' "')
+    DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | tr -d '\n\r\t' | sed 's/.*"p=//' | sed 's/".*//' | tr -d ' "')
     if [ ! -z "$DKIM_KEY" ]; then
         echo "DKIM Record (add to DNS if not automatic):"
         echo "  Name: mail._domainkey"
@@ -1106,14 +1220,14 @@ echo "  mail-test          - Test configuration"
 echo "  check-dns          - Verify DNS records"
 echo "  get-ssl-cert       - Get SSL certificates"
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
-    echo "  ip-rotation-status - View IP rotation"
+    echo "  bulk-ip-manage     - Advanced IP rotation management"
 fi
 echo ""
 
 echo "ANY USER CAN NOW RUN:"
 echo "  As regular user: mail-status"
 echo "  As regular user: mail-account list"
-echo "  As regular user: ip-rotation-status"
+echo "  As regular user: bulk-ip-manage status"
 echo "  No sudo needed - commands work transparently!"
 echo ""
 
