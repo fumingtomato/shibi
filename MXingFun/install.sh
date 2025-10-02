@@ -408,12 +408,17 @@ read -p "Enter mail server subdomain (default: mx): " MAIL_SUBDOMAIN
 MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mx}
 HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
 
+# Define the default email address
+DEFAULT_EMAIL="newsletter@$DOMAIN_NAME"
+
 # First email account
 while true; do
-read -p "Email address for first account (e.g., admin@$DOMAIN_NAME): " FIRST_EMAIL
-if [[ "$FIRST_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    read -p "Email address for first account (default: $DEFAULT_EMAIL): " FIRST_EMAIL
+    FIRST_EMAIL=${FIRST_EMAIL:-$DEFAULT_EMAIL}
+    if [[ "$FIRST_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
         break
     else
+        # This will now only trigger if the user enters an invalid format.
         print_error "Invalid email format"
     fi
 done
