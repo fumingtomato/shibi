@@ -331,6 +331,10 @@ mkdir -p /etc/opendkim/keys/$DOMAIN_NAME
 cd /etc/opendkim/keys/$DOMAIN_NAME
 opendkim-genkey -s mail -d $DOMAIN_NAME
 chown -R opendkim:opendkim /etc/opendkim
+# --- START: Key Permission FIX ---
+# Set strict permissions on the private key to fix the "key not secure" error.
+chmod 600 /etc/opendkim/keys/$DOMAIN_NAME/mail.private
+# --- END: Key Permission FIX ---
 
 cat > /etc/opendkim.conf <<EOF
 AutoRestart             Yes
@@ -356,7 +360,12 @@ echo "localhost" >> /etc/opendkim/TrustedHosts
 echo ".$DOMAIN_NAME" >> /etc/opendkim/TrustedHosts
 
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
+# --- START: SigningTable FIX ---
+# Rule 1: Sign emails from the main domain
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
+# Rule 2: Also sign emails from any subdomain
+echo "*@*.$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" >> /etc/opendkim/SigningTable
+# --- END: SigningTable FIX ---
 
 # Restart services
 systemctl restart postfix
