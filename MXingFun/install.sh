@@ -590,6 +590,8 @@ download_script "create-utilities.sh"
 download_script "post-install-config.sh"
 download_script "setup-permissions.sh"
 download_script "troubleshoot.sh"
+download_script "webhook_handler.py"
+download_script "setup-webhook-api.sh"
 
 # ===================================================================
 # PHASE 3: SYSTEM UPDATE
