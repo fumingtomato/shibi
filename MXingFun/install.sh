@@ -659,7 +659,7 @@ mydomain = $DOMAIN_NAME
 myorigin = \$mydomain
 inet_interfaces = all
 inet_protocols = ipv4
-mydestination = 
+mydestination = localhost, $HOSTNAME, $DOMAIN_NAME
 relay_domains = 
 mynetworks = 127.0.0.0/8
 
@@ -668,13 +668,15 @@ smtpd_tls_cert_file = /etc/ssl/certs/ssl-cert-snakeoil.pem
 smtpd_tls_key_file = /etc/ssl/private/ssl-cert-snakeoil.key
 smtpd_use_tls = yes
 smtpd_tls_auth_only = yes
-smtp_tls_security_level = may
 
 # Restrictions
 smtpd_recipient_restrictions = 
     permit_mynetworks,
     permit_sasl_authenticated,
     reject_unauth_destination
+
+# Transport Maps (Order is important: recipient-specific first)
+transport_maps = hash:/etc/postfix/recipient_transports
 
 # Virtual domains (will be configured by setup-database.sh)
 virtual_transport = lmtp:unix:private/dovecot-lmtp
