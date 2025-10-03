@@ -5,7 +5,6 @@
 # This installer builds the critical '00-common.sh' module with
 # a corrected function name generator. This permanently fixes the
 # 'command not found' errors during the hardener's execution.
-# This is the final, working version.
 # =================================================================
 
 set -e
