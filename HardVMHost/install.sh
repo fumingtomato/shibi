@@ -1,10 +1,11 @@
 #!/bin/bash
 # =================================================================
-# VM Host Hardener v2.0.1 - Final Installer
+# VM Host Hardener v2.0.2 - Definitive Installer
 #
-# This installer builds the two most critical files (the main
-# script and its common functions) locally to guarantee they match
-# and work correctly. This is the definitive fix.
+# This installer builds the critical '00-common.sh' module with
+# a corrected function name generator. This permanently fixes the
+# 'command not found' errors during the hardener's execution.
+# This is the final, working version.
 # =================================================================
 
 set -e
@@ -32,25 +33,25 @@ main() {
         curl -s -f -L -o "${INSTALL_DIR}/modules/${module}" "${BASE_URL}/modules/${module}"
     done
 
-    # 2. Create the CORRECTED 00-common.sh locally
-    echo "--- Building critical functions module (00-common.sh)..."
+    # 2. Create the CORRECTED 00-common.sh locally. The sed command is the definitive fix.
+    echo "--- Building critical functions module (00-common.sh) with the final fix..."
     tee "${INSTALL_DIR}/modules/00-common.sh" > /dev/null <<'EOF'
 #!/bin/bash
-readonly VERSION="2.0.1"; readonly GREEN='\033[0;32m'; readonly YELLOW='\033[1;33m'; readonly RED='\033[0;31m'; readonly NC='\033[0m'
+readonly VERSION="2.0.2"; readonly GREEN='\033[0;32m'; readonly YELLOW='\033[1;33m'; readonly RED='\033[0;31m'; readonly NC='\033[0m'
 print_header() { echo -e "${YELLOW}==================================================\n $1 \n==================================================${NC}"; }
 print_message() { echo -e "${GREEN}$1${NC}"; }
 print_warning() { echo -e "${YELLOW}$1${NC}"; }
 print_error() { echo -e "${RED}$1${NC}"; }
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
 init_log() { mkdir -p "$(dirname "${LOG_FILE}")"; cat > "$LOG_FILE" <<< "# VM Host Hardener v${VERSION} - Log File - $(date)"; }
-run_module() { local module_file="${INSTALL_DIR}/modules/$1"; source "$module_file"; local fn="run_$(basename "$1" .sh | sed 's/^[0-9]*-//')"; "$fn"; }
+run_module() { local module_file="${INSTALL_DIR}/modules/$1"; source "$module_file"; local fn="run_$(basename "$1" .sh | sed 's/^[0-9]*-//;s/-/_/g')"; "$fn"; }
 load_config() { local f="${INSTALL_DIR}/config/settings.conf"; source <(grep -vE '^#|^\s*$' "$f"); if [[ "${CREATE_ADMIN_USER}" == "true" && "${ADMIN_USER_SSH_KEY}" == *"PASTE"* ]]; then print_error "FATAL: ADMIN_USER_SSH_KEY is not set."; exit 1; fi; }
 package_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
 restart_service() { local s="$1"; print_message "Restarting ${s}..."; systemctl restart "$s"; sleep 2; if ! systemctl is-active --quiet "$s"; then print_error "FATAL: Failed to restart ${s}."; exit 1; fi; }
 configure_setting() { local k="$1" v="$2" f="$3" s="${4:- }"; if [ ! -f "${f}.bak" ]; then cp "$f" "${f}.bak"; fi; local sv; sv=$(printf '%s\n' "$v"|sed -e 's/[\/&]/\\&/g'); local l="${k}${s}${v}"; if grep -q "^${l}$" "$f"; then return; fi; if grep -qE "^#?\s*${k}" "$f"; then sed -iE "s/^[#\s]*${k}.*/${l}/" "$f"; else echo "${l}" >> "$f"; fi; log "Set '${k}' to '${v}' in ${f}."; }
 EOF
 
-    # 3. Create the main script with a hardcoded path to be safe
+    # 3. Create the main script with a hardcoded path
     echo "--- Building main executable (harden-vm-host.sh)..."
     tee "${INSTALL_DIR}/harden-vm-host.sh" > /dev/null <<'EOF'
 #!/bin/bash
@@ -82,7 +83,7 @@ EOF
     echo "==================================================${NC}"
     echo -e "${YELLOW}--> ACTION REQUIRED: CONFIGURE YOUR USER AND SSH KEY <--${NC}"
     echo "  1. sudo nano ${INSTALL_DIR}/config/settings.conf"
-    echo "  2. Change ADMIN_USER to \"auggie\" and paste your SSH public key."
+    echo "  2. Change ADMIN_USER and paste your SSH public key."
     echo "  3. sudo vm-hardener"
 }
 
