@@ -93,7 +93,7 @@ EOF
     echo "==================================================\033[0m"
     echo -e "\033[1;33m--> ACTION REQUIRED: CONFIGURE YOUR USER AND SSH KEY <--\033[0m"
     echo "  1. sudo nano ${INSTALL_DIR}/config/settings.conf"
-    echo "  2. Change ADMIN_USER to \"auggie\" and paste your SSH public key."
+    echo "  2. Change ADMIN_USER to \"fred\" and paste your SSH public key."
     echo "  3. sudo vm-hardener"
 }
 
