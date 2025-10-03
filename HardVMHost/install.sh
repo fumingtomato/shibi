@@ -1,11 +1,11 @@
 #!/bin/bash
 # =================================================================
-# VM Host Hardener v2.0.3 - Definitive Installer
+# VM Host Hardener v2.0.4 - Definitive Installer
 #
-# This installer fixes the root cause of the 'command not found'
-# errors by correcting an inconsistent function name in the source
-# module '04-firewall.sh' AFTER it has been downloaded. This makes
-# all modules consistent and guarantees the script will run to completion.
+# This installer fixes two issues:
+# 1. Corrects an inconsistent function name in '04-firewall.sh'.
+# 2. Injects logic into '04-firewall.sh' to load the 'br_netfilter'
+#    kernel module, fixing the 'sysctl: cannot stat' error.
 # =================================================================
 
 set -e
@@ -25,7 +25,7 @@ main() {
     echo "--- Installing to ${INSTALL_DIR}..."
     mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/modules"
 
-    # 1. Download all original module and config files from the repository
+    # 1. Download all original module and config files
     echo "--- Downloading all original components..."
     curl -s -f -L -o "${INSTALL_DIR}/config/settings.conf" "${BASE_URL}/config/settings.conf"
     local modules=("00-common.sh" "01-prerequisites.sh" "02-system-updates.sh" "03-ssh-hardening.sh" "04-firewall.sh" "05-libvirt-hardening.sh" "06-kernel-hardening.sh" "07-storage-security.sh" "08-monitoring-auditing.sh" "09-backups.sh" "10-security-report.sh")
@@ -33,16 +33,21 @@ main() {
         curl -s -f -L -o "${INSTALL_DIR}/modules/${module}" "${BASE_URL}/modules/${module}"
     done
 
-    # 2. *** THE PERMANENT FIX ***
-    # This automatically repairs the downloaded file by renaming the inconsistent function.
-    echo "--- Applying permanent fix to correct inconsistent function name in 04-firewall.sh..."
+    # 2. *** APPLY ALL PERMANENT FIXES ***
+    # FIX A: Correct the inconsistent function name in 04-firewall.sh.
+    echo "--- Applying fix for inconsistent function name..."
     sed -i 's/run_firewall_configuration/run_firewall/' "${INSTALL_DIR}/modules/04-firewall.sh"
 
-    # 3. Create the robust 00-common.sh that now works with the REPAIRED and consistent modules.
+    # FIX B: Ensure br_netfilter module is loaded before sysctl is called in 04-firewall.sh.
+    echo "--- Applying fix for missing br_netfilter module..."
+    local patch_logic="if ! lsmod | grep -q 'br_netfilter'; then modprobe br_netfilter; fi; echo 'br_netfilter' > /etc/modules-load.d/bridge.conf"
+    sed -i "/configure_bridge_filtering()/a ${patch_logic}" "${INSTALL_DIR}/modules/04-firewall.sh"
+
+    # 3. Create the robust 00-common.sh that works with the repaired modules.
     echo "--- Building critical functions module (00-common.sh)..."
     tee "${INSTALL_DIR}/modules/00-common.sh" > /dev/null <<'EOF'
 #!/bin/bash
-readonly VERSION="2.0.3"; readonly GREEN='\033[0;32m'; readonly YELLOW='\033[1;33m'; readonly RED='\033[0;31m'; readonly NC='\033[0m'
+readonly VERSION="2.0.4"; readonly GREEN='\033[0;32m'; readonly YELLOW='\033[1;33m'; readonly RED='\033[0;31m'; readonly NC='\033[0m'
 print_header() { echo -e "${YELLOW}==================================================\n $1 \n==================================================${NC}"; }
 print_message() { echo -e "${GREEN}$1${NC}"; }
 print_warning() { echo -e "${YELLOW}$1${NC}"; }
@@ -84,7 +89,7 @@ EOF
     ln -sf "${INSTALL_DIR}/harden-vm-host.sh" /usr/local/bin/vm-hardener
 
     echo -e "\033[0;32m=================================================="
-    echo "✓ Installation and correction complete. The script will now succeed."
+    echo "✓ Installation and all corrections complete."
     echo "==================================================\033[0m"
     echo -e "\033[1;33m--> ACTION REQUIRED: CONFIGURE YOUR USER AND SSH KEY <--\033[0m"
     echo "  1. sudo nano ${INSTALL_DIR}/config/settings.conf"
