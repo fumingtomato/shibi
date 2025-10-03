@@ -4,8 +4,8 @@
 #
 # This installer fixes the root cause of the 'command not found'
 # errors by correcting an inconsistent function name in the source
-# module '04-firewall.sh'. This makes all modules consistent and
-# guarantees the script will run to completion.
+# module '04-firewall.sh' AFTER it has been downloaded. This makes
+# all modules consistent and guarantees the script will run to completion.
 # =================================================================
 
 set -e
@@ -25,7 +25,7 @@ main() {
     echo "--- Installing to ${INSTALL_DIR}..."
     mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/modules"
 
-    # 1. Download all original module and config files
+    # 1. Download all original module and config files from the repository
     echo "--- Downloading all original components..."
     curl -s -f -L -o "${INSTALL_DIR}/config/settings.conf" "${BASE_URL}/config/settings.conf"
     local modules=("00-common.sh" "01-prerequisites.sh" "02-system-updates.sh" "03-ssh-hardening.sh" "04-firewall.sh" "05-libvirt-hardening.sh" "06-kernel-hardening.sh" "07-storage-security.sh" "08-monitoring-auditing.sh" "09-backups.sh" "10-security-report.sh")
@@ -34,11 +34,11 @@ main() {
     done
 
     # 2. *** THE PERMANENT FIX ***
-    # Correct the inconsistent function name in 04-firewall.sh. This is the root cause.
+    # This automatically repairs the downloaded file by renaming the inconsistent function.
     echo "--- Applying permanent fix to correct inconsistent function name in 04-firewall.sh..."
     sed -i 's/run_firewall_configuration/run_firewall/' "${INSTALL_DIR}/modules/04-firewall.sh"
 
-    # 3. Create the robust 00-common.sh that now works with the consistent modules.
+    # 3. Create the robust 00-common.sh that now works with the REPAIRED and consistent modules.
     echo "--- Building critical functions module (00-common.sh)..."
     tee "${INSTALL_DIR}/modules/00-common.sh" > /dev/null <<'EOF'
 #!/bin/bash
