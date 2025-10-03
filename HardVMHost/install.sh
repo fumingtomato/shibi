@@ -91,7 +91,7 @@ EOF
     echo ""
     print_warning "--> ACTION REQUIRED: CONFIGURE YOUR USER AND SSH KEY <--"
     echo "  1. sudo nano ${INSTALL_DIR}/config/settings.conf"
-    echo "  2. Change ADMIN_USER to \"auggie\" and paste your SSH public key."
+    echo "  2. Change ADMIN_USER and paste your SSH public key."
     echo "  3. sudo vm-hardener"
     echo ""
 }
