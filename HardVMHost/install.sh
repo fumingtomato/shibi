@@ -1,18 +1,18 @@
 #!/bin/bash
 # =================================================================
-# VM Host Hardener v2.0 - Self-Patching Installation Script
+# VM Host Hardener v2.0 - Corrected Installation Script
 #
-# This script downloads the VM Host Hardener and automatically
-# patches a known bug in the main script during installation.
-# The result is a fully functional hardener with no manual
-# fixes required.
+# This script downloads all necessary files from the correct repository
+# path and directly creates the main script with the required fix,
+# guaranteeing a working installation.
 # =================================================================
 
 set -e
 
 # --- Configuration ---
 readonly INSTALL_DIR="/opt/vm-host-hardener"
-readonly BASE_URL="https://raw.githubusercontent.com/fumingtomato/shibi/dude/VMhardner"
+# CORRECTED: This URL now points to the correct 'HardVMHost' directory.
+readonly BASE_URL="https://raw.githubusercontent.com/fumingtomato/shibi/dude/HardVMHost"
 readonly MAIN_SCRIPT_NAME="harden-vm-host.sh"
 readonly MAIN_SCRIPT_PATH="${INSTALL_DIR}/${MAIN_SCRIPT_NAME}"
 
@@ -56,8 +56,14 @@ main() {
         exit 1
     fi
 
+    # Clean up any previous failed installation to ensure a fresh start.
+    if [ -d "${INSTALL_DIR}" ]; then
+        print_warning "Removing previous installation directory to ensure a clean state."
+        rm -rf "${INSTALL_DIR}"
+    fi
+
     echo "=================================================="
-    echo "VM Host Hardener v2.0 - Installer"
+    echo "VM Host Hardener v2.0 - Corrected Installer"
     echo "=================================================="
     print_message "Installing to: ${INSTALL_DIR}"
 
@@ -65,9 +71,8 @@ main() {
     mkdir -p "${INSTALL_DIR}/config"
     mkdir -p "${INSTALL_DIR}/modules"
 
-    # 2. Download all files
+    # 2. Download all module and configuration files from the CORRECT path
     print_message "--- Downloading script components ---"
-    download_file "${BASE_URL}/${MAIN_SCRIPT_NAME}" "${MAIN_SCRIPT_PATH}"
     download_file "${BASE_URL}/config/settings.conf" "${INSTALL_DIR}/config/settings.conf"
 
     local modules=(
@@ -79,28 +84,49 @@ main() {
     for module in "${modules[@]}"; do
         download_file "${BASE_URL}/modules/${module}" "${INSTALL_DIR}/modules/${module}"
     done
-    print_message "✓ All components downloaded."
+    print_message "✓ All components downloaded successfully."
 
-    # 3. *** AUTOMATED PATCHING STEP ***
-    # This fixes the directory location bug in the downloaded harden-vm-host.sh
-    print_message "--- Applying automated patch to fix script error ---"
-    
-    # This is the code that correctly finds the script's directory.
-    local patch_code
-    patch_code='SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" \&> \/dev\/null \&\& pwd)\nreadonly SCRIPT_DIR'
-    
-    # This is the new, corrected 'source' line.
-    local new_source_line
-    new_source_line='if [ -f "${SCRIPT_DIR}\/modules\/00-common.sh" ]; then\n    source "${SCRIPT_DIR}\/modules\/00-common.sh"\nelse\n    echo "FATAL: Module 00-common.sh not found at ${SCRIPT_DIR}\/modules\/00-common.sh."\n    exit 1\nfi'
-
-    # Use sed to find the old 'source' line, insert the patch before it, and replace the old line.
-    if sed -i.bak "s|source \"modules/00-common.sh\"|${patch_code}\n\n${new_source_line}|" "${MAIN_SCRIPT_PATH}"; then
-        rm -f "${MAIN_SCRIPT_PATH}.bak" # Clean up backup file on success
-        print_message "✓ Automated patch applied successfully."
-    else
-        print_error "✗ ERROR: Automated patching failed. The script may not run correctly."
+    # 3. *** GUARANTEED FIX ***
+    # Instead of trying to patch the broken main script, this step creates it correctly from scratch.
+    # This completely avoids any download or patching errors for this critical file.
+    print_message "--- Creating main executable with required fix ---"
+    tee "${MAIN_SCRIPT_PATH}" > /dev/null <<'EOF'
+#!/bin/bash
+set -e
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+readonly SCRIPT_DIR
+if [ -f "${SCRIPT_DIR}/modules/00-common.sh" ]; then
+    source "${SCRIPT_DIR}/modules/00-common.sh"
+else
+    echo "FATAL: Critical module 00-common.sh not found at ${SCRIPT_DIR}/modules/00-common.sh." >&2
+    exit 1
+fi
+main() {
+    print_header "VM Host Hardener v${VERSION}"
+    if [ "$(id -u)" -ne 0 ]; then
+        print_error "This script must be run as root or with sudo privileges."
+        log "ERROR: Script not run as root."
         exit 1
     fi
+    load_config
+    init_log
+    log "===== VM Host Hardener v${VERSION} Started ====="
+    run_module "01-prerequisites.sh"
+    run_module "02-system-updates.sh"
+    run_module "03-ssh-hardening.sh"
+    run_module "04-firewall.sh"
+    run_module "05-libvirt-hardening.sh"
+    run_module "06-kernel-hardening.sh"
+    run_module "07-storage-security.sh"
+    run_module "08-monitoring-auditing.sh"
+    run_module "09-backups.sh"
+    run_module "10-security-report.sh"
+    print_header "Hardening process completed successfully!"
+    log "===== VM Host Hardener Finished ====="
+}
+main
+EOF
+    print_message "✓ Main executable created successfully."
 
     # 4. Set permissions and create symlink
     print_message "--- Finalizing installation ---"
@@ -111,19 +137,17 @@ main() {
 
     # 5. Print final instructions
     echo "=================================================="
-    print_message "✓ Installation and patching complete!"
+    print_message "✓ Installation complete. The script is now ready."
     echo "=================================================="
     echo ""
-    print_warning "--> ACTION REQUIRED: CONFIGURE SSH KEY <--"
-    print_message "Please edit the configuration file and add your public SSH key."
+    print_warning "--> ACTION REQUIRED: CONFIGURE YOUR USER AND SSH KEY <--"
     echo ""
-    echo "  1. Find/Create your key (on your local computer, not the server):"
-    echo "     cat ~/.ssh/id_ed25519.pub"
-    echo ""
-    echo "  2. Open the configuration file on THIS SERVER:"
+    echo "  1. Open the configuration file:"
     echo "     sudo nano ${INSTALL_DIR}/config/settings.conf"
     echo ""
-    echo "  3. Paste your key, save the file, and then run the hardener:"
+    echo "  2. Change ADMIN_USER to \"auggie\" and paste your SSH public key."
+    echo ""
+    echo "  3. Save the file, then run the hardener:"
     echo "     sudo vm-hardener"
     echo ""
 }
