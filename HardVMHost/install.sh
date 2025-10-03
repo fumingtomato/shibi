@@ -1,37 +1,38 @@
 #!/bin/bash
 # =================================================================
-# VM Host Hardener v2.0 - Installation Script
+# VM Host Hardener v2.0 - Self-Patching Installation Script
 #
-# This script downloads and installs the VM Host Hardener to your
-# system. It will not run the hardener automatically.
+# This script downloads the VM Host Hardener and automatically
+# patches a known bug in the main script during installation.
+# The result is a fully functional hardener with no manual
+# fixes required.
 # =================================================================
 
 set -e
 
 # --- Configuration ---
-# Installation directory for all hardening scripts.
 readonly INSTALL_DIR="/opt/vm-host-hardener"
-# The base URL to the raw GitHub files.
-# This must point to the correct repository and branch where the files are hosted.
-readonly BASE_URL="https://raw.githubusercontent.com/fumingtomato/shibi/dude/HardVMHost"
+readonly BASE_URL="https://raw.githubusercontent.com/fumingtomato/shibi/dude/VMhardner"
+readonly MAIN_SCRIPT_NAME="harden-vm-host.sh"
+readonly MAIN_SCRIPT_PATH="${INSTALL_DIR}/${MAIN_SCRIPT_NAME}"
 
-# Color codes for output
+# --- Color Codes ---
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly RED='\033[0;31m'
+readonly NC='\033[0m' # No Color
 
 # --- Helper Functions ---
-print_message() { echo -e "${GREEN}$1\033[0m"; }
-print_warning() { echo -e "${YELLOW}$1\033[0m"; }
-print_error() { echo -e "${RED}$1\033[0m"; }
+print_message() { echo -e "${GREEN}$1${NC}"; }
+print_warning() { echo -e "${YELLOW}$1${NC}"; }
+print_error() { echo -e "${RED}$1${NC}"; }
 
-# Function to download a file using wget or curl.
 download_file() {
     local url="$1"
     local dest="$2"
     local filename=$(basename "$dest")
 
-    echo "Downloading $filename..."
+    echo "Downloading ${filename}..."
     if command -v wget &>/dev/null; then
         if ! wget -q -O "$dest" "$url"; then
             print_error "✗ ERROR: wget failed to download $filename from $url"
@@ -46,120 +47,85 @@ download_file() {
         print_error "✗ ERROR: Neither wget nor curl is available. Please install one and try again."
         exit 1
     fi
-    print_message "✓ Downloaded $filename"
 }
 
 # --- Main Installation Logic ---
 main() {
-    # 1. Check for root privileges
     if [ "$(id -u)" -ne 0 ]; then
         print_error "This script must be run as root or with sudo privileges."
         exit 1
     fi
 
     echo "=================================================="
-    echo "VM Host Hardener v2.0 - Installation"
+    echo "VM Host Hardener v2.0 - Installer"
     echo "=================================================="
     print_message "Installing to: ${INSTALL_DIR}"
 
-    # 2. Create directory structure
+    # 1. Create directory structure
     mkdir -p "${INSTALL_DIR}/config"
     mkdir -p "${INSTALL_DIR}/modules"
 
-    # 3. Download all the files
-    # Main script
-    download_file "${BASE_URL}/harden-vm-host.sh" "${INSTALL_DIR}/harden-vm-host.sh"
-
-    # Config file
+    # 2. Download all files
+    print_message "--- Downloading script components ---"
+    download_file "${BASE_URL}/${MAIN_SCRIPT_NAME}" "${MAIN_SCRIPT_PATH}"
     download_file "${BASE_URL}/config/settings.conf" "${INSTALL_DIR}/config/settings.conf"
 
-    # Module files
     local modules=(
-        "00-common.sh"
-        "01-prerequisites.sh"
-        "02-system-updates.sh"
-        "03-ssh-hardening.sh"
-        "04-firewall.sh"
-        "05-libvirt-hardening.sh"
-        "06-kernel-hardening.sh"
-        "07-storage-security.sh"
-        "08-monitoring-auditing.sh"
-        "09-backups.sh"
-        "10-security-report.sh"
+        "00-common.sh" "01-prerequisites.sh" "02-system-updates.sh"
+        "03-ssh-hardening.sh" "04-firewall.sh" "05-libvirt-hardening.sh"
+        "06-kernel-hardening.sh" "07-storage-security.sh" "08-monitoring-auditing.sh"
+        "09-backups.sh" "10-security-report.sh"
     )
-
     for module in "${modules[@]}"; do
         download_file "${BASE_URL}/modules/${module}" "${INSTALL_DIR}/modules/${module}"
     done
+    print_message "✓ All components downloaded."
 
-    # 4. Set executable permissions
-    print_message "Setting executable permissions..."
-    chmod +x "${INSTALL_DIR}/harden-vm-host.sh"
+    # 3. *** AUTOMATED PATCHING STEP ***
+    # This fixes the directory location bug in the downloaded harden-vm-host.sh
+    print_message "--- Applying automated patch to fix script error ---"
+    
+    # This is the code that correctly finds the script's directory.
+    local patch_code
+    patch_code='SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" \&> \/dev\/null \&\& pwd)\nreadonly SCRIPT_DIR'
+    
+    # This is the new, corrected 'source' line.
+    local new_source_line
+    new_source_line='if [ -f "${SCRIPT_DIR}\/modules\/00-common.sh" ]; then\n    source "${SCRIPT_DIR}\/modules\/00-common.sh"\nelse\n    echo "FATAL: Module 00-common.sh not found at ${SCRIPT_DIR}\/modules\/00-common.sh."\n    exit 1\nfi'
+
+    # Use sed to find the old 'source' line, insert the patch before it, and replace the old line.
+    if sed -i.bak "s|source \"modules/00-common.sh\"|${patch_code}\n\n${new_source_line}|" "${MAIN_SCRIPT_PATH}"; then
+        rm -f "${MAIN_SCRIPT_PATH}.bak" # Clean up backup file on success
+        print_message "✓ Automated patch applied successfully."
+    else
+        print_error "✗ ERROR: Automated patching failed. The script may not run correctly."
+        exit 1
+    fi
+
+    # 4. Set permissions and create symlink
+    print_message "--- Finalizing installation ---"
+    chmod +x "${MAIN_SCRIPT_PATH}"
     chmod +x "${INSTALL_DIR}"/modules/*.sh
+    ln -sf "${MAIN_SCRIPT_PATH}" /usr/local/bin/vm-hardener
+    print_message "✓ Permissions set and 'vm-hardener' command created."
 
-    # 5. Create a symlink for easy execution
-    ln -sf "${INSTALL_DIR}/harden-vm-host.sh" /usr/local/bin/vm-hardener
-    print_message "Symlink created. You can now use the 'vm-hardener' command."
-
-    # 6. Print final instructions
+    # 5. Print final instructions
     echo "=================================================="
-    print_message "✓ Installation Complete!"
+    print_message "✓ Installation and patching complete!"
     echo "=================================================="
     echo ""
     print_warning "--> ACTION REQUIRED: CONFIGURE SSH KEY <--"
+    print_message "Please edit the configuration file and add your public SSH key."
     echo ""
-    print_message "The hardener is configured to use secure SSH keys instead of passwords."
-    print_message "You need to add your PUBLIC SSH key to the configuration file."
+    echo "  1. Find/Create your key (on your local computer, not the server):"
+    echo "     cat ~/.ssh/id_ed25519.pub"
     echo ""
-    cat <<-EOF
-	---------------------------------------------------------------------
-	   How to Find or Create Your SSH Public Key
-	---------------------------------------------------------------------
-	Run these commands on your **LOCAL COMPUTER**, not on this server.
-
-	1. Check for an existing key:
-	   Open a terminal on your local machine (Mac, Linux, or WSL on Windows)
-	   and run:
-	   
-	   cat ~/.ssh/id_ed25519.pub
-
-	   - If it prints a line starting with 'ssh-ed25519...', you have a key!
-	     Copy the ENTIRE line. This is your public key.
-	   - If you get an error like "No such file or directory", proceed to step 2.
-
-	2. If you don't have a key, create one:
-	   Run the following command on your local machine. Ed25519 is modern and secure.
-
-	   ssh-keygen -t ed25519 -C "fumingtomato@example.com"
-
-	   - It will ask where to save the key. Just press ENTER to accept the default.
-	   - It will ask for a passphrase. This is an optional password to protect
-	     your key file. For simplicity, you can leave it empty by pressing ENTER twice.
-	     (For higher security, enter a strong passphrase).
-
-	3. Display and copy your new public key:
-	   After creating the key, run the 'cat' command from step 1 again:
-
-	   cat ~/.ssh/id_ed25519.pub
-
-	   Now it will show your new public key. Copy the entire output.
-	---------------------------------------------------------------------
-
-	Once you have copied your public key:
-
-	1. Open the configuration file on THIS SERVER:
-	   sudo nano ${INSTALL_DIR}/config/settings.conf
-
-	2. Find the line that says:
-	   ADMIN_USER_SSH_KEY="<PASTE YOUR PUBLIC SSH KEY HERE>"
-
-	3. Replace "<PASTE YOUR PUBLIC SSH KEY HERE>" with the key you just copied.
-	   Save the file (Ctrl+O, Enter) and exit (Ctrl+X).
-
-	4. Finally, run the hardener:
-	   sudo vm-hardener
-	EOF
+    echo "  2. Open the configuration file on THIS SERVER:"
+    echo "     sudo nano ${INSTALL_DIR}/config/settings.conf"
+    echo ""
+    echo "  3. Paste your key, save the file, and then run the hardener:"
+    echo "     sudo vm-hardener"
+    echo ""
 }
 
-# --- Entry Point ---
 main
