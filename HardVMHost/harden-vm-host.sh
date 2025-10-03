@@ -21,6 +21,7 @@ if [ -f "${SCRIPT_DIR}/modules/00-common.sh" ]; then
     # shellcheck source=modules/00-common.sh
     source "${SCRIPT_DIR}/modules/00-common.sh"
 else
+    # The 'echo' must use the absolute path for a clear error message.
     echo "FATAL: Module 00-common.sh not found at ${SCRIPT_DIR}/modules/00-common.sh."
     exit 1
 fi
