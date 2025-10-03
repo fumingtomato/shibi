@@ -13,7 +13,7 @@ set -e
 readonly INSTALL_DIR="/opt/vm-host-hardener"
 # The base URL to the raw GitHub files.
 # This must point to the correct repository and branch where the files are hosted.
-readonly BASE_URL="https://raw.githubusercontent.com/fumingtomato/shibi/dude/VMhardner"
+readonly BASE_URL="https://raw.githubusercontent.com/fumingtomato/shibi/dude/HardVMHost"
 
 # Color codes for output
 readonly GREEN='\033[0;32m'
