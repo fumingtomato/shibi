@@ -557,7 +557,7 @@ chmod 600 "$INSTALL_DIR/install.conf"
 
 print_header "Starting Automated Installation"
 echo "All configuration collected. Installation will now proceed automatically."
-echo "This will take approximately 10-15 minutes."
+echo "This will take approximately 30-45 minutes."
 echo ""
 
 # ===================================================================
