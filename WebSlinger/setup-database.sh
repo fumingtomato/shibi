@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# DATABASE SETUP FOR MAIL SERVER - V2 (FIXED PERMISSIONS)
-# Version: 17.0.5
-# Fixes Dovecot socket permissions to allow web-based authentication.
+# DATABASE SETUP FOR MAIL SERVER - V2.1 (FINAL AUTH FIX)
+# Version: 17.0.6
+# Forcefully sets world-writable permissions on the Dovecot auth socket.
 # =================================================================
 
 # Colors
@@ -505,7 +505,7 @@ print_message "✓ Postfix configured for virtual users"
 # 7. CONFIGURE DOVECOT (WITH PERMISSIONS FIX)
 # ===================================================================
 
-print_header "Configuring Dovecot with Permissions Fix"
+print_header "Configuring Dovecot with Final Permissions Fix"
 
 # Backup original configs
 cp -n /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.conf.bak 2>/dev/null || true
@@ -605,12 +605,10 @@ service auth {
     group = postfix
   }
   
-  # *** PERMISSION FIX FOR WEB AUTH ***
-  # This makes the auth socket accessible to the 'dovecot' group, which www-data is a member of.
+  # *** FINAL PERMISSION FIX FOR WEB AUTH ***
+  # This makes the auth socket world-writable, bypassing group issues.
   unix_listener auth-client {
-    mode = 0660
-    user = root
-    group = dovecot 
+    mode = 0666
   }
   
   unix_listener auth-userdb {
@@ -630,7 +628,7 @@ DMASTER
 chmod 600 /etc/dovecot/dovecot-sql.conf.ext
 chown root:root /etc/dovecot/dovecot-sql.conf.ext
 
-print_message "✓ Dovecot configured with auth socket permissions fix"
+print_message "✓ Dovecot configured with final auth socket permissions fix"
 
 # ===================================================================
 # 8. REGENERATE DKIM KEY AS 1024-BIT (CRITICAL)
