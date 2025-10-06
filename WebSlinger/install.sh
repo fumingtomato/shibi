@@ -1,19 +1,19 @@
 #!/bin/bash
 
 # =================================================================
-# BULK MAIL SERVER INSTALLER WITH MULTI-IP SUPPORT
-# Version: 17.0.8 - WITH ADVANCED IP ROTATION
-# Automated installation with Cloudflare DNS, compliance website, and DKIM
-# FIXED: Ensures 1024-bit DKIM key generation and proper configuration
-# ADDED: Universal command access and advanced bulk IP rotation management
+# BULK MAIL SERVER INSTALLER WITH MANAGEMENT PORTAL
+# Version: 18.0.0
 # =================================================================
 
-set -e  # Exit on any error
+set -e
 
-# Installation directory
 INSTALL_DIR="/root/mail-installer"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
+
+LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG_FILE")
+exec 2>&1
 
 # Log file
 LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
@@ -881,59 +881,15 @@ if [[ "$USE_CF" == "y" ]]; then
 fi
 
 # ===================================================================
-# PHASE 9: WEBSITE SETUP
+# PHASE 9: MANAGEMENT PORTAL SETUP (MODIFIED)
 # ===================================================================
 
-print_header "Phase 9: Website Setup"
+print_header "Phase 9: Management Portal Setup"
 
 if [ -f "$INSTALL_DIR/setup-website.sh" ]; then
     bash "$INSTALL_DIR/setup-website.sh"
 else
-    print_warning "Website setup script not found, creating basic site"
-    
-    # Basic website
-    mkdir -p /var/www/$DOMAIN_NAME
-    cat > /var/www/$DOMAIN_NAME/index.html <<EOF
-<!DOCTYPE html>
-<html>
-<head>
-    <title>$DOMAIN_NAME</title>
-</head>
-<body>
-    <h1>Welcome to $DOMAIN_NAME</h1>
-    <p>Mail server is operational</p>
-</body>
-</html>
-EOF
-    
-    # Basic nginx config WITHOUT DUPLICATE SERVER BLOCKS
-    cat > /etc/nginx/sites-available/$DOMAIN_NAME.conf <<EOF
-# Single server block for ALL domains
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name $DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME _;
-    
-    root /var/www/$DOMAIN_NAME;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # Let's Encrypt challenge
-    location /.well-known/acme-challenge/ {
-        root /var/www/$DOMAIN_NAME;
-        allow all;
-    }
-}
-EOF
-    
-    # Remove default site
-    rm -f /etc/nginx/sites-enabled/default
-    
-    ln -sf /etc/nginx/sites-available/$DOMAIN_NAME.conf /etc/nginx/sites-enabled/
-    nginx -t 2>/dev/null && systemctl reload nginx
+    print_error "setup-website.sh not found. Skipping portal setup."
 fi
 
 # ===================================================================
