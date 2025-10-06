@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# MANAGEMENT PORTAL SETUP - V3 (WITH ALIAS MANAGEMENT)
-# Version: 18.2.0
-# Adds email alias management to the portal.
+# MANAGEMENT PORTAL SETUP - V3.1 (FIXED AUTH)
+# Version: 18.2.1
+# Fixes a PHP syntax error in the authentication API.
 # =================================================================
 
 # Colors
@@ -227,14 +227,15 @@ EOF
 
 # --- Secure Authentication API (auth.php) ---
 print_message "Creating secure authentication API..."
-cat > "$WEB_ROOT/api/auth.php" <<'EOF'
+# FIX: Use EOF without quotes to allow variable expansion for $admin_email
+cat > "$WEB_ROOT/api/auth.php" <<EOF
 <?php
 session_start();
 header('Content-Type: application/json');
 
 // --- CONFIG ---
 // The admin user is the first email account created during installation
-\$admin_email = trim(shell_exec("grep '^FIRST_EMAIL=' /root/mail-installer/install.conf | cut -d'=' -f2 | tr -d '\"'"));
+\$admin_email = "$ADMIN_USER_EMAIL";
 // --- END CONFIG ---
 
 function login() {
