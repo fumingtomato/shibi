@@ -11,10 +11,6 @@ INSTALL_DIR="/root/mail-installer"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
-LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
-exec > >(tee -a "$LOG_FILE")
-exec 2>&1
-
 # Log file
 LOG_FILE="/var/log/mail-installer-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE")
