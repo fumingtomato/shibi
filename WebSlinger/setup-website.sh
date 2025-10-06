@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# MANAGEMENT PORTAL SETUP - V3.1 (FIXED AUTH)
-# Version: 18.2.1
-# Fixes a PHP syntax error in the authentication API.
+# MANAGEMENT PORTAL SETUP - V3.2 (DIAGNOSTIC AUTH)
+# Version: 18.2.2
+# Adds detailed error logging to the authentication API for troubleshooting.
 # =================================================================
 
 # Colors
@@ -225,16 +225,14 @@ document.getElementById('loginForm').addEventListener('submit', function(e) {
 <?php include 'includes/footer.php'; ?>
 EOF
 
-# --- Secure Authentication API (auth.php) ---
-print_message "Creating secure authentication API..."
-# FIX: Use EOF without quotes to allow variable expansion for $admin_email
+# --- Secure Authentication API (auth.php) with DIAGNOSTIC LOGGING ---
+print_message "Creating secure authentication API with diagnostic logging..."
 cat > "$WEB_ROOT/api/auth.php" <<EOF
 <?php
 session_start();
 header('Content-Type: application/json');
 
 // --- CONFIG ---
-// The admin user is the first email account created during installation
 \$admin_email = "$ADMIN_USER_EMAIL";
 // --- END CONFIG ---
 
@@ -248,21 +246,17 @@ function login() {
     \$email = \$_POST['email'];
     \$password = \$_POST['password'];
 
-    // Only allow the designated admin to log in
     if (\$email !== \$admin_email) {
         echo json_encode(['success' => false, 'error' => 'Access denied.']);
         exit;
     }
 
-    // Use doveadm to verify password against the mail server's database
-    // This is secure as it doesn't expose the password hash
     \$escaped_password = escapeshellarg(\$password);
-    \$verification_cmd = "doveadm auth test " . escapeshellarg(\$email) . " " . \$escaped_password;
+    // Use full path for doveadm to avoid PATH issues
+    \$verification_cmd = "/usr/bin/doveadm auth test " . escapeshellarg(\$email) . " " . \$escaped_password;
     
-    // Execute the command and capture output
     exec(\$verification_cmd . " 2>&1", \$output, \$return_code);
 
-    // Check if the output contains "passdb lookup succeeded"
     \$auth_success = false;
     foreach (\$output as \$line) {
         if (strpos(\$line, 'passdb lookup succeeded') !== false) {
@@ -276,8 +270,13 @@ function login() {
         \$_SESSION['user'] = \$email;
         echo json_encode(['success' => true]);
     } else {
-        // Log failed attempt for security audits
-        error_log("Failed login attempt for user: " . \$email);
+        // DETAILED LOGGING FOR DIAGNOSIS
+        \$log_message = "Failed login for user: " . \$email . "\\n";
+        \$log_message .= "doveadm command: " . \$verification_cmd . "\\n";
+        \$log_message .= "Return code: " . \$return_code . "\\n";
+        \$log_message .= "Output: " . implode("\\n", \$output);
+        error_log(\$log_message);
+        
         echo json_encode(['success' => false, 'error' => 'Invalid credentials.']);
     }
 }
@@ -681,6 +680,10 @@ systemctl restart php${PHP_VERSION}-fpm
 print_message "Setting final permissions..."
 chown -R www-data:www-data "$WEB_ROOT"
 chmod -R 755 "$WEB_ROOT"
+
+# Allow www-data to run doveadm
+print_message "Configuring permissions for password verification..."
+usermod -a -G dovecot www-data
 
 print_header "Enhanced Portal with Alias Management Setup Complete!"
 echo "Portal URL: http://$DOMAIN_NAME"
