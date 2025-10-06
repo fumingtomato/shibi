@@ -895,12 +895,13 @@ if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
     print_message "Creating Nginx server blocks for SSL validation..."
     i=0
     for ip in "${IP_ADDRESSES[@]}"; do
-        # Skip the primary IP/hostname, which is handled by the default config
+        # The primary hostname (e.g., mx.domain.com) is handled by the default portal config.
+        # We only need to create configs for the numbered subdomains.
         if [ "$ip" == "$PRIMARY_IP" ]; then
+            i=$((i+1)) # Increment counter but skip creating a separate config
             continue
         fi
         
-        i=$((i+1))
         SUBDOMAIN="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
         WEBROOT_DIR="/var/www/$SUBDOMAIN"
         mkdir -p "$WEBROOT_DIR/.well-known/acme-challenge"
@@ -926,6 +927,7 @@ EOF
         # Enable the site
         ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$SUBDOMAIN.conf"
         print_message "✓ Created Nginx config for $SUBDOMAIN"
+        i=$((i+1))
     done
     # Reload nginx to apply new server blocks
     systemctl reload nginx
