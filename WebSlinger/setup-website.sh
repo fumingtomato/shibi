@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# MANAGEMENT PORTAL SETUP - V3.2 (DIAGNOSTIC AUTH)
-# Version: 18.2.2
-# Adds detailed error logging to the authentication API for troubleshooting.
+# MANAGEMENT PORTAL SETUP - V3.3 (CLEANUP)
+# Version: 18.2.3
+# Removes incorrect permission fix, which is now handled by setup-permissions.sh
 # =================================================================
 
 # Colors
@@ -680,10 +680,6 @@ systemctl restart php${PHP_VERSION}-fpm
 print_message "Setting final permissions..."
 chown -R www-data:www-data "$WEB_ROOT"
 chmod -R 755 "$WEB_ROOT"
-
-# Allow www-data to run doveadm
-print_message "Configuring permissions for password verification..."
-usermod -a -G dovecot www-data
 
 print_header "Enhanced Portal with Alias Management Setup Complete!"
 echo "Portal URL: http://$DOMAIN_NAME"
