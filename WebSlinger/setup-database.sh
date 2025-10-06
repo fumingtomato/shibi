@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# DATABASE SETUP FOR MAIL SERVER - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.4 - FIXED with 1024-bit DKIM key generation
-# Sets up MySQL/MariaDB with virtual users automatically
-# Creates first email account from configuration
+# DATABASE SETUP FOR MAIL SERVER - V2 (FIXED PERMISSIONS)
+# Version: 17.0.5
+# Fixes Dovecot socket permissions to allow web-based authentication.
 # =================================================================
 
 # Colors
@@ -503,10 +502,10 @@ fi
 print_message "✓ Postfix configured for virtual users"
 
 # ===================================================================
-# 7. CONFIGURE DOVECOT
+# 7. CONFIGURE DOVECOT (WITH PERMISSIONS FIX)
 # ===================================================================
 
-print_header "Configuring Dovecot"
+print_header "Configuring Dovecot with Permissions Fix"
 
 # Backup original configs
 cp -n /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.conf.bak 2>/dev/null || true
@@ -569,7 +568,7 @@ last_valid_uid = 5000
 mail_privileged_group = vmail
 DMAIL
 
-# Configure master process
+# Configure master process with PERMISSIONS FIX for auth-client
 cat > /etc/dovecot/conf.d/10-master.conf <<DMASTER
 service imap-login {
   inet_listener imap {
@@ -606,6 +605,14 @@ service auth {
     group = postfix
   }
   
+  # *** PERMISSION FIX FOR WEB AUTH ***
+  # This makes the auth socket accessible to the 'dovecot' group, which www-data is a member of.
+  unix_listener auth-client {
+    mode = 0660
+    user = root
+    group = dovecot 
+  }
+  
   unix_listener auth-userdb {
     mode = 0600
     user = vmail
@@ -623,7 +630,7 @@ DMASTER
 chmod 600 /etc/dovecot/dovecot-sql.conf.ext
 chown root:root /etc/dovecot/dovecot-sql.conf.ext
 
-print_message "✓ Dovecot configured"
+print_message "✓ Dovecot configured with auth socket permissions fix"
 
 # ===================================================================
 # 8. REGENERATE DKIM KEY AS 1024-BIT (CRITICAL)
