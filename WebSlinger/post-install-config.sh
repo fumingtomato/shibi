@@ -2,7 +2,7 @@
 
 # =================================================================
 # MAIL SERVER POST-INSTALLATION CONFIGURATION - AUTOMATIC, NO QUESTIONS
-# Version: 17.0.4 - FIXED ip_local_port_range and DKIM verification
+# Version: 17.0.5 - FIXED SSL subdomain generation
 # Configures SSL, firewall, IP rotation finalization, and optimizations
 # =================================================================
 
@@ -325,6 +325,9 @@ fi
 SSL_DOMAINS="$DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME"
 # Add numbered subdomains if multiple IPs
 if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    # *** THIS IS THE FIX ***
+    # Use the MAIL_SUBDOMAIN variable to construct the correct subdomain names.
+    MAIL_PREFIX=${MAIL_SUBDOMAIN:-"mail"}
     for i in $(seq 1 $((${#IP_ADDRESSES[@]} - 1))); do
         SSL_DOMAINS="$SSL_DOMAINS ${MAIL_PREFIX}${i}.$DOMAIN_NAME"
     done
@@ -448,11 +451,10 @@ if [ ! -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
     if host "$DOMAIN_NAME" 8.8.8.8 > /dev/null 2>&1; then
         # Build domain list
         CERT_ARGS="-d $DOMAIN_NAME -d www.$DOMAIN_NAME -d $HOSTNAME"
-        if [ ! -z "$MAIL_SUBDOMAIN" ]; then
-            for i in {1..9}; do
-                [ -d "/var/www/$DOMAIN_NAME" ] && CERT_ARGS="$CERT_ARGS -d ${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
-            done
-        fi
+        MAIL_PREFIX=${MAIL_SUBDOMAIN:-"mail"}
+        for i in {1..9}; do
+            [ -d "/var/www/$DOMAIN_NAME" ] && CERT_ARGS="$CERT_ARGS -d ${MAIL_PREFIX}${i}.$DOMAIN_NAME"
+        done
         
         certbot --nginx $CERT_ARGS \
             --non-interactive --agree-tos --email "$ADMIN_EMAIL" \
@@ -772,8 +774,9 @@ if host "\$DOMAIN" 8.8.8.8 > /dev/null 2>&1; then
     CERT_ARGS="-d \$DOMAIN -d www.\$DOMAIN -d \$HOSTNAME"
     
     # Add numbered subdomains if they exist
+    MAIL_PREFIX=\${MAIL_SUBDOMAIN:-"mail"}
     for i in {1..9}; do
-        SUB="\${MAIL_SUBDOMAIN}\${i}.\$DOMAIN"
+        SUB="\${MAIL_PREFIX}\${i}.\$DOMAIN"
         if host "\$SUB" 8.8.8.8 > /dev/null 2>&1; then
             CERT_ARGS="\$CERT_ARGS -d \$SUB"
         fi
