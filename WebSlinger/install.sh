@@ -2,7 +2,7 @@
 
 # =================================================================
 # BULK MAIL SERVER INSTALLER WITH MANAGEMENT PORTAL
-# Version: 18.0.0
+# Version: 18.0.2 - NGINX & SSL CERTIFICATE FIX
 # =================================================================
 
 set -e
@@ -253,19 +253,19 @@ case "$1" in
                 fi
             done
         fi
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT INTO ip_rotation_advanced (sender_email, assigned_ip, transport_id, rotation_mode) VALUES ('$EMAIL', '$ASSIGNED_IP', $IP_INDEX, '$ROTATION_MODE') ON DUPLICATE KEY UPDATE assigned_ip = '$ASSIGNED_IP', transport_id = $IP_INDEX, rotation_mode = '$ROTATION_MODE'" 2>/dev/null
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT INTO ip_rotation_advanced (sender_email, assigned_ip, transport_id, rotation_mode) VALUES ('$EMAIL', '$ASSIGNED_IP', $IP_INDEX, '$ROTATION_MODE') ON DUPLICATE KEY UPDATE assigned_ip = VALUES(assigned_ip), transport_id = VALUES(transport_id), rotation_mode = VALUES(rotation_mode);" 2>/dev/null
         (grep -v "^$EMAIL " /etc/postfix/sender_transports 2>/dev/null || true) > /tmp/sender_transport_tmp
-        echo "$EMAIL    smtp-ip$IP_INDEX" >> /tmp/sender_transport_tmp
+        echo "$EMAIL    smtp-ip$IP_INDEX:" >> /tmp/sender_transport_tmp
         mv /tmp/sender_transport_tmp /etc/postfix/sender_transports
         postmap hash:/etc/postfix/sender_transports
         echo "✓ Assigned $EMAIL to IP $ASSIGNED_IP (mode: $ROTATION_MODE)"
         ;;
     status)
         echo "=== IP POOL STATUS ==="
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT ip_address AS 'IP Address', is_active AS 'Active', messages_sent_today AS 'Today', messages_sent_total AS 'Total', reputation_score AS 'Score' FROM ip_pool ORDER BY ip_index" 2>/dev/null
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT ip_address AS 'IP Address', is_active AS 'Active', messages_sent_today AS 'Today', messages_sent_total AS 'Total', reputation_score AS 'Score' FROM ip_pool;"
         echo ""
         echo "=== SENDER ASSIGNMENTS ==="
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT sender_email AS 'Sender', assigned_ip AS 'IP', rotation_mode AS 'Mode', message_count AS 'Messages', last_used AS 'Last Used' FROM ip_rotation_advanced ORDER BY last_used DESC LIMIT 20" 2>/dev/null
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT sender_email AS 'Sender', assigned_ip AS 'IP', rotation_mode AS 'Mode', message_count AS 'Messages', last_used AS 'Last Used' FROM ip_rotation_advanced ORDER BY last_used DESC LIMIT 20;"
         ;;
     rotate)
         EMAIL="$2"
@@ -278,7 +278,7 @@ case "$1" in
         NEXT_IP="${IP_ADDRESSES[$NEXT_ID]}"
         mysql -u mailuser -p"$DB_PASS" mailserver -e "UPDATE ip_rotation_advanced SET assigned_ip = '$NEXT_IP', transport_id = $NEXT_ID WHERE sender_email = '$EMAIL'" 2>/dev/null
         sed -i "/^$EMAIL /d" /etc/postfix/sender_transports 2>/dev/null
-        echo "$EMAIL    smtp-ip$NEXT_ID" >> /etc/postfix/sender_transports
+        echo "$EMAIL    smtp-ip$NEXT_ID:" >> /etc/postfix/sender_transports
         postmap hash:/etc/postfix/sender_transports
         echo "✓ Rotated $EMAIL to IP $NEXT_IP"
         ;;
@@ -365,7 +365,7 @@ generate_dkim_key() {
 # ===================================================================
 
 print_header "Multi-IP Bulk Mail Server Installer"
-echo "Version: 17.0.8"
+echo "Version: 18.0.2"
 echo "Starting installation at: $(date)"
 echo ""
 
@@ -877,15 +877,58 @@ if [[ "$USE_CF" == "y" ]]; then
 fi
 
 # ===================================================================
-# PHASE 9: MANAGEMENT PORTAL SETUP (MODIFIED)
+# PHASE 9: MANAGEMENT PORTAL & NGINX SETUP (MODIFIED FOR SSL FIX)
 # ===================================================================
 
-print_header "Phase 9: Management Portal Setup"
+print_header "Phase 9: Management Portal & Nginx Setup"
 
 if [ -f "$INSTALL_DIR/setup-website.sh" ]; then
     bash "$INSTALL_DIR/setup-website.sh"
 else
     print_error "setup-website.sh not found. Skipping portal setup."
+fi
+
+# *** NGINX FIX FOR SSL CERTIFICATES ***
+# Create simple server blocks for each additional IP's subdomain
+# This gives Certbot a place to put its challenge files.
+if [ ${#IP_ADDRESSES[@]} -gt 1 ]; then
+    print_message "Creating Nginx server blocks for SSL validation..."
+    i=0
+    for ip in "${IP_ADDRESSES[@]}"; do
+        # Skip the primary IP/hostname, which is handled by the default config
+        if [ "$ip" == "$PRIMARY_IP" ]; then
+            continue
+        fi
+        
+        i=$((i+1))
+        SUBDOMAIN="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"
+        WEBROOT_DIR="/var/www/$SUBDOMAIN"
+        mkdir -p "$WEBROOT_DIR/.well-known/acme-challenge"
+        chown -R www-data:www-data "$WEBROOT_DIR"
+        
+        cat > "/etc/nginx/sites-available/$SUBDOMAIN.conf" <<EOF
+server {
+    listen 80;
+    server_name $SUBDOMAIN;
+    root $WEBROOT_DIR;
+
+    # Allow certbot to access the challenge files
+    location /.well-known/acme-challenge/ {
+        default_type "text/plain";
+    }
+
+    # For all other requests, return 404
+    location / {
+        return 404; 
+    }
+}
+EOF
+        # Enable the site
+        ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$SUBDOMAIN.conf"
+        print_message "✓ Created Nginx config for $SUBDOMAIN"
+    done
+    # Reload nginx to apply new server blocks
+    systemctl reload nginx
 fi
 
 # ===================================================================
