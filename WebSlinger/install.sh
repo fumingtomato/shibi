@@ -570,7 +570,7 @@ echo ""
 
 print_header "Phase 2: Downloading Components"
 
-GITHUB_BASE="https://raw.githubusercontent.com/fumingtomato/shibi/dude/MXingFun"
+GITHUB_BASE="https://raw.githubusercontent.com/fumingtomato/shibi/dude/WebSlinger"
 
 download_script() {
     local script_name=$1
