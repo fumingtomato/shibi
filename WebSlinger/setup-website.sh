@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# MANAGEMENT PORTAL SETUP - V3.3 (CLEANUP)
-# Version: 18.2.3
-# Removes incorrect permission fix, which is now handled by setup-permissions.sh
+# MANAGEMENT PORTAL SETUP - V3.4 (FINAL LOGIN FIX)
+# Version: 18.2.4
+# Corrects the PHP logic to check for the proper auth success message.
 # =================================================================
 
 # Colors
@@ -23,7 +23,7 @@ print_header() {
     echo -e "${BLUE}==================================================${NC}"
 }
 
-print_header "Setting Up Enhanced Management Portal with Alias Management"
+print_header "Setting Up Enhanced Management Portal with Final Login Fix"
 
 # Load configuration
 if [ -f "/root/mail-installer/install.conf" ]; then
@@ -225,8 +225,8 @@ document.getElementById('loginForm').addEventListener('submit', function(e) {
 <?php include 'includes/footer.php'; ?>
 EOF
 
-# --- Secure Authentication API (auth.php) with DIAGNOSTIC LOGGING ---
-print_message "Creating secure authentication API with diagnostic logging..."
+# --- Secure Authentication API (auth.php) with THE FINAL FIX ---
+print_message "Creating secure authentication API with the final fix..."
 cat > "$WEB_ROOT/api/auth.php" <<EOF
 <?php
 session_start();
@@ -252,14 +252,14 @@ function login() {
     }
 
     \$escaped_password = escapeshellarg(\$password);
-    // Use full path for doveadm to avoid PATH issues
     \$verification_cmd = "/usr/bin/doveadm auth test " . escapeshellarg(\$email) . " " . \$escaped_password;
     
     exec(\$verification_cmd . " 2>&1", \$output, \$return_code);
 
     \$auth_success = false;
     foreach (\$output as \$line) {
-        if (strpos(\$line, 'passdb lookup succeeded') !== false) {
+        // *** THE FINAL FIX: Check for "auth succeeded" instead of the old string ***
+        if (strpos(\$line, 'auth succeeded') !== false) {
             \$auth_success = true;
             break;
         }
@@ -270,13 +270,9 @@ function login() {
         \$_SESSION['user'] = \$email;
         echo json_encode(['success' => true]);
     } else {
-        // DETAILED LOGGING FOR DIAGNOSIS
-        \$log_message = "Failed login for user: " . \$email . "\\n";
-        \$log_message .= "doveadm command: " . \$verification_cmd . "\\n";
-        \$log_message .= "Return code: " . \$return_code . "\\n";
-        \$log_message .= "Output: " . implode("\\n", \$output);
+        // Log the full output for any future debugging, though it should not be needed.
+        \$log_message = "Failed login for user: " . \$email . "\\nOutput: " . implode("\\n", \$output);
         error_log(\$log_message);
-        
         echo json_encode(['success' => false, 'error' => 'Invalid credentials.']);
     }
 }
@@ -681,6 +677,6 @@ print_message "Setting final permissions..."
 chown -R www-data:www-data "$WEB_ROOT"
 chmod -R 755 "$WEB_ROOT"
 
-print_header "Enhanced Portal with Alias Management Setup Complete!"
+print_header "Enhanced Portal with Final Login Fix Complete!"
 echo "Portal URL: http://$DOMAIN_NAME"
 echo "Login with the first email account created during installation: $ADMIN_USER_EMAIL"
