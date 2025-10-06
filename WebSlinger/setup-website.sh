@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-# MANAGEMENT PORTAL SETUP - V3.4 (FINAL LOGIN FIX)
-# Version: 18.2.4
-# Corrects the PHP logic to check for the proper auth success message.
+# MANAGEMENT PORTAL SETUP - V3.5 (DATABASE CONNECTION FIX)
+# Version: 18.2.5
+# Creates a secure config file for the database password, fixing all page load errors.
 # =================================================================
 
 # Colors
@@ -23,7 +23,7 @@ print_header() {
     echo -e "${BLUE}==================================================${NC}"
 }
 
-print_header "Setting Up Enhanced Management Portal with Final Login Fix"
+print_header "Setting Up Enhanced Management Portal with Database Connection Fix"
 
 # Load configuration
 if [ -f "/root/mail-installer/install.conf" ]; then
@@ -48,7 +48,21 @@ apt-get install -y nginx php-fpm php-mysql php-cli php-json unzip > /dev/null 2>
 print_message "Creating portal directory structure at $WEB_ROOT..."
 mkdir -p "$WEB_ROOT"/{css,js,includes,api}
 
-# 3. Create Portal Files
+# 3. Create Secure Database Config
+print_message "Creating secure database configuration..."
+DB_PASS=$(cat /root/.mail_db_password)
+cat > "$WEB_ROOT/includes/config.php" <<EOF
+<?php
+// Secure configuration file
+define('DB_HOST', '127.0.0.1');
+define('DB_USER', 'mailuser');
+define('DB_PASS', '$DB_PASS');
+define('DB_NAME', 'mailserver');
+EOF
+# Set strict permissions on the config file
+chmod 600 "$WEB_ROOT/includes/config.php"
+
+# 4. Create Portal Files
 
 # --- CSS (Refined UI) ---
 print_message "Creating refined CSS file..."
@@ -132,6 +146,11 @@ print_message "Creating new header and footer with Aliases link..."
 cat > "$WEB_ROOT/includes/header.php" <<EOF
 <?php
 session_start();
+// Include the secure config file on all pages except login
+if (basename(\$_SERVER['PHP_SELF']) != 'login.php') {
+    require_once 'includes/config.php';
+}
+
 if (!isset(\$_SESSION['loggedin']) && basename(\$_SERVER['PHP_SELF']) != 'login.php') {
     header('Location: /login.php');
     exit;
@@ -225,8 +244,8 @@ document.getElementById('loginForm').addEventListener('submit', function(e) {
 <?php include 'includes/footer.php'; ?>
 EOF
 
-# --- Secure Authentication API (auth.php) with THE FINAL FIX ---
-print_message "Creating secure authentication API with the final fix..."
+# --- Secure Authentication API (auth.php) ---
+print_message "Creating secure authentication API..."
 cat > "$WEB_ROOT/api/auth.php" <<EOF
 <?php
 session_start();
@@ -258,7 +277,6 @@ function login() {
 
     \$auth_success = false;
     foreach (\$output as \$line) {
-        // *** THE FINAL FIX: Check for "auth succeeded" instead of the old string ***
         if (strpos(\$line, 'auth succeeded') !== false) {
             \$auth_success = true;
             break;
@@ -270,9 +288,7 @@ function login() {
         \$_SESSION['user'] = \$email;
         echo json_encode(['success' => true]);
     } else {
-        // Log the full output for any future debugging, though it should not be needed.
-        \$log_message = "Failed login for user: " . \$email . "\\nOutput: " . implode("\\n", \$output);
-        error_log(\$log_message);
+        error_log("Failed login for user: " . \$email . "\\nOutput: " . implode("\\n", \$output));
         echo json_encode(['success' => false, 'error' => 'Invalid credentials.']);
     }
 }
@@ -316,8 +332,7 @@ cat > "$WEB_ROOT/index.php" <<'EOF'
     <div class="card-header">Quick Stats</div>
     <div class="card-body">
         <?php
-            $db_pass = trim(file_get_contents('/root/.mail_db_password'));
-            $conn = new mysqli('127.0.0.1', 'mailuser', $db_pass, 'mailserver');
+            $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
             $domains_count = shell_exec("ls -l /etc/nginx/sites-available | grep -v 'default' | grep -v 'total' | wc -l");
             $users_count = "DB Error";
             $aliases_count = "DB Error";
@@ -354,7 +369,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_domain'])) {
         $nginx_conf_path = "/etc/nginx/sites-available/$domain";
         
         // 1. Create Nginx config
-        $nginx_conf = "server { listen 80; server_name $domain www.$domain; root $webroot; index index.php index.html; location / { try_files \$uri \$uri/ /index.php?\$args; } location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/var/run/php/php" . phpversion() . "-fpm.sock; } }";
+        $php_version = phpversion();
+        $nginx_conf = "server { listen 80; server_name $domain www.$domain; root $webroot; index index.php index.html; location / { try_files \$uri \$uri/ /index.php?\$args; } location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/var/run/php/php$php_version-fpm.sock; } }";
         file_put_contents($nginx_conf_path, $nginx_conf);
         
         // 2. Enable site
@@ -366,16 +382,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_domain'])) {
         run_command("tar -xzf /tmp/wordpress.tar.gz -C $webroot --strip-components=1");
         run_command("chown -R www-data:www-data $webroot");
         
-        // 4. Create database
+        // 4. Create database using root credentials from the secure config
+        $conn_root = new mysqli(DB_HOST, 'root', DB_PASS); // Assumes mailuser and root have same pass from installer
+        if ($conn_root->connect_error) { // Fallback if root pass is different
+             $root_db_pass_from_file = trim(file_get_contents('/etc/mail-config/db_password'));
+             $conn_root = new mysqli(DB_HOST, 'root', $root_db_pass_from_file);
+        }
+        
         $db_name = preg_replace('/[^a-zA-Z0-9_]/', '_', $domain);
         $db_user = substr($db_name, 0, 16);
-        $db_pass = substr(str_shuffle('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'), 0, 16);
-        $root_db_pass = trim(file_get_contents('/root/.mail_db_password'));
-        $conn = new mysqli('127.0.0.1', 'root', $root_db_pass);
-        $conn->query("CREATE DATABASE $db_name;");
-        $conn->query("CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass';");
-        $conn->query("GRANT ALL PRIVILEGES ON $db_name.* TO '$db_user'@'localhost';");
-        $conn->query("FLUSH PRIVILEGES;");
+        $db_pass_new = substr(str_shuffle('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'), 0, 16);
+        
+        $conn_root->query("CREATE DATABASE $db_name;");
+        $conn_root->query("CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass_new';");
+        $conn_root->query("GRANT ALL PRIVILEGES ON $db_name.* TO '$db_user'@'localhost';");
+        $conn_root->query("FLUSH PRIVILEGES;");
         
         // 5. Configure wp-config.php
         $wp_config_path = "$webroot/wp-config.php";
@@ -383,8 +404,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_domain'])) {
         $config_content = file_get_contents($wp_config_path);
         $config_content = str_replace('database_name_here', $db_name, $config_content);
         $config_content = str_replace('username_here', $db_user, $config_content);
-        $config_content = str_replace('password_here', $db_pass, $config_content);
-        // Add salt keys
+        $config_content = str_replace('password_here', $db_pass_new, $config_content);
         $salts = file_get_contents('https://api.wordpress.org/secret-key/1.1/salt/');
         $config_content = preg_replace('/put your unique phrases here(.+?)\/put/s', $salts, $config_content);
         file_put_contents($wp_config_path, $config_content);
@@ -400,21 +420,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_domain'])) {
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_domain'])) {
     $domain = trim($_POST['domain']);
     if (!empty($domain)) {
-        // 1. Disable and remove Nginx config
-        run_command("rm /etc/nginx/sites-enabled/$domain");
-        run_command("rm /etc/nginx/sites-available/$domain");
-        
-        // 2. Remove web root
+        run_command("rm -f /etc/nginx/sites-enabled/$domain");
+        run_command("rm -f /etc/nginx/sites-available/$domain");
         run_command("rm -rf /var/www/$domain");
         
-        // 3. Drop database
         $db_name = preg_replace('/[^a-zA-Z0-9_]/', '_', $domain);
-        $root_db_pass = trim(file_get_contents('/root/.mail_db_password'));
-        $conn = new mysqli('127.0.0.1', 'root', $root_db_pass);
-        $conn->query("DROP DATABASE IF EXISTS $db_name;");
-        $conn->query("DROP USER IF EXISTS '" . substr($db_name, 0, 16) . "'@'localhost';");
+        $conn_root = new mysqli(DB_HOST, 'root', DB_PASS);
+        $conn_root->query("DROP DATABASE IF EXISTS $db_name;");
+        $conn_root->query("DROP USER IF EXISTS '" . substr($db_name, 0, 16) . "'@'localhost';");
         
-        // 4. Reload Nginx
         run_command("systemctl reload nginx");
         echo "<div style='color:green; padding:10px; background:#e8f5e9; border-radius:4px;'>Domain $domain deleted.</div>";
     }
@@ -473,8 +487,7 @@ print_message "Creating enhanced email management page..."
 cat > "$WEB_ROOT/emails.php" <<'EOF'
 <?php
 include 'includes/header.php';
-$db_pass = trim(file_get_contents('/root/.mail_db_password'));
-$db = new mysqli('127.0.0.1', 'mailuser', $db_pass, 'mailserver');
+$db = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
 
 // Add Email
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_email'])) {
@@ -567,8 +580,7 @@ print_message "Creating new email alias management page..."
 cat > "$WEB_ROOT/aliases.php" <<'EOF'
 <?php
 include 'includes/header.php';
-$db_pass = trim(file_get_contents('/root/.mail_db_password'));
-$db = new mysqli('127.0.0.1', 'mailuser', $db_pass, 'mailserver');
+$db = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
 
 // Add Alias
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_alias'])) {
@@ -647,7 +659,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_alias'])) {
 EOF
 
 
-# 4. Configure Nginx
+# 5. Configure Nginx
 print_message "Configuring Nginx for the portal..."
 NGINX_CONF="/etc/nginx/sites-available/default"
 rm -f /etc/nginx/sites-enabled/default
@@ -672,11 +684,13 @@ ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/default
 systemctl reload nginx
 systemctl restart php${PHP_VERSION}-fpm
 
-# 5. Final Permissions
+# 6. Final Permissions
 print_message "Setting final permissions..."
 chown -R www-data:www-data "$WEB_ROOT"
 chmod -R 755 "$WEB_ROOT"
+# Re-secure the config file after chown
+chmod 600 "$WEB_ROOT/includes/config.php"
 
-print_header "Enhanced Portal with Final Login Fix Complete!"
+print_header "Portal Database Connection Fixed!"
 echo "Portal URL: http://$DOMAIN_NAME"
 echo "Login with the first email account created during installation: $ADMIN_USER_EMAIL"
