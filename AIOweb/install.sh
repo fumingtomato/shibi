@@ -477,6 +477,7 @@ echo "smtp-round-robin unix - - n - - smtp -o smtp_bind_address_iterator=random"
 for i in "${!IP_ADDRESSES[@]}"; do echo "smtp-ip$i unix - - n - - smtp -o smtp_bind_address=${IP_ADDRESSES[$i]}" >> /etc/postfix/master.cf; done
 mkdir -p /etc/opendkim/keys/$DOMAIN_NAME; opendkim-genkey -s mail -d "$DOMAIN_NAME" -D /etc/opendkim/keys -b 1024; mv /etc/opendkim/keys/mail.private /etc/opendkim/keys/$DOMAIN_NAME/; mv /etc/opendkim/keys/mail.txt /etc/opendkim/keys/$DOMAIN_NAME/
 chown -R opendkim:opendkim /etc/opendkim/keys; chmod 600 /etc/opendkim/keys/$DOMAIN_NAME/mail.private
+# CORRECTED VERSION
 cat > /etc/opendkim.conf <<EOF
 AutoRestart Yes
 Mode sv
@@ -484,6 +485,7 @@ Domain $DOMAIN_NAME
 Selector mail
 Socket inet:8891@localhost
 UserID opendkim
+PidFile /run/opendkim/opendkim.pid
 KeyTable /etc/opendkim/KeyTable
 SigningTable /etc/opendkim/SigningTable
 ExternalIgnoreList /etc/opendkim/TrustedHosts
