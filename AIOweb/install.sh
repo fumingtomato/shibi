@@ -315,6 +315,16 @@ run_cloudflare_dns_setup() {
 # --- EMBEDDED: Server Hardening Logic ---
 run_server_hardening() {
     print_header "Function: run_server_hardening"
+    # UFW Firewall
+    ufw allow ssh > /dev/null
+    ufw allow 'Postfix' > /dev/null
+    ufw allow 'Postfix SMTPS' > /dev/null
+    ufw allow 'Postfix Submission' > /dev/null
+    ufw allow 'Dovecot IMAP' > /dev/null
+    ufw allow 'Dovecot IMAPS' > /dev/null
+    ufw allow 'Nginx Full' > /dev/null
+    ufw --force enable
+    # Fail2Ban
     if ! command -v fail2ban-client > /dev/null; then apt-get install -y fail2ban > /dev/null 2>&1; fi
     cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
@@ -329,15 +339,16 @@ enabled = true
 logpath = /var/log/mail.log
 EOF
     systemctl enable fail2ban; systemctl start fail2ban
+    # Kernel (sysctl)
     cat > /etc/sysctl.d/99-mailserver.conf <<'EOF'
 net.ipv4.tcp_fin_timeout = 20; net.ipv4.tcp_tw_reuse = 1; net.ipv4.ip_local_port_range = 10001 65000; net.core.somaxconn = 65535; net.ipv4.tcp_syncookies = 1; net.ipv4.conf.all.rp_filter = 1; net.ipv4.conf.default.rp_filter = 1;
 EOF
     sysctl -p > /dev/null 2>&1
+    # Postfix/Dovecot TLS
     postconf -e "smtpd_tls_security_level = may"; postconf -e "smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"; postconf -e "smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
     if [ -f /etc/dovecot/conf.d/10-ssl.conf ]; then sed -i 's/^ssl = yes/ssl = required/' /etc/dovecot/conf.d/10-ssl.conf; echo "ssl_min_protocol = TLSv1.2" >> /etc/dovecot/conf.d/10-ssl.conf; fi
-    print_message "✓ Server hardening applied (Fail2Ban, Kernel, TLS)."
+    print_message "✓ Server hardening applied (UFW, Fail2Ban, Kernel, TLS)."
 }
-
 # ===================================================================
 # MAIN INSTALLATION SCRIPT
 # ===================================================================
@@ -367,7 +378,6 @@ print_header "Phase 5: Configuring Core Mail Services (Sender & Recipient-Aware)
 groupadd -g 5000 vmail 2>/dev/null || true; useradd -u 5000 -g vmail -d /var/vmail vmail 2>/dev/null || true
 mkdir -p /var/vmail
 chown -R vmail:vmail /var/vmail
-# FIX: Use standard multi-line format for Dovecot configuration
 cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
 mail_location = maildir:/var/vmail/%d/%n
 mail_uid = 5000
@@ -388,21 +398,12 @@ user_query = SELECT '/var/vmail/%d/%n' as home, 5000 AS uid, 5000 AS gid FROM vi
 EOF
 cat > /etc/dovecot/conf.d/10-master.conf <<'EOF'
 service auth {
-  unix_listener /var/spool/postfix/private/auth {
-    mode = 0666
-  }
-  unix_listener auth-userdb {
-    mode = 0600
-    user = vmail
-  }
+  unix_listener /var/spool/postfix/private/auth { mode = 0666 }
+  unix_listener auth-userdb { mode = 0600; user = vmail }
   user = dovecot
 }
 service lmtp {
-  unix_listener /var/spool/postfix/private/dovecot-lmtp {
-    mode = 0600
-    user = postfix
-    group = postfix
-  }
+  unix_listener /var/spool/postfix/private/dovecot-lmtp { mode = 0600; user = postfix; group = postfix }
 }
 EOF
 DB_PASS=$(cat /root/.mail_db_password); mkdir -p /etc/postfix/mysql; touch /etc/postfix/transport; postmap /etc/postfix/transport
@@ -445,7 +446,15 @@ InternalHosts /etc/opendkim/TrustedHosts
 EOF
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
-echo "127.0.0.1" > /etc/opendkim/TrustedHosts; mkdir -p /var/run/opendkim && chown opendkim:opendkim /var/run/opendkim
+echo "127.0.0.1" > /etc/opendkim/TrustedHosts
+# FIX: Create systemd override to manage the runtime directory for OpenDKIM
+mkdir -p /etc/systemd/system/opendkim.service.d
+cat > /etc/systemd/system/opendkim.service.d/override.conf <<'EOF'
+[Service]
+RuntimeDirectory=opendkim
+RuntimeDirectoryMode=0755
+EOF
+systemctl daemon-reload
 # --- PHASE 6: START SERVICES & CONFIGURE WEB/API/UTILITIES ---
 print_header "Phase 6: Starting Services & Configuring Integrations"
 systemctl restart mariadb dovecot postfix opendkim; systemctl enable mariadb dovecot postfix opendkim
