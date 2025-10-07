@@ -2,9 +2,8 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.0.1 - THE CORRECTED FLOW, FEATURE-COMPLETE, FINAL FIX
-# Self-contained with ALL features: Full Web Portal, Multi-IP Sending,
-# IP Rotation, Mailwizz Webhook, Fail2Ban, and Kernel Hardening.
+# Version: 24.0.2 - USER PROMPTS AND IP INPUT RESTORED
+# Self-contained with ALL features and the EXACT prompts you required.
 # ZERO external dependencies.
 # =================================================================
 
@@ -18,6 +17,33 @@ print_message() { echo -e "${GREEN}$1${NC}"; }
 print_error() { echo -e "${RED}$1${NC}" >&2; }
 print_warning() { echo -e "${YELLOW}$1${NC}"; }
 print_header() { echo -e "${BLUE}==================================================${NC}\n${BLUE}$1${NC}\n${BLUE}==================================================${NC}"; }
+
+# --- HELPER FUNCTIONS FOR ADVANCED IP INPUT (RESTORED) ---
+validate_ip() {
+    local ip=$1; if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then IFS='.' read -r -a octets <<< "$ip"; for octet in "${octets[@]}"; do if ((octet > 255)); then return 1; fi; done; return 0; fi; return 1
+}
+ip_to_decimal() {
+    local ip=$1; IFS='.' read -r -a octets <<< "$ip"; echo "$((octets[0] * 256**3 + octets[1] * 256**2 + octets[2] * 256 + octets[3]))"
+}
+decimal_to_ip() {
+    local dec=$1; echo "$((dec >> 24 & 255)).$((dec >> 16 & 255)).$((dec >> 8 & 255)).$((dec & 255))"
+}
+expand_ip_range() {
+    local range=$1; local start_ip end_ip; IFS='-' read -r start_ip end_ip <<< "$range"
+    if ! validate_ip "$start_ip"; then return 1; fi
+    if [ -z "$end_ip" ]; then echo "$start_ip"; return 0; fi
+    if [[ ! "$end_ip" =~ \. ]]; then IFS='.' read -r -a start_octets <<< "$start_ip"; end_ip="${start_octets[0]}.${start_octets[1]}.${start_octets[2]}.$end_ip"; fi
+    if ! validate_ip "$end_ip"; then return 1; fi
+    local start_dec=$(ip_to_decimal "$start_ip"); local end_dec=$(ip_to_decimal "$end_ip")
+    if [ $start_dec -gt $end_dec ]; then return 1; fi
+    for ((dec=start_dec; dec<=end_dec; dec++)); do echo "$(decimal_to_ip $dec)"; done
+}
+expand_cidr() {
+    local cidr=$1; local ip prefix; IFS='/' read -r ip prefix <<< "$cidr"
+    if ! validate_ip "$ip" || [ -z "$prefix" ] || [ "$prefix" -lt 0 ] || [ "$prefix" -gt 32 ]; then return 1; fi
+    local ip_dec=$(ip_to_decimal "$ip"); local mask=$(( (1 << 32) - (1 << (32 - prefix)) )); local network=$(( ip_dec & mask ))
+    local broadcast=$(( network | ~mask & ((1 << 32) - 1) )); for ((dec=network+1; dec<broadcast; dec++)); do echo "$(decimal_to_ip $dec)"; done
+}
 
 # =================================================================
 # EMBEDDED SCRIPT LOGIC AS FUNCTIONS
@@ -136,8 +162,7 @@ EOF
     cat > "$NGINX_CONF" <<EOF
 server { listen 80; server_name $DOMAIN_NAME www.$DOMAIN_NAME; root $WEB_ROOT; index index.php; location / { try_files \$uri \$uri/ /index.php?\$query_string; } location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/var/run/php/php\${PHP_VERSION}-fpm.sock; } location /.well-known/acme-challenge/ { root /var/www/html; } }
 EOF
-    ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/$DOMAIN_NAME.conf"; mkdir -p /var/www/html; chown www-data:www-data /var/w
-ww/html
+    ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/$DOMAIN_NAME.conf"; mkdir -p /var/www/html; chown www-data:www-data /var/www/html
     chown -R www-data:www-data "$WEB_ROOT"
     print_message "✓ Full-featured web portal setup complete."
 }
@@ -264,6 +289,7 @@ EOF
     print_message "✓ Server hardening applied (Fail2Ban, Kernel, TLS)."
 }
 
+
 # ===================================================================
 # MAIN INSTALLATION SCRIPT
 # ===================================================================
@@ -276,13 +302,28 @@ apt-get update -y > /dev/null 2>&1
 DEBIAN_FRONTEND=noninteractive apt-get install -y curl dnsutils sudo > /dev/null 2>&1
 print_message "✓ Prerequisites installed."
 
-# --- PHASE 2: GATHER CONFIGURATION ---
+# --- PHASE 2: GATHER CONFIGURATION (with restored prompts) ---
 print_header "Phase 2: Configuration"
 while true; do read -p "Enter domain name: " DOMAIN_NAME; if [[ "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then break; fi; done
 read -p "Enter mail subdomain (default: mx): " MAIL_SUBDOMAIN; MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mx}; HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
-read -p "Enter admin email for portal & DMARC: " FIRST_EMAIL; read -sp "Enter password for $FIRST_EMAIL: " FIRST_PASS; echo ""; ADMIN_EMAIL=$FIRST_EMAIL
+# --- THIS IS THE RESTORED EMAIL PROMPT ---
+DEFAULT_EMAIL="newsletter@$DOMAIN_NAME"
+read -p "Enter admin email for portal & DMARC (default: $DEFAULT_EMAIL): " FIRST_EMAIL; FIRST_EMAIL=${FIRST_EMAIL:-$DEFAULT_EMAIL}
+read -sp "Enter password for $FIRST_EMAIL: " FIRST_PASS; echo ""; ADMIN_EMAIL=$FIRST_EMAIL
+# --- THIS IS THE RESTORED IP INPUT LOGIC ---
 PRIMARY_IP=$(curl -s4 --max-time 5 https://ifconfig.me/ip); IP_ADDRESSES=("$PRIMARY_IP")
-read -p "Enter additional IPs (space-separated): " -a EXTRA_IPS; if [ ${#EXTRA_IPS[@]} -gt 0 ]; then IP_ADDRESSES+=(${EXTRA_IPS[@]}); fi
+echo "Enter additional IPs. Formats: single (1.2.3.4), range (1.2.3.4-10), CIDR (1.2.3.0/24). Press Enter when done."
+while true; do
+    read -p "IP> " ip_input
+    [ -z "$ip_input" ] && break
+    if [[ "$ip_input" =~ / ]]; then
+        while IFS= read -r ip; do if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then IP_ADDRESSES+=("$ip"); fi; done < <(expand_cidr "$ip_input")
+    elif [[ "$ip_input" =~ - ]]; then
+        while IFS= read -r ip; do if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then IP_ADDRESSES+=("$ip"); fi; done < <(expand_ip_range "$ip_input")
+    else
+        if validate_ip "$ip_input" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip_input " ]]; then IP_ADDRESSES+=("$ip_input"); fi
+    fi
+done
 read -p "Enter Cloudflare API Key/Token (or press Enter for manual DNS): " CF_API_KEY; if [ ! -z "$CF_API_KEY" ]; then if ! [[ ${#CF_API_KEY} -gt 37 ]]; then read -p "Enter Cloudflare account email: " CF_EMAIL; fi; fi
 
 # --- PHASE 3: MAIN PACKAGE INSTALLATION ---
