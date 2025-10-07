@@ -396,14 +396,29 @@ default_pass_scheme = SHA512-CRYPT
 password_query = SELECT email as user, password FROM virtual_users WHERE email = '%u'
 user_query = SELECT '/var/vmail/%d/%n' as home, 5000 AS uid, 5000 AS gid FROM virtual_users WHERE email = '%u'
 EOF
+# FIX: Use meticulously correct multi-line format for Dovecot service definitions
 cat > /etc/dovecot/conf.d/10-master.conf <<'EOF'
 service auth {
-  unix_listener /var/spool/postfix/private/auth { mode = 0666 }
-  unix_listener auth-userdb { mode = 0600; user = vmail }
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0666
+    user = postfix
+    group = postfix
+  }
+
+  unix_listener auth-userdb {
+    mode = 0600
+    user = vmail
+  }
+
   user = dovecot
 }
+
 service lmtp {
-  unix_listener /var/spool/postfix/private/dovecot-lmtp { mode = 0600; user = postfix; group = postfix }
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
 }
 EOF
 DB_PASS=$(cat /root/.mail_db_password); mkdir -p /etc/postfix/mysql; touch /etc/postfix/transport; postmap /etc/postfix/transport
@@ -447,7 +462,6 @@ EOF
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
 echo "127.0.0.1" > /etc/opendkim/TrustedHosts
-# FIX: Create systemd override to manage the runtime directory for OpenDKIM
 mkdir -p /etc/systemd/system/opendkim.service.d
 cat > /etc/systemd/system/opendkim.service.d/override.conf <<'EOF'
 [Service]
