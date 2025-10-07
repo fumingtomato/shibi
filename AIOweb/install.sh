@@ -2,7 +2,7 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.1.1 - FINAL (Hostname Resolution Fix)
+# Version: 24.1.2 - FINAL (Nginx Formatting Fix)
 # This script is fully self-contained and includes ALL original features
 # and management commands. All silent failure points, Python
 # environment, service file, Nginx, and system hostname issues are fixed.
@@ -159,8 +159,28 @@ EOF
 <?php include 'includes/footer.php'; ?>
 EOF
     NGINX_CONF="/etc/nginx/sites-available/$DOMAIN_NAME.conf"; rm -f /etc/nginx/sites-enabled/default
+    
+    # FIX: Use properly formatted heredoc for Nginx config to prevent syntax errors
     cat > "$NGINX_CONF" <<EOF
-server { listen 80; server_name $DOMAIN_NAME www.$DOMAIN_NAME; root $WEB_ROOT; index index.php; location / { try_files \$uri \$uri/ /index.php?\$query_string; } location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/var/run/php/php\${PHP_VERSION}-fpm.sock; } location /.well-known/acme-challenge/ { root /var/www/html; } }
+server {
+    listen 80;
+    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
+    root $WEB_ROOT;
+    index index.php;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php${PHP_VERSION}-fpm.sock;
+    }
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+}
 EOF
     ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/$DOMAIN_NAME.conf"; mkdir -p /var/www/html; chown www-data:www-data /var/www/html
     chown -R www-data:www-data "$WEB_ROOT"
@@ -334,7 +354,11 @@ Restart=always
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload; systemctl start mailwizz-api; systemctl enable mailwizz-api
-    sed -i '/location \/ {/i \    location /api/mailwizz-webhook { proxy_pass http://127.0.0.1:5001/webhook; }' "/etc/nginx/sites-available/$DOMAIN_NAME.conf"
+    # FIX: Correctly format the injected Nginx location block
+    sed -i '/location \/ {/i \
+    location /api/mailwizz-webhook { \
+        proxy_pass http://127.0.0.1:5001/webhook; \
+    }' "/etc/nginx/sites-available/$DOMAIN_NAME.conf"
     systemctl reload nginx
     print_message "✓ Mailwizz webhook API with sticky IP logic is active."
 }
@@ -542,7 +566,7 @@ virtual_mailbox_domains = mysql:/etc/postfix/mysql/virtual_domains.cf;
 virtual_mailbox_maps = mysql:/etc/postfix/mysql/virtual_mailbox.cf;
 smtpd_sasl_type = dovecot; smtpd_sasl_path = private/auth; smtpd_sasl_auth_enable = yes;
 smtpd_recipient_restrictions = permit_sasl_authenticated,reject_unauth_destination;
-milter_protocol = 6; smtpd_milters = inet:localhost:8891; non_smtpd_milters = inet:localhost:8891;
+milter_protocol = 6; smtd_milters = inet:localhost:8891; non_smtpd_milters = inet:localhost:8891;
 EOF
 echo "smtp-round-robin unix - - n - - smtp -o smtp_bind_address_iterator=random" >> /etc/postfix/master.cf
 for i in "${!IP_ADDRESSES[@]}"; do echo "smtp-ip$i unix - - n - - smtp -o smtp_bind_address=${IP_ADDRESSES[$i]}" >> /etc/postfix/master.cf; done
@@ -579,10 +603,31 @@ run_setup_website; create_all_utilities; run_setup_webhook_api; systemctl reload
 # --- PHASE 7: HARDENING, DNS, SSL & FINALIZATION ---
 print_header "Phase 7: Hardening, DNS, SSL & Finalization"
 run_server_hardening; run_cloudflare_dns_setup
-for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; SUBDOMAIN="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME}"; WEBROOT_DIR="/var/www/html/$SUBDOMAIN"; mkdir -p "$WEBROOT_DIR"; cat > "/etc/nginx/sites-available/$SUBDOMAIN.conf" <<EOF
-server { listen 80; server_name $SUBDOMAIN; location /.well-known/acme-challenge/ { root $WEBROOT_DIR; } location / { return 404; } }
+
+# FIX: Use properly formatted heredoc for Nginx config to prevent syntax errors
+for i in "${!IP_ADDRESSES[@]}"; do
+    if [ $i -eq 0 ]; then continue; fi
+    SUBDOMAIN="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME}"
+    WEBROOT_DIR="/var/www/html/$SUBDOMAIN"
+    mkdir -p "$WEBROOT_DIR"
+    cat > "/etc/nginx/sites-available/$SUBDOMAIN.conf" <<EOF
+server {
+    listen 80;
+    server_name $SUBDOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root $WEBROOT_DIR;
+    }
+
+    location / {
+        return 404;
+    }
+}
 EOF
-ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$SUBDOMAIN.conf"; done; systemctl reload nginx
+    ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$SUBDOMAIN.conf"
+done
+systemctl reload nginx
+
 if [ ! -z "$CF_API_KEY" ]; then
     print_message "Waiting 90 seconds for DNS records to propagate before requesting SSL certificate..."
     sleep 90
