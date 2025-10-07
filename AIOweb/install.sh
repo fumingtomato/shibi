@@ -365,23 +365,45 @@ run_setup_database
 # --- PHASE 5: CONFIGURE CORE MAIL SERVICES (SENDER & RECIPIENT-AWARE) ---
 print_header "Phase 5: Configuring Core Mail Services (Sender & Recipient-Aware)"
 groupadd -g 5000 vmail 2>/dev/null || true; useradd -u 5000 -g vmail -d /var/vmail vmail 2>/dev/null || true
-# FIX: Explicitly create the /var/vmail directory before changing ownership
 mkdir -p /var/vmail
 chown -R vmail:vmail /var/vmail
+# FIX: Use standard multi-line format for Dovecot configuration
 cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
-mail_location = maildir:/var/vmail/%d/%n; mail_uid = 5000; mail_gid = 5000;
+mail_location = maildir:/var/vmail/%d/%n
+mail_uid = 5000
+mail_gid = 5000
+mail_privileged_group = vmail
 EOF
 cat > /etc/dovecot/conf.d/10-auth.conf <<'EOF'
-disable_plaintext_auth = yes; auth_mechanisms = plain login; !include auth-sql.conf.ext
+disable_plaintext_auth = yes
+auth_mechanisms = plain login
+!include auth-sql.conf.ext
 EOF
 cat > /etc/dovecot/dovecot-sql.conf.ext <<EOF
-driver = mysql; connect = host=127.0.0.1 dbname=mailserver user=mailuser password=$(cat /root/.mail_db_password);
-password_query = SELECT email as user, password FROM virtual_users WHERE email = '%u';
-user_query = SELECT '/var/vmail/%d/%n' as home, 5000 AS uid, 5000 AS gid FROM virtual_users WHERE email = '%u';
+driver = mysql
+connect = host=127.0.0.1 dbname=mailserver user=mailuser password=$(cat /root/.mail_db_password)
+default_pass_scheme = SHA512-CRYPT
+password_query = SELECT email as user, password FROM virtual_users WHERE email = '%u'
+user_query = SELECT '/var/vmail/%d/%n' as home, 5000 AS uid, 5000 AS gid FROM virtual_users WHERE email = '%u'
 EOF
 cat > /etc/dovecot/conf.d/10-master.conf <<'EOF'
-service auth { unix_listener /var/spool/postfix/private/auth { mode = 0666 }; unix_listener auth-userdb { mode = 0600; user = vmail }; user = dovecot; }
-service lmtp { unix_listener /var/spool/postfix/private/dovecot-lmtp { mode = 0600; user = postfix; group = postfix; } }
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0666
+  }
+  unix_listener auth-userdb {
+    mode = 0600
+    user = vmail
+  }
+  user = dovecot
+}
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
+}
 EOF
 DB_PASS=$(cat /root/.mail_db_password); mkdir -p /etc/postfix/mysql; touch /etc/postfix/transport; postmap /etc/postfix/transport
 cat > /etc/postfix/mysql/virtual_domains.cf <<EOF
@@ -410,8 +432,16 @@ for i in "${!IP_ADDRESSES[@]}"; do echo "smtp-ip$i unix - - n - - smtp -o smtp_b
 mkdir -p /etc/opendkim/keys/$DOMAIN_NAME; opendkim-genkey -s mail -d "$DOMAIN_NAME" -D /etc/opendkim/keys -b 1024; mv /etc/opendkim/keys/mail.private /etc/opendkim/keys/$DOMAIN_NAME/; mv /etc/opendkim/keys/mail.txt /etc/opendkim/keys/$DOMAIN_NAME/
 chown -R opendkim:opendkim /etc/opendkim/keys; chmod 600 /etc/opendkim/keys/$DOMAIN_NAME/mail.private
 cat > /etc/opendkim.conf <<EOF
-AutoRestart Yes; Mode sv; Domain $DOMAIN_NAME; Selector mail; Socket inet:8891@localhost; UserID opendkim;
-KeyTable /etc/opendkim/KeyTable; SigningTable /etc/opendkim/SigningTable; ExternalIgnoreList /etc/opendkim/TrustedHosts; InternalHosts /etc/opendkim/TrustedHosts;
+AutoRestart Yes
+Mode sv
+Domain $DOMAIN_NAME
+Selector mail
+Socket inet:8891@localhost
+UserID opendkim
+KeyTable /etc/opendkim/KeyTable
+SigningTable /etc/opendkim/SigningTable
+ExternalIgnoreList /etc/opendkim/TrustedHosts
+InternalHosts /etc/opendkim/TrustedHosts
 EOF
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
