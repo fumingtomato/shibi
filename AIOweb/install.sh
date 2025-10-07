@@ -2,7 +2,7 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.0.6 - ALL UTILITIES RESTORED
+# Version: 24.0.6 - ALL UTILITIES RESTORED (Corrected)
 # This script is fully self-contained and includes ALL original features
 # and management commands. ZERO external dependencies.
 # =================================================================
@@ -179,10 +179,28 @@ EOF
 #!/bin/bash
 DB_PASS=$(cat /root/.mail_db_password); MYSQL_CMD="mysql -u mailuser -p$DB_PASS mailserver"
 case "$1" in
-    add) $MYSQL_CMD -e "INSERT INTO virtual_users (domain_id, email, password) SELECT id, '$2', '\$(doveadm pw -s SHA512-CRYPT -p "$3")' FROM virtual_domains WHERE name = '${2#*@}';" ;;
-    delete) $MYSQL_CMD -e "DELETE FROM virtual_users WHERE email = '$2';" ;;
-    list) $MYSQL_CMD -e "SELECT email FROM virtual_users;" ;;
-    *) echo "Usage: $0 {add|delete|list} <email> [password]" ;;
+    add)
+        # FIX: Pre-hash the password to avoid shell expansion issues with mysql -e
+        if [ -z "$3" ]; then echo "Error: Password is required."; exit 1; fi
+        PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$3")
+        $MYSQL_CMD -e "INSERT INTO virtual_users (domain_id, email, password) SELECT id, '$2', '$PASS_HASH' FROM virtual_domains WHERE name = '${2#*@}';"
+        ;;
+    delete)
+        $MYSQL_CMD -e "DELETE FROM virtual_users WHERE email = '$2';"
+        ;;
+    list)
+        $MYSQL_CMD -e "SELECT email FROM virtual_users;"
+        ;;
+    password)
+        # FIX: Add missing password change functionality
+        if [ -z "$3" ]; then echo "Error: New password is required."; exit 1; fi
+        PASS_HASH=$(doveadm pw -s SHA512-CRYPT -p "$3")
+        $MYSQL_CMD -e "UPDATE virtual_users SET password = '$PASS_HASH' WHERE email = '$2';"
+        echo "Password for $2 changed."
+        ;;
+    *)
+        echo "Usage: $0 {add|delete|list|password} <email> [password]"
+        ;;
 esac
 EOF
     # test-email
@@ -227,12 +245,13 @@ EOF
     cat > /usr/local/bin/bulk-ip-manage <<'EOF'
 #!/bin/bash
 DB_PASS=$(cat /root/.mail_db_password)
+MYSQL_CMD="mysql -u mailuser -p$DB_PASS mailserver -sN"
 RECIPIENT_TRANSPORT_FILE="/etc/postfix/transport"
 COMMAND="$1"; TARGET_EMAIL="$2"; MODE="$3"
 case "$COMMAND" in
     assign-recipient)
         if [[ "$MODE" == "sticky" ]]; then
-            TRANSPORT_NAME=$(mysql -u mailuser -p"$DB_PASS" mailserver -sN -e "SELECT CONCAT('smtp-ip', ip_index) FROM ip_pool ORDER BY messages_sent_total ASC LIMIT 1;")
+            TRANSPORT_NAME=$($MYSQL_CMD -e "SELECT CONCAT('smtp-ip', ip_index) FROM ip_pool ORDER BY messages_sent_total ASC LIMIT 1;")
             if [ -z "$TRANSPORT_NAME" ]; then echo "Error: No IPs in pool." >&2; exit 1; fi
             sed -i "/^${TARGET_EMAIL} /d" "$RECIPIENT_TRANSPORT_FILE"
             echo "$TARGET_EMAIL $TRANSPORT_NAME:" >> "$RECIPIENT_TRANSPORT_FILE"
@@ -244,12 +263,23 @@ case "$COMMAND" in
             echo "Set recipient $TARGET_EMAIL to use default round-robin sending."
         else echo "Invalid mode for recipient. Use 'sticky' or 'round-robin'." >&2; exit 1; fi;;
     assign-sender)
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT INTO sender_ip_map (sender_email, rotation_mode) VALUES ('$TARGET_EMAIL', '$MODE') ON DUPLICATE KEY UPDATE rotation_mode=VALUES(rotation_mode);"
-        echo "Assigned sender $TARGET_EMAIL with mode $MODE";;
+        # FIX: Implement full logic for sticky and round-robin sender assignment
+        if [[ "$MODE" == "sticky" ]]; then
+            STICKY_IP=$($MYSQL_CMD -e "SELECT ip_address FROM ip_pool ORDER BY messages_sent_total ASC LIMIT 1;")
+            if [ -z "$STICKY_IP" ]; then echo "Error: No IPs in pool." >&2; exit 1; fi
+            $MYSQL_CMD -e "INSERT INTO sender_ip_map (sender_email, assigned_ip, rotation_mode) VALUES ('$TARGET_EMAIL', '$STICKY_IP', 'sticky') ON DUPLICATE KEY UPDATE assigned_ip=VALUES(assigned_ip), rotation_mode=VALUES(rotation_mode);"
+            echo "Assigned sender $TARGET_EMAIL to sticky IP $STICKY_IP"
+        elif [[ "$MODE" == "round-robin" ]]; then
+            $MYSQL_CMD -e "INSERT INTO sender_ip_map (sender_email, assigned_ip, rotation_mode) VALUES ('$TARGET_EMAIL', NULL, 'round-robin') ON DUPLICATE KEY UPDATE assigned_ip=VALUES(assigned_ip), rotation_mode=VALUES(rotation_mode);"
+            echo "Set sender $TARGET_EMAIL to use default round-robin sending."
+        else
+            echo "Invalid mode for sender. Use 'sticky' or 'round-robin'." >&2; exit 1
+        fi
+        ;;
     status)
         echo "--- Recipient Assignments (Sticky) ---"; cat "$RECIPIENT_TRANSPORT_FILE"
         echo ""; echo "--- Sender Assignments (Default) ---"
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT * FROM sender_ip_map;";;
+        $MYSQL_CMD -e "SELECT * FROM sender_ip_map;";;
     *) echo "Usage: $0 {assign-recipient|assign-sender|status} <email> <sticky|round-robin>";;
 esac
 postfix reload
@@ -481,6 +511,11 @@ for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; SUBDOMAIN
 server { listen 80; server_name $SUBDOMAIN; location /.well-known/acme-challenge/ { root $WEBROOT_DIR; } location / { return 404; } }
 EOF
 ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$SUBDOMAIN.conf"; done; systemctl reload nginx
+# FIX: Add a delay to allow DNS records to propagate before attempting SSL certificate generation.
+if [ ! -z "$CF_API_KEY" ]; then
+    print_message "Waiting 90 seconds for DNS records to propagate before requesting SSL certificate..."
+    sleep 90
+fi
 CERT_DOMAINS=""; DOMAINS_TO_CHECK=("$DOMAIN_NAME" "www.$DOMAIN_NAME" "$HOSTNAME"); for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; DOMAINS_TO_CHECK+=("${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"); done
 for domain in "${DOMAINS_TO_CHECK[@]}"; do if host "$domain" 8.8.8.8 > /dev/null 2>&1; then CERT_DOMAINS="$CERT_DOMAINS -d $domain"; fi; done
 if [[ ! -z "$CERT_DOMAINS" ]]; then certbot --nginx $CERT_DOMAINS --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect --no-eff-email 2>/dev/null || true; fi
@@ -528,7 +563,8 @@ print_message "--- Step 1: Add Your SSH Public Key to the Server ---"
 print_message "On your LOCAL computer (not the server), run this command to copy your key:"
 print_message "  cat ~/.ssh/id_rsa.pub"
 echo ""
-print_message "On THIS SERVER, logged in as 'fumingtomato', run the following commands:"
+# FIX: Removed the confusing/hardcoded username reference
+print_message "On THIS SERVER, logged in as the current user, run the following commands:"
 print_message "  1. mkdir -p ~/.ssh"
 print_message "  2. nano ~/.ssh/authorized_keys"
 print_message "     (Paste your key from the previous step into this file and save it)"
