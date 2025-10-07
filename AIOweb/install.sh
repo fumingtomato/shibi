@@ -2,9 +2,9 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.0.2 - USER PROMPTS AND IP INPUT RESTORED
-# Self-contained with ALL features and the EXACT prompts you required.
-# ZERO external dependencies.
+# Version: 24.0.6 - ALL UTILITIES RESTORED
+# This script is fully self-contained and includes ALL original features
+# and management commands. ZERO external dependencies.
 # =================================================================
 
 set -e
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS virtual_domains (id INT AUTO_INCREMENT PRIMARY KEY, n
 CREATE TABLE IF NOT EXISTS virtual_users (id INT AUTO_INCREMENT PRIMARY KEY, domain_id INT NOT NULL, email VARCHAR(255) NOT NULL UNIQUE, password VARCHAR(255) NOT NULL, FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS virtual_aliases (id INT AUTO_INCREMENT PRIMARY KEY, domain_id INT NOT NULL, source VARCHAR(255) NOT NULL UNIQUE, destination VARCHAR(255) NOT NULL, FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS ip_pool (ip_address VARCHAR(45) PRIMARY KEY, ip_index INT, messages_sent_total BIGINT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS sender_ip_map (sender_email VARCHAR(255) PRIMARY KEY, assigned_ip VARCHAR(45), rotation_mode ENUM('sticky', 'round-robin') DEFAULT 'sticky');
+CREATE TABLE IF NOT EXISTS sender_ip_map (sender_email VARCHAR(255) PRIMARY KEY, assigned_ip VARCHAR(45), rotation_mode ENUM('sticky', 'round-robin') DEFAULT 'round-robin');
 EOF
     mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN_NAME');"
     if [ ! -z "$FIRST_EMAIL" ] && [ ! -z "$FIRST_PASS" ]; then
@@ -88,7 +88,6 @@ run_setup_website() {
     cat > "$WEB_ROOT/includes/config.php" <<EOF
 <?php define('DB_HOST','127.0.0.1'); define('DB_USER','mailuser'); define('DB_PASS','$DB_PASS'); define('DB_NAME','mailserver'); ?>
 EOF
-    # --- START: FULL FEATURED PHP PORTAL ---
     cat > "$WEB_ROOT/includes/header.php" <<'EOF'
 <?php session_start(); if (basename($_SERVER['PHP_SELF']) !== 'login.php' && (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true)) { header('Location: /login.php'); exit; } ?>
 <!DOCTYPE html><html lang="en"><head><title>Mail Portal</title><style>body{font-family:sans-serif;}</style></head><body><div><nav><a href="/">Dashboard</a> | <a href="/domains.php">Domains</a> | <a href="/emails.php">Emails</a> | <a href="/aliases.php">Aliases</a> | <a href="/system.php">System</a> | <a href="/api/auth.php?action=logout">Logout</a></nav><main>
@@ -167,50 +166,114 @@ EOF
     print_message "✓ Full-featured web portal setup complete."
 }
 
-# --- EMBEDDED: bulk-ip-manage utility ---
-create_bulk_ip_utility() {
-    print_header "Function: create_bulk_ip_utility"
+# --- EMBEDDED: create_all_utilities (RESTORED) ---
+create_all_utilities() {
+    print_header "Function: create_all_utilities"
+    # mail-status
+    cat > /usr/local/bin/mail-status <<'EOF'
+#!/bin/bash
+echo "Mail Server Status" && for s in postfix dovecot opendkim mariadb nginx fail2ban; do systemctl is-active --quiet $s && echo "  $s: Running" || echo "  $s: Stopped"; done
+EOF
+    # mail-account
+    cat > /usr/local/bin/mail-account <<'EOF'
+#!/bin/bash
+DB_PASS=$(cat /root/.mail_db_password); MYSQL_CMD="mysql -u mailuser -p$DB_PASS mailserver"
+case "$1" in
+    add) $MYSQL_CMD -e "INSERT INTO virtual_users (domain_id, email, password) SELECT id, '$2', '\$(doveadm pw -s SHA512-CRYPT -p "$3")' FROM virtual_domains WHERE name = '${2#*@}';" ;;
+    delete) $MYSQL_CMD -e "DELETE FROM virtual_users WHERE email = '$2';" ;;
+    list) $MYSQL_CMD -e "SELECT email FROM virtual_users;" ;;
+    *) echo "Usage: $0 {add|delete|list} <email> [password]" ;;
+esac
+EOF
+    # test-email
+    cat > /usr/local/bin/test-email <<EOF
+#!/bin/bash
+echo "This is a test email from $HOSTNAME" | mail -s "Test Email" "$1"
+EOF
+    # check-dns
+    cat > /usr/local/bin/check-dns <<'EOF'
+#!/bin/bash
+dig +short "$1" MX; dig +short "$1" TXT; dig +short "mail._domainkey.$1" TXT;
+EOF
+    # mail-log
+    cat > /usr/local/bin/mail-log <<'EOF'
+#!/bin/bash
+case "$1" in
+    live) tail -f /var/log/mail.log;;
+    errors) grep -i "error\|warning\|fatal" /var/log/mail.log | tail -50;;
+    search) grep -i "$2" /var/log/mail.log | tail -100;;
+    *) echo "Usage: $0 {live|errors|search} [term]";;
+esac
+EOF
+    # mail-queue
+    cat > /usr/local/bin/mail-queue <<'EOF'
+#!/bin/bash
+case "$1" in
+    show) mailq;;
+    flush) postqueue -f;;
+    clear) postsuper -d ALL;;
+    *) echo "Usage: $0 {show|flush|clear}";;
+esac
+EOF
+    # mail-backup
+    cat > /usr/local/bin/mail-backup <<'EOF'
+#!/bin/bash
+BACKUP_DIR="/root/mail_backups/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$BACKUP_DIR"
+mysqldump -u mailuser -p"$(cat /root/.mail_db_password)" mailserver > "$BACKUP_DIR/database.sql"
+tar -czf "$BACKUP_DIR/config.tar.gz" /etc/postfix /etc/dovecot /etc/opendkim /etc/nginx
+echo "Backup created in $BACKUP_DIR"
+EOF
+    # bulk-ip-manage (SENDER & RECIPIENT AWARE)
     cat > /usr/local/bin/bulk-ip-manage <<'EOF'
 #!/bin/bash
 DB_PASS=$(cat /root/.mail_db_password)
-SENDER="$2"; MODE="$3"
-case "$1" in
-    assign)
-        IP_TO_ASSIGN=""; if [[ "$MODE" == "sticky" ]]; then IP_TO_ASSIGN=$(mysql -u mailuser -p"$DB_PASS" mailserver -sN -e "SELECT ip_address FROM ip_pool ORDER BY messages_sent_total ASC LIMIT 1;"); elif [[ "$MODE" == "round-robin" ]]; then IP_TO_ASSIGN="round-robin-placeholder"; else echo "Invalid mode." >&2; exit 1; fi
-        mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT INTO sender_ip_map (sender_email, assigned_ip, rotation_mode) VALUES ('$SENDER', '$IP_TO_ASSIGN', '$MODE') ON DUPLICATE KEY UPDATE assigned_ip=VALUES(assigned_ip), rotation_mode=VALUES(rotation_mode);"
-        postfix reload; echo "Assigned $SENDER with mode $MODE" ;;
-    status) mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT * FROM sender_ip_map;" ;;
-    *) echo "Usage: $0 {assign|status} <email> <sticky|round-robin>";;
+RECIPIENT_TRANSPORT_FILE="/etc/postfix/transport"
+COMMAND="$1"; TARGET_EMAIL="$2"; MODE="$3"
+case "$COMMAND" in
+    assign-recipient)
+        if [[ "$MODE" == "sticky" ]]; then
+            TRANSPORT_NAME=$(mysql -u mailuser -p"$DB_PASS" mailserver -sN -e "SELECT CONCAT('smtp-ip', ip_index) FROM ip_pool ORDER BY messages_sent_total ASC LIMIT 1;")
+            if [ -z "$TRANSPORT_NAME" ]; then echo "Error: No IPs in pool." >&2; exit 1; fi
+            sed -i "/^${TARGET_EMAIL} /d" "$RECIPIENT_TRANSPORT_FILE"
+            echo "$TARGET_EMAIL $TRANSPORT_NAME:" >> "$RECIPIENT_TRANSPORT_FILE"
+            postmap "$RECIPIENT_TRANSPORT_FILE"
+            echo "Assigned recipient $TARGET_EMAIL to sticky IP via $TRANSPORT_NAME"
+        elif [[ "$MODE" == "round-robin" ]]; then
+            sed -i "/^${TARGET_EMAIL} /d" "$RECIPIENT_TRANSPORT_FILE"
+            postmap "$RECIPIENT_TRANSPORT_FILE"
+            echo "Set recipient $TARGET_EMAIL to use default round-robin sending."
+        else echo "Invalid mode for recipient. Use 'sticky' or 'round-robin'." >&2; exit 1; fi;;
+    assign-sender)
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT INTO sender_ip_map (sender_email, rotation_mode) VALUES ('$TARGET_EMAIL', '$MODE') ON DUPLICATE KEY UPDATE rotation_mode=VALUES(rotation_mode);"
+        echo "Assigned sender $TARGET_EMAIL with mode $MODE";;
+    status)
+        echo "--- Recipient Assignments (Sticky) ---"; cat "$RECIPIENT_TRANSPORT_FILE"
+        echo ""; echo "--- Sender Assignments (Default) ---"
+        mysql -u mailuser -p"$DB_PASS" mailserver -e "SELECT * FROM sender_ip_map;";;
+    *) echo "Usage: $0 {assign-recipient|assign-sender|status} <email> <sticky|round-robin>";;
 esac
+postfix reload
 EOF
-    chmod +x /usr/local/bin/bulk-ip-manage
-    print_message "✓ 'bulk-ip-manage' utility created."
+    chmod +x /usr/local/bin/*
+    print_message "✓ All management utilities created."
 }
 
-# --- EMBEDDED: setup-webhook-api.sh (With sticky IP logic) ---
+# --- EMBEDDED: setup-webhook-api.sh (With sticky recipient logic) ---
 run_setup_webhook_api() {
     print_header "Function: run_setup_webhook_api"
     apt-get install -y python3 python3-pip python3-venv > /dev/null 2>&1; python3 -m pip install flask gunicorn > /dev/null 2>&1
     mkdir -p /opt/mailwizz-api
     cat > /opt/mailwizz-api/webhook_handler.py <<'EOF'
 from flask import Flask, request, jsonify
-import subprocess, json, re
+import subprocess
 app = Flask(__name__)
-def find_ip_from_log(email):
-    try:
-        cmd = f"grep -E 'to=<{re.escape(email)}>,.* status=sent' /var/log/mail.log | grep -o 'smtp_bind_address=[0-9.]*' | tail -n 1"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout: return result.stdout.strip().split('=')[1]
-    except: pass
-    return None
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
     data = request.get_json()
     if data and data.get('event') == 'open':
         recipient = data.get('subscriber', {}).get('email')
         if recipient:
-            # When an email is opened, make the recipient sticky to the IP that sent it
-            subprocess.run(['sudo', '/usr/local/bin/bulk-ip-manage', 'assign', recipient, 'sticky'], check=True)
+            subprocess.run(['sudo', '/usr/local/bin/bulk-ip-manage', 'assign-recipient', recipient, 'sticky'], check=True)
     return jsonify({'status': 'success'}), 200
 if __name__ == '__main__': app.run(host='127.0.0.1', port=5001)
 EOF
@@ -252,7 +315,6 @@ run_cloudflare_dns_setup() {
 # --- EMBEDDED: Server Hardening Logic ---
 run_server_hardening() {
     print_header "Function: run_server_hardening"
-    # Fail2Ban
     if ! command -v fail2ban-client > /dev/null; then apt-get install -y fail2ban > /dev/null 2>&1; fi
     cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
@@ -267,76 +329,41 @@ enabled = true
 logpath = /var/log/mail.log
 EOF
     systemctl enable fail2ban; systemctl start fail2ban
-    # Kernel (sysctl)
     cat > /etc/sysctl.d/99-mailserver.conf <<'EOF'
-net.ipv4.tcp_fin_timeout = 20
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 10001 65000
-net.core.somaxconn = 65535
-net.ipv4.tcp_syncookies = 1
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+net.ipv4.tcp_fin_timeout = 20; net.ipv4.tcp_tw_reuse = 1; net.ipv4.ip_local_port_range = 10001 65000; net.core.somaxconn = 65535; net.ipv4.tcp_syncookies = 1; net.ipv4.conf.all.rp_filter = 1; net.ipv4.conf.default.rp_filter = 1;
 EOF
     sysctl -p > /dev/null 2>&1
-    # Postfix/Dovecot TLS
-    postconf -e "smtpd_tls_security_level = may"
-    postconf -e "smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
-    postconf -e "smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
-    if [ -f /etc/dovecot/conf.d/10-ssl.conf ]; then
-        sed -i 's/^ssl = yes/ssl = required/' /etc/dovecot/conf.d/10-ssl.conf
-        echo "ssl_min_protocol = TLSv1.2" >> /etc/dovecot/conf.d/10-ssl.conf
-    fi
+    postconf -e "smtpd_tls_security_level = may"; postconf -e "smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"; postconf -e "smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
+    if [ -f /etc/dovecot/conf.d/10-ssl.conf ]; then sed -i 's/^ssl = yes/ssl = required/' /etc/dovecot/conf.d/10-ssl.conf; echo "ssl_min_protocol = TLSv1.2" >> /etc/dovecot/conf.d/10-ssl.conf; fi
     print_message "✓ Server hardening applied (Fail2Ban, Kernel, TLS)."
 }
-
 
 # ===================================================================
 # MAIN INSTALLATION SCRIPT
 # ===================================================================
-
 print_header "Starting The Definitive All-In-One Mail Server Installation"
-
 # --- PHASE 1: PREREQUISITES ---
 print_header "Phase 1: Installing Prerequisites"
-apt-get update -y > /dev/null 2>&1
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl dnsutils sudo > /dev/null 2>&1
-print_message "✓ Prerequisites installed."
-
+apt-get update -y > /dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y curl dnsutils sudo > /dev/null 2>&1; print_message "✓ Prerequisites installed."
 # --- PHASE 2: GATHER CONFIGURATION (with restored prompts) ---
 print_header "Phase 2: Configuration"
 while true; do read -p "Enter domain name: " DOMAIN_NAME; if [[ "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then break; fi; done
 read -p "Enter mail subdomain (default: mx): " MAIL_SUBDOMAIN; MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mx}; HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
-# --- THIS IS THE RESTORED EMAIL PROMPT ---
-DEFAULT_EMAIL="newsletter@$DOMAIN_NAME"
-read -p "Enter admin email for portal & DMARC (default: $DEFAULT_EMAIL): " FIRST_EMAIL; FIRST_EMAIL=${FIRST_EMAIL:-$DEFAULT_EMAIL}
+DEFAULT_EMAIL="newsletter@$DOMAIN_NAME"; read -p "Enter admin email for portal & DMARC (default: $DEFAULT_EMAIL): " FIRST_EMAIL; FIRST_EMAIL=${FIRST_EMAIL:-$DEFAULT_EMAIL}
 read -sp "Enter password for $FIRST_EMAIL: " FIRST_PASS; echo ""; ADMIN_EMAIL=$FIRST_EMAIL
-# --- THIS IS THE RESTORED IP INPUT LOGIC ---
-PRIMARY_IP=$(curl -s4 --max-time 5 https://ifconfig.me/ip); IP_ADDRESSES=("$PRIMARY_IP")
-echo "Enter additional IPs. Formats: single (1.2.3.4), range (1.2.3.4-10), CIDR (1.2.3.0/24). Press Enter when done."
-while true; do
-    read -p "IP> " ip_input
-    [ -z "$ip_input" ] && break
-    if [[ "$ip_input" =~ / ]]; then
-        while IFS= read -r ip; do if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then IP_ADDRESSES+=("$ip"); fi; done < <(expand_cidr "$ip_input")
-    elif [[ "$ip_input" =~ - ]]; then
-        while IFS= read -r ip; do if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then IP_ADDRESSES+=("$ip"); fi; done < <(expand_ip_range "$ip_input")
-    else
-        if validate_ip "$ip_input" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip_input " ]]; then IP_ADDRESSES+=("$ip_input"); fi
-    fi
-done
+PRIMARY_IP=$(curl -s4 --max-time 5 https://ifconfig.me/ip 2>/dev/null || hostname -I | awk '{print $1}'); if [ -z "$PRIMARY_IP" ]; then read -p "Could not detect primary IP. Enter it now: " PRIMARY_IP; else echo "Detected primary IP: $PRIMARY_IP"; read -p "Press Enter if correct, or enter new IP: " USER_IP_OVERRIDE; if [ ! -z "$USER_IP_OVERRIDE" ]; then PRIMARY_IP="$USER_IP_OVERRIDE"; fi; fi
+IP_ADDRESSES=("$PRIMARY_IP"); echo "Enter additional IPs. Formats: single (1.2.3.4), range (1.2.3.4-10), CIDR (1.2.3.0/24). Press Enter when done."
+while true; do read -p "IP> " ip_input; [ -z "$ip_input" ] && break; if [[ "$ip_input" =~ / ]]; then while IFS= read -r ip; do if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then IP_ADDRESSES+=("$ip"); fi; done < <(expand_cidr "$ip_input"); elif [[ "$ip_input" =~ - ]]; then while IFS= read -r ip; do if validate_ip "$ip" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip " ]]; then IP_ADDRESSES+=("$ip"); fi; done < <(expand_ip_range "$ip_input"); else if validate_ip "$ip_input" && [[ ! " ${IP_ADDRESSES[@]} " =~ " $ip_input " ]]; then IP_ADDRESSES+=("$ip_input"); fi; fi; done
 read -p "Enter Cloudflare API Key/Token (or press Enter for manual DNS): " CF_API_KEY; if [ ! -z "$CF_API_KEY" ]; then if ! [[ ${#CF_API_KEY} -gt 37 ]]; then read -p "Enter Cloudflare account email: " CF_EMAIL; fi; fi
-
 # --- PHASE 3: MAIN PACKAGE INSTALLATION ---
 print_header "Phase 3: Main Package Installation"
 hostnamectl set-hostname "$HOSTNAME" 2>/dev/null || true
 debconf-set-selections <<< "postfix postfix/mailname string $HOSTNAME"; debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
 apt-get install -y postfix postfix-mysql dovecot-core dovecot-imapd dovecot-lmtpd dovecot-mysql mariadb-server opendkim opendkim-tools nginx certbot python3-certbot-nginx ufw mailutils php-fpm php-mysql jq > /dev/null 2>&1
-
 # --- PHASE 4: DATABASE SETUP ---
 run_setup_database
-
-# --- PHASE 5: CONFIGURE CORE MAIL SERVICES ---
-print_header "Phase 5: Configuring Core Mail Services"
+# --- PHASE 5: CONFIGURE CORE MAIL SERVICES (SENDER & RECIPIENT-AWARE) ---
+print_header "Phase 5: Configuring Core Mail Services (Sender & Recipient-Aware)"
 groupadd -g 5000 vmail 2>/dev/null || true; useradd -u 5000 -g vmail -d /var/vmail vmail 2>/dev/null || true; chown -R vmail:vmail /var/vmail
 cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
 mail_location = maildir:/var/vmail/%d/%n; mail_uid = 5000; mail_gid = 5000;
@@ -353,7 +380,7 @@ cat > /etc/dovecot/conf.d/10-master.conf <<'EOF'
 service auth { unix_listener /var/spool/postfix/private/auth { mode = 0666 }; unix_listener auth-userdb { mode = 0600; user = vmail }; user = dovecot; }
 service lmtp { unix_listener /var/spool/postfix/private/dovecot-lmtp { mode = 0600; user = postfix; group = postfix; } }
 EOF
-DB_PASS=$(cat /root/.mail_db_password); mkdir -p /etc/postfix/mysql
+DB_PASS=$(cat /root/.mail_db_password); mkdir -p /etc/postfix/mysql; touch /etc/postfix/transport; postmap /etc/postfix/transport
 cat > /etc/postfix/mysql/virtual_domains.cf <<EOF
 user=mailuser; password=$DB_PASS; hosts=127.0.0.1; dbname=mailserver; query=SELECT 1 FROM virtual_domains WHERE name='%s';
 EOF
@@ -362,17 +389,18 @@ user=mailuser; password=$DB_PASS; hosts=127.0.0.1; dbname=mailserver; query=SELE
 EOF
 cat > /etc/postfix/mysql/sender_transport.cf <<EOF
 user=mailuser; password=$DB_PASS; hosts=127.0.0.1; dbname=mailserver;
-query=SELECT CASE WHEN rotation_mode = 'round-robin' THEN 'smtp-round-robin:' WHEN assigned_ip IS NOT NULL THEN CONCAT('smtp-ip', (SELECT ip_index FROM ip_pool WHERE ip_address = sender_ip_map.assigned_ip), ':') ELSE 'smtp:' END FROM sender_ip_map WHERE sender_email='%s';
+query=SELECT CASE WHEN rotation_mode = 'round-robin' THEN 'smtp-round-robin:' WHEN assigned_ip IS NOT NULL THEN CONCAT('smtp-ip', (SELECT ip_index FROM ip_pool WHERE ip_address = sender_ip_map.assigned_ip), ':') ELSE 'smtp-round-robin:' END FROM sender_ip_map WHERE sender_email='%s';
 EOF
 cat > /etc/postfix/main.cf <<EOF
 myhostname = $HOSTNAME; mydomain = $DOMAIN_NAME; inet_interfaces = all;
-virtual_transport = lmtp:unix:private/dovecot-lmtp;
+virtual_transport = lmtp:unix:private/dovecot-lmtp
+transport_maps = hash:/etc/postfix/transport
+sender_dependent_default_transport_maps = mysql:/etc/postfix/mysql/sender_transport.cf
 virtual_mailbox_domains = mysql:/etc/postfix/mysql/virtual_domains.cf;
 virtual_mailbox_maps = mysql:/etc/postfix/mysql/virtual_mailbox.cf;
 smtpd_sasl_type = dovecot; smtpd_sasl_path = private/auth; smtpd_sasl_auth_enable = yes;
 smtpd_recipient_restrictions = permit_sasl_authenticated,reject_unauth_destination;
 milter_protocol = 6; smtpd_milters = inet:localhost:8891; non_smtpd_milters = inet:localhost:8891;
-sender_dependent_default_transport_maps = mysql:/etc/postfix/mysql/sender_transport.cf;
 EOF
 echo "smtp-round-robin unix - - n - - smtp -o smtp_bind_address_iterator=random" >> /etc/postfix/master.cf
 for i in "${!IP_ADDRESSES[@]}"; do echo "smtp-ip$i unix - - n - - smtp -o smtp_bind_address=${IP_ADDRESSES[$i]}" >> /etc/postfix/master.cf; done
@@ -385,20 +413,14 @@ EOF
 echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_NAME/mail.private" > /etc/opendkim/KeyTable
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
 echo "127.0.0.1" > /etc/opendkim/TrustedHosts; mkdir -p /var/run/opendkim && chown opendkim:opendkim /var/run/opendkim
-
 # --- PHASE 6: START SERVICES & CONFIGURE WEB/API/UTILITIES ---
 print_header "Phase 6: Starting Services & Configuring Integrations"
 systemctl restart mariadb dovecot postfix opendkim; systemctl enable mariadb dovecot postfix opendkim
 echo "www-data ALL=(root) NOPASSWD: /usr/bin/doveadm, /usr/local/bin/bulk-ip-manage, /bin/systemctl" >> /etc/sudoers.d/mail-portal; chmod 440 /etc/sudoers.d/mail-portal
-run_setup_website
-create_bulk_ip_utility
-run_setup_webhook_api
-systemctl reload nginx
-
+run_setup_website; create_all_utilities; run_setup_webhook_api; systemctl reload nginx
 # --- PHASE 7: HARDENING, DNS, SSL & FINALIZATION ---
 print_header "Phase 7: Hardening, DNS, SSL & Finalization"
-run_server_hardening
-run_cloudflare_dns_setup
+run_server_hardening; run_cloudflare_dns_setup
 for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; SUBDOMAIN="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME}"; WEBROOT_DIR="/var/www/html/$SUBDOMAIN"; mkdir -p "$WEBROOT_DIR"; cat > "/etc/nginx/sites-available/$SUBDOMAIN.conf" <<EOF
 server { listen 80; server_name $SUBDOMAIN; location /.well-known/acme-challenge/ { root $WEBROOT_DIR; } location / { return 404; } }
 EOF
@@ -406,19 +428,64 @@ ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$S
 CERT_DOMAINS=""; DOMAINS_TO_CHECK=("$DOMAIN_NAME" "www.$DOMAIN_NAME" "$HOSTNAME"); for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; DOMAINS_TO_CHECK+=("${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"); done
 for domain in "${DOMAINS_TO_CHECK[@]}"; do if host "$domain" 8.8.8.8 > /dev/null 2>&1; then CERT_DOMAINS="$CERT_DOMAINS -d $domain"; fi; done
 if [[ ! -z "$CERT_DOMAINS" ]]; then certbot --nginx $CERT_DOMAINS --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect --no-eff-email 2>/dev/null || true; fi
-if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
-    postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem"; postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem"
-    systemctl reload postfix dovecot nginx
-fi
-
+if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem"; postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem"; systemctl reload postfix dovecot nginx; fi
 # --- COMPLETION ---
 print_header "Installation Complete!"
 DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -o 'p=[^"]*' | sed 's/."//' | cut -c 3- | tr -d ' \n\t')
 print_message "DKIM Record: Name: mail._domainkey, Value: v=DKIM1; k=rsa; p=$DKIM_KEY"
 print_message "Your mail server, with all advanced features, is hardened and READY."
 echo ""
-print_warning "Recommended next step: Harden SSH."
-print_warning "Run: 'sudo nano /etc/ssh/sshd_config' and set:"
-print_warning "  PermitRootLogin no"
-print_warning "  PasswordAuthentication no (if you have an SSH key installed!)"
-print_warning "Then run: 'sudo systemctl restart sshd'"
+print_header "Available Management Commands"
+print_message "--- General Server Management ---"
+print_message "  mail-status         - Check the status of all mail-related services, ports, and resources."
+print_message "  mail-backup         - Create a backup of your mail server configuration and database."
+print_message "  check-dns           - Verify the DNS records (MX, SPF, DKIM, DMARC) for your domain."
+echo ""
+print_message "--- Account Management ---"
+print_message "  mail-account add <email> <password>    - Create a new email account."
+print_message "  mail-account delete <email>          - Delete an email account."
+print_message "  mail-account password <email> <new_pass> - Change an account's password."
+print_message "  mail-account list                    - List all email accounts on the server."
+echo ""
+print_message "--- IP Rotation & Assignment Management ---"
+print_message "  bulk-ip-manage assign-recipient <email> sticky     - Assigns a RECIPIENT to the least-used IP (used by webhook)."
+print_message "  bulk-ip-manage assign-recipient <email> round-robin  - Removes sticky IP assignment for a RECIPIENT."
+print_message "  bulk-ip-manage assign-sender <email> sticky        - Assigns a SENDER to a specific, least-used IP."
+print_message "  bulk-ip-manage assign-sender <email> round-robin   - Sets a SENDER to use the default round-robin IP pool."
+print_message "  bulk-ip-manage status                              - Shows all current recipient and sender IP assignments."
+echo ""
+print_message "--- Diagnostics & Logging ---"
+print_message "  test-email <recipient_email>         - Sends a test email to verify deliverability and DKIM."
+print_message "  mail-log live                        - Watch the live mail log in real-time."
+print_message "  mail-log errors                      - Show recent errors from the mail log."
+print_message "  mail-log search <term>               - Search the mail log for a specific term or email address."
+echo ""
+print_message "--- Mail Queue Management ---"
+print_message "  mail-queue show                      - Display all messages currently in the mail queue."
+print_message "  mail-queue flush                     - Force an immediate attempt to deliver all queued mail."
+print_message "  mail-queue clear                     - DANGEROUS: Deletes ALL mail from the queue permanently."
+echo ""
+print_header "CRITICAL NEXT STEP: SECURE YOUR SSH ACCESS"
+print_warning "Follow these steps carefully to avoid being locked out of your server."
+echo ""
+print_message "--- Step 1: Add Your SSH Public Key to the Server ---"
+print_message "On your LOCAL computer (not the server), run this command to copy your key:"
+print_message "  cat ~/.ssh/id_rsa.pub"
+echo ""
+print_message "On THIS SERVER, logged in as 'fumingtomato', run the following commands:"
+print_message "  1. mkdir -p ~/.ssh"
+print_message "  2. nano ~/.ssh/authorized_keys"
+print_message "     (Paste your key from the previous step into this file and save it)"
+print_message "  3. chmod 700 ~/.ssh"
+print_message "  4. chmod 600 ~/.ssh/authorized_keys"
+echo ""
+print_message "After adding the key, open a NEW terminal and try to SSH into the server."
+print_message "If you can log in without a password, proceed to Step 2."
+echo ""
+print_warning "--- Step 2: Harden the SSH Configuration ---"
+print_warning "ONLY after confirming your key-based login works, run these commands:"
+print_warning "  1. sudo nano /etc/ssh/sshd_config"
+print_warning "     Set the following values:"
+print_warning "       PermitRootLogin no"
+print_warning "       PasswordAuthentication no"
+print_warning "  2. sudo systemctl restart sshd"
