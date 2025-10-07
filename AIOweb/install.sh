@@ -2,10 +2,10 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.0.9 - Systemd & Alias Fixes
+# Version: 24.1.0 - FINAL (Nginx Hash Bucket Fix)
 # This script is fully self-contained and includes ALL original features
 # and management commands. All silent failure points, Python
-# environment, and service file issues have been fixed.
+# environment, service file, and Nginx scaling issues have been fixed.
 # =================================================================
 
 set -e
@@ -464,6 +464,12 @@ chown -R vmail:vmail /var/vmail
 print_message "Configuring root mail alias..."
 echo "root: $FIRST_EMAIL" >> /etc/aliases
 newaliases
+
+# FIX: Add Nginx hash bucket size increase to prevent failure with many domains
+print_message "Increasing Nginx server_names_hash_bucket_size..."
+if ! grep -q "server_names_hash_bucket_size" /etc/nginx/nginx.conf; then
+    sed -i '/http {/a \    server_names_hash_bucket_size 64;' /etc/nginx/nginx.conf
+fi
 
 cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
 mail_location = maildir:/var/vmail/%d/%n
