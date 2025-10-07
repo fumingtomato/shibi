@@ -2,7 +2,7 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.0.0 - THE SECURE, FEATURE-COMPLETE, FINAL FIX
+# Version: 24.0.1 - THE CORRECTED FLOW, FEATURE-COMPLETE, FINAL FIX
 # Self-contained with ALL features: Full Web Portal, Multi-IP Sending,
 # IP Rotation, Mailwizz Webhook, Fail2Ban, and Kernel Hardening.
 # ZERO external dependencies.
@@ -26,7 +26,7 @@ print_header() { echo -e "${BLUE}===============================================
 # --- EMBEDDED: setup-database.sh ---
 run_setup_database() {
     print_header "Function: run_setup_database"
-    DB_SERVICE="mariadb"; apt-get install -y mariadb-server > /dev/null 2>&1 || { DB_SERVICE="mysql"; apt-get install -y mysql-server > /dev/null 2>&1; }
+    DB_SERVICE="mariadb";
     systemctl start $DB_SERVICE; systemctl enable $DB_SERVICE
     DB_PASS=$(openssl rand -base64 24); echo "$DB_PASS" > /root/.mail_db_password; chmod 600 /root/.mail_db_password
     mysql -u root <<EOF
@@ -136,7 +136,8 @@ EOF
     cat > "$NGINX_CONF" <<EOF
 server { listen 80; server_name $DOMAIN_NAME www.$DOMAIN_NAME; root $WEB_ROOT; index index.php; location / { try_files \$uri \$uri/ /index.php?\$query_string; } location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/var/run/php/php\${PHP_VERSION}-fpm.sock; } location /.well-known/acme-challenge/ { root /var/www/html; } }
 EOF
-    ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/$DOMAIN_NAME.conf"; mkdir -p /var/www/html; chown www-data:www-data /var/www/html
+    ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/$DOMAIN_NAME.conf"; mkdir -p /var/www/html; chown www-data:www-data /var/w
+ww/html
     chown -R www-data:www-data "$WEB_ROOT"
     print_message "✓ Full-featured web portal setup complete."
 }
@@ -183,7 +184,7 @@ def handle_webhook():
     if data and data.get('event') == 'open':
         recipient = data.get('subscriber', {}).get('email')
         if recipient:
-            # When an email is opened, find what IP sent it and make that IP sticky for the recipient
+            # When an email is opened, make the recipient sticky to the IP that sent it
             subprocess.run(['sudo', '/usr/local/bin/bulk-ip-manage', 'assign', recipient, 'sticky'], check=True)
     return jsonify({'status': 'success'}), 200
 if __name__ == '__main__': app.run(host='127.0.0.1', port=5001)
@@ -197,7 +198,7 @@ User=www-data; Group=www-data; WorkingDirectory=/opt/mailwizz-api; ExecStart=/us
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload; systemctl start mailwizz-api; systemctl enable mailwizz-api
-    sed -i '/location \/ {/i \    location /api/mailwizz-webhook { proxy_pass http://127.0.0.1/webhook; }' "/etc/nginx/sites-available/$DOMAIN_NAME.conf"
+    sed -i '/location \/ {/i \    location /api/mailwizz-webhook { proxy_pass http://127.0.0.1:5001/webhook; }' "/etc/nginx/sites-available/$DOMAIN_NAME.conf"
     systemctl reload nginx
     print_message "✓ Mailwizz webhook API with sticky IP logic is active."
 }
@@ -206,7 +207,7 @@ EOF
 run_cloudflare_dns_setup() {
     print_header "Function: run_cloudflare_dns_setup"
     if [ -z "$CF_API_KEY" ]; then print_warning "Cloudflare API key not set. Skipping."; return; fi
-    apt-get install -y jq > /dev/null 2>&1
+    if ! command -v jq > /dev/null; then apt-get install -y jq > /dev/null 2>&1; fi
     if [[ ${#CF_API_KEY} -gt 37 ]]; then AUTH_HEADER="Authorization: Bearer $CF_API_KEY"; else AUTH_HEADER="X-Auth-Email: $CF_EMAIL;X-Auth-Key: $CF_API_KEY"; fi
     ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" -H "$AUTH_HEADER" -H "Content-Type: application/json" | jq -r '.result[0].id')
     if [ "$ZONE_ID" == "null" ]; then print_error "Cloudflare Zone ID not found for $DOMAIN_NAME."; return; fi
@@ -227,7 +228,7 @@ run_cloudflare_dns_setup() {
 run_server_hardening() {
     print_header "Function: run_server_hardening"
     # Fail2Ban
-    apt-get install -y fail2ban > /dev/null 2>&1
+    if ! command -v fail2ban-client > /dev/null; then apt-get install -y fail2ban > /dev/null 2>&1; fi
     cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
 bantime = 1h
@@ -235,11 +236,9 @@ bantime = 1h
 enabled = true
 [postfix-sasl]
 enabled = true
-filter = postfix-sasl
 logpath = /var/log/mail.log
 [dovecot]
 enabled = true
-filter = dovecot
 logpath = /var/log/mail.log
 EOF
     systemctl enable fail2ban; systemctl start fail2ban
@@ -258,19 +257,27 @@ EOF
     postconf -e "smtpd_tls_security_level = may"
     postconf -e "smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
     postconf -e "smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
-    sed -i 's/^ssl = yes/ssl = required/' /etc/dovecot/conf.d/10-ssl.conf
-    echo "ssl_min_protocol = TLSv1.2" >> /etc/dovecot/conf.d/10-ssl.conf
+    if [ -f /etc/dovecot/conf.d/10-ssl.conf ]; then
+        sed -i 's/^ssl = yes/ssl = required/' /etc/dovecot/conf.d/10-ssl.conf
+        echo "ssl_min_protocol = TLSv1.2" >> /etc/dovecot/conf.d/10-ssl.conf
+    fi
     print_message "✓ Server hardening applied (Fail2Ban, Kernel, TLS)."
 }
-
 
 # ===================================================================
 # MAIN INSTALLATION SCRIPT
 # ===================================================================
 
 print_header "Starting The Definitive All-In-One Mail Server Installation"
-# --- PHASE 1: GATHER CONFIGURATION ---
-print_header "Phase 1: Configuration"
+
+# --- PHASE 1: PREREQUISITES ---
+print_header "Phase 1: Installing Prerequisites"
+apt-get update -y > /dev/null 2>&1
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl dnsutils sudo > /dev/null 2>&1
+print_message "✓ Prerequisites installed."
+
+# --- PHASE 2: GATHER CONFIGURATION ---
+print_header "Phase 2: Configuration"
 while true; do read -p "Enter domain name: " DOMAIN_NAME; if [[ "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then break; fi; done
 read -p "Enter mail subdomain (default: mx): " MAIL_SUBDOMAIN; MAIL_SUBDOMAIN=${MAIL_SUBDOMAIN:-mx}; HOSTNAME="$MAIL_SUBDOMAIN.$DOMAIN_NAME"
 read -p "Enter admin email for portal & DMARC: " FIRST_EMAIL; read -sp "Enter password for $FIRST_EMAIL: " FIRST_PASS; echo ""; ADMIN_EMAIL=$FIRST_EMAIL
@@ -278,18 +285,17 @@ PRIMARY_IP=$(curl -s4 --max-time 5 https://ifconfig.me/ip); IP_ADDRESSES=("$PRIM
 read -p "Enter additional IPs (space-separated): " -a EXTRA_IPS; if [ ${#EXTRA_IPS[@]} -gt 0 ]; then IP_ADDRESSES+=(${EXTRA_IPS[@]}); fi
 read -p "Enter Cloudflare API Key/Token (or press Enter for manual DNS): " CF_API_KEY; if [ ! -z "$CF_API_KEY" ]; then if ! [[ ${#CF_API_KEY} -gt 37 ]]; then read -p "Enter Cloudflare account email: " CF_EMAIL; fi; fi
 
-# --- PHASE 2: SYSTEM PREPARATION & PACKAGE INSTALLATION ---
-print_header "Phase 2: System Prep & Package Installation"
-apt-get update -y > /dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get upgrade -y > /dev/null 2>&1
+# --- PHASE 3: MAIN PACKAGE INSTALLATION ---
+print_header "Phase 3: Main Package Installation"
 hostnamectl set-hostname "$HOSTNAME" 2>/dev/null || true
 debconf-set-selections <<< "postfix postfix/mailname string $HOSTNAME"; debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
-apt-get install -y postfix postfix-mysql dovecot-core dovecot-imapd dovecot-lmtpd dovecot-mysql mariadb-server opendkim opendkim-tools nginx certbot python3-certbot-nginx ufw mailutils sudo php-fpm php-mysql jq > /dev/null 2>&1
+apt-get install -y postfix postfix-mysql dovecot-core dovecot-imapd dovecot-lmtpd dovecot-mysql mariadb-server opendkim opendkim-tools nginx certbot python3-certbot-nginx ufw mailutils php-fpm php-mysql jq > /dev/null 2>&1
 
-# --- PHASE 3: DATABASE SETUP ---
+# --- PHASE 4: DATABASE SETUP ---
 run_setup_database
 
-# --- PHASE 4: CONFIGURE CORE MAIL SERVICES ---
-print_header "Phase 4: Configuring Core Mail Services"
+# --- PHASE 5: CONFIGURE CORE MAIL SERVICES ---
+print_header "Phase 5: Configuring Core Mail Services"
 groupadd -g 5000 vmail 2>/dev/null || true; useradd -u 5000 -g vmail -d /var/vmail vmail 2>/dev/null || true; chown -R vmail:vmail /var/vmail
 cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
 mail_location = maildir:/var/vmail/%d/%n; mail_uid = 5000; mail_gid = 5000;
@@ -339,8 +345,8 @@ echo "mail._domainkey.$DOMAIN_NAME $DOMAIN_NAME:mail:/etc/opendkim/keys/$DOMAIN_
 echo "*@$DOMAIN_NAME mail._domainkey.$DOMAIN_NAME" > /etc/opendkim/SigningTable
 echo "127.0.0.1" > /etc/opendkim/TrustedHosts; mkdir -p /var/run/opendkim && chown opendkim:opendkim /var/run/opendkim
 
-# --- PHASE 5: START SERVICES & CONFIGURE WEB/API/UTILITIES ---
-print_header "Phase 5: Starting Services & Configuring Integrations"
+# --- PHASE 6: START SERVICES & CONFIGURE WEB/API/UTILITIES ---
+print_header "Phase 6: Starting Services & Configuring Integrations"
 systemctl restart mariadb dovecot postfix opendkim; systemctl enable mariadb dovecot postfix opendkim
 echo "www-data ALL=(root) NOPASSWD: /usr/bin/doveadm, /usr/local/bin/bulk-ip-manage, /bin/systemctl" >> /etc/sudoers.d/mail-portal; chmod 440 /etc/sudoers.d/mail-portal
 run_setup_website
@@ -348,8 +354,8 @@ create_bulk_ip_utility
 run_setup_webhook_api
 systemctl reload nginx
 
-# --- PHASE 6: HARDENING, DNS, SSL & FINALIZATION ---
-print_header "Phase 6: Hardening, DNS, SSL & Finalization"
+# --- PHASE 7: HARDENING, DNS, SSL & FINALIZATION ---
+print_header "Phase 7: Hardening, DNS, SSL & Finalization"
 run_server_hardening
 run_cloudflare_dns_setup
 for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; SUBDOMAIN="${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME}"; WEBROOT_DIR="/var/www/html/$SUBDOMAIN"; mkdir -p "$WEBROOT_DIR"; cat > "/etc/nginx/sites-available/$SUBDOMAIN.conf" <<EOF
@@ -359,8 +365,10 @@ ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$S
 CERT_DOMAINS=""; DOMAINS_TO_CHECK=("$DOMAIN_NAME" "www.$DOMAIN_NAME" "$HOSTNAME"); for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; DOMAINS_TO_CHECK+=("${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME"); done
 for domain in "${DOMAINS_TO_CHECK[@]}"; do if host "$domain" 8.8.8.8 > /dev/null 2>&1; then CERT_DOMAINS="$CERT_DOMAINS -d $domain"; fi; done
 if [[ ! -z "$CERT_DOMAINS" ]]; then certbot --nginx $CERT_DOMAINS --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect --no-eff-email 2>/dev/null || true; fi
-postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem"; postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem"
-systemctl reload postfix dovecot nginx
+if [ -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ]; then
+    postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem"; postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem"
+    systemctl reload postfix dovecot nginx
+fi
 
 # --- COMPLETION ---
 print_header "Installation Complete!"
