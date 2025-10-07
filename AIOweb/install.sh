@@ -2,10 +2,10 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.0.8 - PEP 668 COMPLIANT
+# Version: 24.0.9 - Systemd & Alias Fixes
 # This script is fully self-contained and includes ALL original features
-# and management commands. All silent failure points and Python
-# environment issues have been fixed.
+# and management commands. All silent failure points, Python
+# environment, and service file issues have been fixed.
 # =================================================================
 
 set -e
@@ -317,11 +317,19 @@ def handle_webhook():
     return jsonify({'status': 'success'}), 200
 if __name__ == '__main__': app.run(host='127.0.0.1', port=5001)
 EOF
+    # FIX: Correctly format the systemd service file with newlines
     cat > /etc/systemd/system/mailwizz-api.service <<'EOF'
 [Unit]
-Description=Webhook API for Mailwizz; After=network.target
+Description=Webhook API for Mailwizz
+After=network.target
+
 [Service]
-User=www-data; Group=www-data; WorkingDirectory=/opt/mailwizz-api; ExecStart=/usr/bin/gunicorn --workers 3 --bind 127.0.0.1:5001 webhook_handler:app; Restart=always
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/mailwizz-api
+ExecStart=/usr/bin/gunicorn --workers 3 --bind 127.0.0.1:5001 webhook_handler:app
+Restart=always
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -451,6 +459,12 @@ print_header "Phase 5: Configuring Core Mail Services (Sender & Recipient-Aware)
 groupadd -g 5000 vmail 2>/dev/null || true; useradd -u 5000 -g vmail -d /var/vmail vmail 2>/dev/null || true
 mkdir -p /var/vmail
 chown -R vmail:vmail /var/vmail
+
+# FIX: Add root alias for Postfix to handle system mail
+print_message "Configuring root mail alias..."
+echo "root: $FIRST_EMAIL" >> /etc/aliases
+newaliases
+
 cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
 mail_location = maildir:/var/vmail/%d/%n
 mail_uid = 5000
@@ -469,7 +483,6 @@ default_pass_scheme = SHA512-CRYPT
 password_query = SELECT email as user, password FROM virtual_users WHERE email = '%u'
 user_query = SELECT '/var/vmail/%d/%n' as home, 5000 AS uid, 5000 AS gid FROM virtual_users WHERE email = '%u'
 EOF
-# FIX: Use meticulously correct multi-line format for Dovecot service definitions
 cat > /etc/dovecot/conf.d/10-master.conf <<'EOF'
 service auth {
   unix_listener /var/spool/postfix/private/auth {
@@ -518,9 +531,8 @@ milter_protocol = 6; smtpd_milters = inet:localhost:8891; non_smtpd_milters = in
 EOF
 echo "smtp-round-robin unix - - n - - smtp -o smtp_bind_address_iterator=random" >> /etc/postfix/master.cf
 for i in "${!IP_ADDRESSES[@]}"; do echo "smtp-ip$i unix - - n - - smtp -o smtp_bind_address=${IP_ADDRESSES[$i]}" >> /etc/postfix/master.cf; done
-mkdir -p /etc/opendkim/keys/$DOMAIN_NAME; opendkim-genkey -s mail -d "$DOMAIN_NAME" -D /etc/opendkim/keys -b 1024; mv /etc/opendkim/keys/mail.private /etc/opendkim/keys/$DOMAIN_NAME/; mv /etc/opendkim/keys/mail.txt /etc/opendkim/keys/$DOMAIN_NAME/
+mkdir -p /etc/opendkim/keys/$DOMAIN_NAME; opendkim-genkey -s mail -d "$DOMAIN_NAME" -D /etc/opendkim/keys -b 2048; mv /etc/opendkim/keys/mail.private /etc/opendkim/keys/$DOMAIN_NAME/; mv /etc/opendkim/keys/mail.txt /etc/opendkim/keys/$DOMAIN_NAME/
 chown -R opendkim:opendkim /etc/opendkim/keys; chmod 600 /etc/opendkim/keys/$DOMAIN_NAME/mail.private
-# CORRECTED VERSION
 cat > /etc/opendkim.conf <<EOF
 AutoRestart Yes
 Mode sv
@@ -556,7 +568,6 @@ for i in "${!IP_ADDRESSES[@]}"; do if [ $i -eq 0 ]; then continue; fi; SUBDOMAIN
 server { listen 80; server_name $SUBDOMAIN; location /.well-known/acme-challenge/ { root $WEBROOT_DIR; } location / { return 404; } }
 EOF
 ln -sf "/etc/nginx/sites-available/$SUBDOMAIN.conf" "/etc/nginx/sites-enabled/$SUBDOMAIN.conf"; done; systemctl reload nginx
-# FIX: Add a delay to allow DNS records to propagate before attempting SSL certificate generation.
 if [ ! -z "$CF_API_KEY" ]; then
     print_message "Waiting 90 seconds for DNS records to propagate before requesting SSL certificate..."
     sleep 90
@@ -611,7 +622,6 @@ print_message "--- Step 1: Add Your SSH Public Key to the Server ---"
 print_message "On your LOCAL computer (not the server), run this command to copy your key:"
 print_message "  cat ~/.ssh/id_rsa.pub"
 echo ""
-# FIX: Removed the confusing/hardcoded username reference
 print_message "On THIS SERVER, logged in as the current user, run the following commands:"
 print_message "  1. mkdir -p ~/.ssh"
 print_message "  2. nano ~/.ssh/authorized_keys"
