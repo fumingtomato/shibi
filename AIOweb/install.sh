@@ -2,9 +2,10 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.0.7 - FULLY AUDITED & ROBUST
+# Version: 24.0.8 - PEP 668 COMPLIANT
 # This script is fully self-contained and includes ALL original features
-# and management commands. All silent failure points have been fixed.
+# and management commands. All silent failure points and Python
+# environment issues have been fixed.
 # =================================================================
 
 set -e
@@ -298,8 +299,8 @@ run_setup_webhook_api() {
     done
     
     print_message "Installing Python dependencies for webhook API..."
-    apt-get install -y python3 python3-pip python3-venv
-    python3 -m pip install flask gunicorn
+    # FIX: Use apt to install Python packages to comply with PEP 668
+    apt-get install -y python3-flask python3-gunicorn python3-venv
     
     mkdir -p /opt/mailwizz-api
     cat > /opt/mailwizz-api/webhook_handler.py <<'EOF'
@@ -320,7 +321,7 @@ EOF
 [Unit]
 Description=Webhook API for Mailwizz; After=network.target
 [Service]
-User=www-data; Group=www-data; WorkingDirectory=/opt/mailwizz-api; ExecStart=/usr/bin/python3 -m gunicorn --workers 3 --bind 127.0.0.1:5001 webhook_handler:app; Restart=always
+User=www-data; Group=www-data; WorkingDirectory=/opt/mailwizz-api; ExecStart=/usr/bin/gunicorn --workers 3 --bind 127.0.0.1:5001 webhook_handler:app; Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
