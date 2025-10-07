@@ -364,7 +364,10 @@ apt-get install -y postfix postfix-mysql dovecot-core dovecot-imapd dovecot-lmtp
 run_setup_database
 # --- PHASE 5: CONFIGURE CORE MAIL SERVICES (SENDER & RECIPIENT-AWARE) ---
 print_header "Phase 5: Configuring Core Mail Services (Sender & Recipient-Aware)"
-groupadd -g 5000 vmail 2>/dev/null || true; useradd -u 5000 -g vmail -d /var/vmail vmail 2>/dev/null || true; chown -R vmail:vmail /var/vmail
+groupadd -g 5000 vmail 2>/dev/null || true; useradd -u 5000 -g vmail -d /var/vmail vmail 2>/dev/null || true
+# FIX: Explicitly create the /var/vmail directory before changing ownership
+mkdir -p /var/vmail
+chown -R vmail:vmail /var/vmail
 cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
 mail_location = maildir:/var/vmail/%d/%n; mail_uid = 5000; mail_gid = 5000;
 EOF
