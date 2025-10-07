@@ -385,7 +385,7 @@ EOF
 print_header "Starting The Definitive All-In-One Mail Server Installation"
 # --- PHASE 1: PREREQUISITES ---
 print_header "Phase 1: Installing Prerequisites"
-apt-get update -y > /dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y curl dnsutils sudo > /dev/null 2>&1; print_message "✓ Prerequisites installed."
+apt-get update -y > /dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y curl dnsutils sudo; print_message "✓ Prerequisites installed."
 # --- PHASE 2: GATHER CONFIGURATION (with restored prompts) ---
 print_header "Phase 2: Configuration"
 while true; do read -p "Enter domain name: " DOMAIN_NAME; if [[ "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then break; fi; done
