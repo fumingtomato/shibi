@@ -2,10 +2,10 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.1.0 - FINAL (Nginx Hash Bucket Fix)
+# Version: 24.1.1 - FINAL (Hostname Resolution Fix)
 # This script is fully self-contained and includes ALL original features
 # and management commands. All silent failure points, Python
-# environment, service file, and Nginx scaling issues have been fixed.
+# environment, service file, Nginx, and system hostname issues are fixed.
 # =================================================================
 
 set -e
@@ -444,6 +444,15 @@ read -p "Enter Cloudflare API Key/Token (or press Enter for manual DNS): " CF_AP
 # --- PHASE 3: MAIN PACKAGE INSTALLATION ---
 print_header "Phase 3: Main Package Installation"
 hostnamectl set-hostname "$HOSTNAME" 2>/dev/null || true
+
+# FIX: Add new hostname to /etc/hosts to ensure local resolution
+print_message "Updating /etc/hosts for local hostname resolution..."
+# Remove any existing 127.0.1.1 entry and add our new primary IP and hostname
+sed -i '/127.0.1.1/d' /etc/hosts
+if ! grep -q "$HOSTNAME" /etc/hosts; then
+    echo -e "$PRIMARY_IP\t$HOSTNAME\t$MAIL_SUBDOMAIN" >> /etc/hosts
+fi
+
 debconf-set-selections <<< "postfix postfix/mailname string $HOSTNAME"; debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
 
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
