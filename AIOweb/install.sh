@@ -2,10 +2,10 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.1.2 - FINAL (Nginx Formatting Fix)
+# Version: 24.1.3 - FINAL (Robust Firewall Fix)
 # This script is fully self-contained and includes ALL original features
 # and management commands. All silent failure points, Python
-# environment, service file, Nginx, and system hostname issues are fixed.
+# environment, service file, Nginx, hostname, and firewall issues are fixed.
 # =================================================================
 
 set -e
@@ -397,14 +397,16 @@ run_cloudflare_dns_setup() {
 run_server_hardening() {
     print_header "Function: run_server_hardening"
     
-    print_message "Configuring firewall..."
-    ufw allow ssh
-    ufw allow 'Postfix'
-    ufw allow 'Postfix SMTPS'
-    ufw allow 'Postfix Submission'
-    ufw allow 'Dovecot IMAP'
-    ufw allow 'Dovecot IMAPS'
-    ufw allow 'Nginx Full'
+    print_message "Configuring firewall with robust port-based rules..."
+    # FIX: Use port numbers instead of application profiles for maximum compatibility
+    ufw allow 22/tcp   # SSH
+    ufw allow 25/tcp   # SMTP
+    ufw allow 80/tcp   # HTTP
+    ufw allow 143/tcp  # IMAP
+    ufw allow 443/tcp  # HTTPS
+    ufw allow 465/tcp  # SMTPS
+    ufw allow 587/tcp  # Submission
+    ufw allow 993/tcp  # IMAPS
     ufw --force enable
     
     if ! command -v fail2ban-client > /dev/null; then
@@ -566,7 +568,7 @@ virtual_mailbox_domains = mysql:/etc/postfix/mysql/virtual_domains.cf;
 virtual_mailbox_maps = mysql:/etc/postfix/mysql/virtual_mailbox.cf;
 smtpd_sasl_type = dovecot; smtpd_sasl_path = private/auth; smtpd_sasl_auth_enable = yes;
 smtpd_recipient_restrictions = permit_sasl_authenticated,reject_unauth_destination;
-milter_protocol = 6; smtd_milters = inet:localhost:8891; non_smtpd_milters = inet:localhost:8891;
+milter_protocol = 6; smtpd_milters = inet:localhost:8891; non_smtpd_milters = inet:localhost:8891;
 EOF
 echo "smtp-round-robin unix - - n - - smtp -o smtp_bind_address_iterator=random" >> /etc/postfix/master.cf
 for i in "${!IP_ADDRESSES[@]}"; do echo "smtp-ip$i unix - - n - - smtp -o smtp_bind_address=${IP_ADDRESSES[$i]}" >> /etc/postfix/master.cf; done
@@ -597,9 +599,9 @@ EOF
 systemctl daemon-reload
 # --- PHASE 6: START SERVICES & CONFIGURE WEB/API/UTILITIES ---
 print_header "Phase 6: Starting Services & Configuring Integrations"
-systemctl restart mariadb dovecot postfix opendkim; systemctl enable mariadb dovecot postfix opendkim
+systemctl restart mariadb dovecot postfix opendkim nginx; systemctl enable mariadb dovecot postfix opendkim nginx
 echo "www-data ALL=(root) NOPASSWD: /usr/bin/doveadm, /usr/local/bin/bulk-ip-manage, /bin/systemctl" >> /etc/sudoers.d/mail-portal; chmod 440 /etc/sudoers.d/mail-portal
-run_setup_website; create_all_utilities; run_setup_webhook_api; systemctl reload nginx
+run_setup_website; create_all_utilities; run_setup_webhook_api
 # --- PHASE 7: HARDENING, DNS, SSL & FINALIZATION ---
 print_header "Phase 7: Hardening, DNS, SSL & Finalization"
 run_server_hardening; run_cloudflare_dns_setup
