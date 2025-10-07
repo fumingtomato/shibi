@@ -291,7 +291,18 @@ EOF
 # --- EMBEDDED: setup-webhook-api.sh (With sticky recipient logic) ---
 run_setup_webhook_api() {
     print_header "Function: run_setup_webhook_api"
-    apt-get install -y python3 python3-pip python3-venv > /dev/null 2>&1; python3 -m pip install flask gunicorn > /dev/null 2>&1
+
+    # Wait for any other apt processes to finish
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+        print_warning "Waiting for other package managers to finish..."
+        sleep 5
+    done
+
+    # Install Python tools with visible output
+    print_message "Installing Python dependencies for webhook API..."
+    apt-get install -y python3 python3-pip python3-venv
+    python3 -m pip install flask gunicorn
+
     mkdir -p /opt/mailwizz-api
     cat > /opt/mailwizz-api/webhook_handler.py <<'EOF'
 from flask import Flask, request, jsonify
