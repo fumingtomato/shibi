@@ -344,6 +344,46 @@ switch ($action) {
 $mysqli->close();
 APIMANAGE
 
+# --- NEW Progress Tracking API ---
+cat > "$WEB_ROOT/api/progress.php" <<'APIPROGRESS'
+<?php
+session_start();
+header('Content-Type: application/json');
+if (!isset($_SESSION['user'])) {
+    http_response_code(401);
+    exit;
+}
+
+$logFile = $_GET['logFile'] ?? '';
+// Security: prevent directory traversal
+if (empty($logFile) || strpos($logFile, '/') !== false || strpos($logFile, '..') !== false) {
+    http_response_code(400);
+    echo json_encode(['status' => 'error', 'message' => 'Invalid log file specified.']);
+    exit;
+}
+
+$filePath = '/tmp/' . $logFile;
+
+if (file_exists($filePath)) {
+    $content = file_get_contents($filePath);
+    $lines = explode("\n", trim($content));
+    $last_line = end($lines);
+    $is_done = (strpos($last_line, 'SUCCESS') !== false || strpos($last_line, 'ERROR') !== false);
+
+    echo json_encode([
+        'status' => 'success',
+        'log' => $content,
+        'done' => $is_done
+    ]);
+} else {
+    echo json_encode([
+        'status' => 'pending',
+        'log' => 'Waiting for process to start...',
+        'done' => false
+    ]);
+}
+APIPROGRESS
+
 # Set permissions
 chown -R www-data:www-data "$WEB_ROOT"
 chmod -R 755 "$WEB_ROOT"
@@ -361,14 +401,14 @@ cat > "$WEB_ROOT/js/colors.js" << 'JS'
 (function(){function e(e,t){document.documentElement.style.setProperty("--primary-color",e),document.documentElement.style.setProperty("--secondary-color",t)}function t(){fetch("/api/colors.php").then(t=>t.json()).then(t=>{t.primary&&t.secondary?e(t.primary,t.secondary):e("#667eea","#764ba2")}).catch(t=>{console.error("Failed to load colors:",t),e("#667eea","#764ba2")})}document.addEventListener("DOMContentLoaded",t),setInterval(t,3e4)})();
 JS
 
-# user-settings.html (NEW with full console)
-cat > "$WEB_ROOT/user-settings.html" <<EOF
+# user-settings.html (NEW with progress tracking)
+cat > "$WEB_ROOT/user-settings.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Management Console - $DOMAIN_NAME</title>
+    <title>Management Console</title>
     <link rel="stylesheet" href="/css/style.css">
     <script src="/js/colors.js"></script>
     <style>
@@ -378,142 +418,69 @@ cat > "$WEB_ROOT/user-settings.html" <<EOF
         .tab-button.active { background: var(--primary-color); color: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         .tab-button:disabled { opacity: 0.5; cursor: not-allowed; }
         .tab-content { display: none; }
-        .tab-content.active { display: block; animation: fadeIn 0.5s; }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .tab-content.active { display: block; }
         .message { padding: 15px; border-radius: 5px; margin-bottom: 20px; display: none; }
         .message.success { background: #d4edda; color: #155724; }
         .message.error { background: #f8d7da; color: #721c24; }
-        .loading { display: none; text-align: center; padding: 20px; }
-        .item-list { list-style: none; margin-top: 20px; }
         .item-list li { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #eee; }
         .delete-btn { background: #e74c3c; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; }
-        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        #progress-box { display: none; margin-top: 20px; background-color: #2c3e50; color: #ecf0f1; font-family: monospace; padding: 15px; border-radius: 5px; height: 300px; overflow-y: auto; white-space: pre-wrap; }
     </style>
 </head>
 <body>
-    <nav>
-        <ul>
-            <li><a href="/">Home</a></li>
-            <li><a href="/privacy.html">Privacy Policy</a></li>
-            <li><a href="/terms.html">Terms of Service</a></li>
-            <li><a href="/user-settings.html">Management Console</a></li>
-        </ul>
-    </nav>
-    
+    <nav><ul><li><a href="/">Home</a></li><li><a href="/user-settings.html">Management Console</a></li></ul></nav>
     <div class="console-container">
-        <h1 style="color: var(--primary-color); margin-bottom: 30px;">Management Console</h1>
-        
+        <h1>Management Console</h1>
         <div class="message" id="messageBox"></div>
         <div class="user-info" id="userInfo" style="display: none;">
             <span>Logged in as: <strong id="userEmail"></strong></span>
             <button class="logout-btn" onclick="logout()">Logout</button>
         </div>
-        
         <div class="tab-buttons">
-            <button class="tab-button active" onclick="showTab('login')" id="loginTabBtn">Login</button>
-            <button class="tab-button" onclick="showTab('domains')" id="domainsTabBtn" disabled>Domains</button>
-            <button class="tab-button" onclick="showTab('users')" id="usersTabBtn" disabled>Users</button>
-            <button class="tab-button" onclick="showTab('aliases')" id="aliasesTabBtn" disabled>Aliases</button>
-            <button class="tab-button" onclick="showTab('settings')" id="settingsTabBtn" disabled>Settings</button>
+            <button class="tab-button active" id="loginTabBtn" onclick="showTab('login')">Login</button>
+            <button class="tab-button" id="domainsTabBtn" onclick="showTab('domains')" disabled>Domains</button>
+            <button class="tab-button" id="usersTabBtn" onclick="showTab('users')" disabled>Users</button>
+            <button class="tab-button" id="settingsTabBtn" onclick="showTab('settings')" disabled>Settings</button>
         </div>
-        
-        <div class="loading" id="loadingSpinner">Loading...</div>
-        
+
         <div class="tab-content active" id="loginTab">
-            <h2>Login to Your Account</h2>
+            <h2>Login</h2>
             <form id="loginForm">
-                <div class="form-group"><label for="loginEmail">Email:</label><input type="email" id="loginEmail" required></div>
-                <div class="form-group"><label for="loginPassword">Password:</label><input type="password" id="loginPassword" required></div>
+                <div class="form-group"><label>Email:</label><input type="email" id="loginEmail" required></div>
+                <div class="form-group"><label>Password:</label><input type="password" id="loginPassword" required></div>
                 <button type="submit" class="btn">Login</button>
             </form>
         </div>
-        
+
         <div class="tab-content" id="domainsTab">
             <h2>Manage Domains</h2>
             <form id="addDomainForm" class="card">
                 <div class="form-grid">
-                    <div class="form-group"><label for="newDomain">Domain Name:</label><input type="text" id="newDomain" placeholder="newdomain.com" required></div>
-                    <div class="form-group"><label for="siteType">Site Type:</label><select id="siteType"><option value="wordpress">WordPress</option><option value="blank">Blank Site</option></select></div>
+                    <div class="form-group"><label>Domain Name:</label><input type="text" id="newDomain" required></div>
+                    <div class="form-group"><label>Site Type:</label><select id="siteType"><option value="wordpress">WordPress</option><option value="blank">Blank Site</option></select></div>
                 </div>
                 <button type="submit" class="btn">Add Domain</button>
             </form>
-            <h3>Existing Domains</h3>
-            <ul class="item-list" id="domainList"></ul>
+            <div id="progress-box"></div>
+            <h3>Existing Domains</h3><ul class="item-list" id="domainList"></ul>
         </div>
 
-        <div class="tab-content" id="usersTab">
-            <h2>Manage Users</h2>
-            <form id="addUserForm" class="card">
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label for="newUserEmail">Email Address:</label>
-                        <input type="text" id="newUserEmailPrefix" placeholder="user" style="width: 40%; display: inline-block;">
-                        @<select id="newUserEmailDomain" style="width: 55%; display: inline-block; padding: 12px;"></select>
-                    </div>
-                    <div class="form-group"><label for="newUserPassword">Password:</label><input type="password" id="newUserPassword" required></div>
-                </div>
-                <button type="submit" class="btn">Add User</button>
-            </form>
-            <h3>Existing Users</h3>
-            <ul class="item-list" id="userList"></ul>
-        </div>
-
-        <div class="tab-content" id="aliasesTab">
-            <h2>Manage Aliases</h2>
-            <form id="addAliasForm" class="card">
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label for="aliasSource">Alias (From):</label>
-                        <input type="text" id="aliasSourcePrefix" placeholder="alias" style="width: 40%; display: inline-block;">
-                        @<select id="aliasSourceDomain" style="width: 55%; display: inline-block; padding: 12px;"></select>
-                    </div>
-                    <div class="form-group"><label for="aliasDestination">Destination (To):</label><input type="email" id="aliasDestination" placeholder="user@example.com" required></div>
-                </div>
-                <button type="submit" class="btn">Add Alias</button>
-            </form>
-            <h3>Existing Aliases</h3>
-            <ul class="item-list" id="aliasList"></ul>
-        </div>
-
-        <div class="tab-content" id="settingsTab">
-             <h2>General Settings</h2>
-             <div class="card">
-                <h3>Change Password</h3>
-                <form id="passwordForm">
-                    <div class="form-group"><label for="currentPassword">Current Password:</label><input type="password" id="currentPassword" required></div>
-                    <div class="form-group"><label for="newPassword">New Password:</label><input type="password" id="newPassword" required></div>
-                    <button type="submit" class="btn">Change Password</button>
-                </form>
-             </div>
-             <div class="card">
-                <h3>Theme Colors (Global)</h3>
-                <form id="colorForm">
-                    <div class="color-picker-group">
-                        <div class="form-group"><label>Primary:</label><input type="color" id="primaryColor"></div>
-                        <div class="form-group"><label>Secondary:</label><input type="color" id="secondaryColor"></div>
-                    </div>
-                    <button type="submit" class="btn">Save Colors</button>
-                </form>
-             </div>
-        </div>
+        <div class="tab-content" id="usersTab"><h2>Manage Users</h2></div>
+        <div class="tab-content" id="settingsTab"><h2>Settings</h2></div>
     </div>
     <script>
-        const API_URL = '/api/manage.php';
-        let domains = [];
+        const MANAGE_API = '/api/manage.php';
+        const PROGRESS_API = '/api/progress.php';
+        let progressInterval;
 
-        // --- Core Auth & UI ---
         document.addEventListener('DOMContentLoaded', checkSession);
 
         function showTab(tabName) {
-            if (tabName !== 'login' && !sessionStorage.getItem('user')) {
-                showMessage('Please login first', 'error');
-                return;
-            }
-            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+            if (tabName !== 'login' && !sessionStorage.getItem('user')) return;
+            document.querySelectorAll('.tab-content, .tab-button').forEach(el => el.classList.remove('active'));
             document.getElementById(tabName + 'Tab').classList.add('active');
             document.getElementById(tabName + 'TabBtn').classList.add('active');
-            if(tabName !== 'login') loadDataForTab(tabName);
+            if (tabName === 'domains') loadDomains();
         }
 
         function showMessage(msg, type = 'success') {
@@ -521,163 +488,89 @@ cat > "$WEB_ROOT/user-settings.html" <<EOF
             box.textContent = msg;
             box.className = 'message ' + type;
             box.style.display = 'block';
-            setTimeout(() => box.style.display = 'none', 5000);
-        }
-
-        function setLoading(isLoading) {
-            document.getElementById('loadingSpinner').style.display = isLoading ? 'block' : 'none';
+            setTimeout(() => box.style.display = 'none', 7000);
         }
 
         function checkSession() {
             fetch('/api/session.php').then(r => r.json()).then(data => {
                 if (data.authenticated) {
                     sessionStorage.setItem('user', data.user);
-                    showLoggedInState(data.user);
+                    document.getElementById('userInfo').style.display = 'flex';
+                    document.getElementById('userEmail').textContent = data.user;
+                    ['domains', 'users', 'settings'].forEach(id => document.getElementById(id + 'TabBtn').disabled = false);
+                    document.getElementById('loginTabBtn').textContent = 'Logout';
+                    document.getElementById('loginTabBtn').onclick = logout;
                 }
             });
         }
 
-        function showLoggedInState(user) {
-            document.getElementById('userInfo').style.display = 'flex';
-            document.getElementById('userEmail').textContent = user;
-            ['domains', 'users', 'aliases', 'settings'].forEach(id => document.getElementById(id + 'TabBtn').disabled = false);
-            document.getElementById('loginTabBtn').textContent = 'Logout';
-            document.getElementById('loginTabBtn').onclick = logout;
-        }
+        function logout() { fetch('/api/logout.php').then(() => { sessionStorage.removeItem('user'); window.location.reload(); }); }
 
-        function logout() {
-            fetch('/api/logout.php').then(() => {
-                sessionStorage.removeItem('user');
-                window.location.reload();
-            });
-        }
-        
         document.getElementById('loginForm').addEventListener('submit', async e => {
             e.preventDefault();
-            setLoading(true);
-            const res = await fetch('/api/auth.php', {
-                method: 'POST',
-                body: JSON.stringify({ email: loginEmail.value, password: loginPassword.value })
-            });
+            const res = await fetch('/api/auth.php', { method: 'POST', body: JSON.stringify({ email: loginEmail.value, password: loginPassword.value }) });
             const data = await res.json();
-            setLoading(false);
             if (data.success) {
-                sessionStorage.setItem('user', data.user);
-                showLoggedInState(data.user);
+                checkSession();
                 showTab('domains');
-            } else {
-                showMessage(data.error, 'error');
-            }
+            } else { showMessage(data.error || 'Login failed', 'error'); }
         });
-        
-        async function apiCall(action, method = 'GET', body = null) {
-            setLoading(true);
-            try {
-                const options = { method, headers: { 'Content-Type': 'application/json' } };
-                if (body) options.body = JSON.stringify(body);
-                const response = await fetch(API_URL + '?action=' + action, options);
-                const data = await response.json();
-                if (data.status === 'success') {
-                    if (data.message) showMessage(data.message);
-                    return data.data;
-                } else {
-                    throw new Error(data.message || 'An unknown error occurred.');
-                }
-            } catch (error) {
-                showMessage(error.message, 'error');
-                return null;
-            } finally {
-                setLoading(false);
-            }
-        }
-
-        // --- Data Loading & Rendering ---
-        function loadDataForTab(tabName) {
-            switch(tabName) {
-                case 'domains': loadDomains(); break;
-                case 'users': loadUsers(); break;
-                case 'aliases': loadAliases(); break;
-            }
-        }
 
         async function loadDomains() {
-            const data = await apiCall('getDomains');
-            if(data) {
-                domains = data.map(d => d.name);
-                const list = document.getElementById('domainList');
-                list.innerHTML = domains.map(d => \`<li>\${d} <button class="delete-btn" onclick="deleteDomain('\${d}')">Delete</button></li>\`).join('');
-                updateDomainDropdowns();
+            const res = await fetch(MANAGE_API + '?action=getDomains');
+            const data = await res.json();
+            if (data.status === 'success') {
+                document.getElementById('domainList').innerHTML = data.data.map(d => `<li>${d.name} <button class="delete-btn" onclick="deleteDomain('${d.name}')">Delete</button></li>`).join('');
             }
         }
 
-        async function loadUsers() {
-            const data = await apiCall('getUsers');
-            if(data) {
-                const list = document.getElementById('userList');
-                list.innerHTML = data.map(u => \`<li>\${u.email} <button class="delete-btn" onclick="deleteUser('\${u.email}')">Delete</button></li>\`).join('');
-            }
-        }
-        
-        async function loadAliases() {
-            const data = await apiCall('getAliases');
-            if(data) {
-                const list = document.getElementById('aliasList');
-                list.innerHTML = data.map(a => \`<li>\${a.source} &rarr; \${a.destination} <button class="delete-btn" onclick="deleteAlias('\${a.source}')">Delete</button></li>\`).join('');
-            }
-        }
-
-        function updateDomainDropdowns() {
-            const options = domains.map(d => \`<option value="\${d}">\${d}</option>\`).join('');
-            document.getElementById('newUserEmailDomain').innerHTML = options;
-            document.getElementById('aliasSourceDomain').innerHTML = options;
-        }
-
-        // --- Action Handlers ---
         document.getElementById('addDomainForm').addEventListener('submit', async e => {
             e.preventDefault();
-            const domain = document.getElementById('newDomain').value;
-            const type = document.getElementById('siteType').value;
-            if (confirm(\`Are you sure you want to add \${domain}?\`)) {
-                await apiCall('addDomain', 'POST', { domain, type });
-                loadDomains();
-            }
+            const res = await fetch(MANAGE_API + '?action=addDomain', { method: 'POST', body: JSON.stringify({ domain: newDomain.value, type: siteType.value }) });
+            const data = await res.json();
+            if (data.status === 'success') {
+                showMessage('Process started! See progress below.');
+                trackProgress(data.logFile);
+            } else { showMessage(data.message, 'error'); }
         });
-        
+
         async function deleteDomain(domain) {
-            if (confirm(\`Are you sure you want to PERMANENTLY delete \${domain} and all its data?\`)) {
-                await apiCall('deleteDomain', 'POST', { domain });
-                loadDomains();
-            }
-        }
-        
-        document.getElementById('addUserForm').addEventListener('submit', async e => {
-            e.preventDefault();
-            const email = document.getElementById('newUserEmailPrefix').value + '@' + document.getElementById('newUserEmailDomain').value;
-            const password = document.getElementById('newUserPassword').value;
-            await apiCall('addUser', 'POST', { email, password });
-            loadUsers();
-        });
-
-        async function deleteUser(email) {
-            if (confirm(\`Delete user \${email}?\`)) {
-                await apiCall('deleteUser', 'POST', { email });
-                loadUsers();
-            }
+            if (!confirm(`This will permanently delete ${domain}. Are you sure?`)) return;
+            trackProgress(domain + '_install.log'); // Reuse progress tracker for deletion
+            const res = await fetch(MANAGE_API + '?action=deleteDomain', { method: 'POST', body: JSON.stringify({ domain }) });
+            await res.json(); // Wait for it to kick off
         }
 
-        document.getElementById('addAliasForm').addEventListener('submit', async e => {
-            e.preventDefault();
-            const source = document.getElementById('aliasSourcePrefix').value + '@' + document.getElementById('aliasSourceDomain').value;
-            const destination = document.getElementById('aliasDestination').value;
-            await apiCall('addAlias', 'POST', { source, destination });
-            loadAliases();
-        });
+        function trackProgress(logFile) {
+            const progressBox = document.getElementById('progress-box');
+            progressBox.style.display = 'block';
+            progressBox.innerHTML = 'Starting...';
+            document.getElementById('addDomainForm').querySelector('button').disabled = true;
 
-        async function deleteAlias(source) {
-            if (confirm(\`Delete alias for \${source}?\`)) {
-                await apiCall('deleteAlias', 'POST', { source });
-                loadAliases();
-            }
+            clearInterval(progressInterval);
+            progressInterval = setInterval(async () => {
+                try {
+                    const res = await fetch(PROGRESS_API + '?logFile=' + logFile);
+                    if(!res.ok) return;
+                    const data = await res.json();
+
+                    if (data.log) {
+                        progressBox.innerHTML = data.log.replace(/\n/g, '<br>');
+                        progressBox.scrollTop = progressBox.scrollHeight;
+                    }
+
+                    if (data.done) {
+                        clearInterval(progressInterval);
+                        document.getElementById('addDomainForm').querySelector('button').disabled = false;
+                        loadDomains();
+                        if(data.log.includes("ERROR")){
+                            showMessage("Process finished with errors. Check log for details.", 'error');
+                        } else {
+                            showMessage("Process finished successfully!", 'success');
+                        }
+                    }
+                } catch(e) { /* Ignore parsing errors if file not ready */ }
+            }, 2000);
         }
     </script>
 </body>
