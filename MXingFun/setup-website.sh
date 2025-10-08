@@ -94,25 +94,51 @@ mkdir -p "$WEB_ROOT"/{css,js,api,data}
 # but we add new ones for management.
 
 # api/auth.php (No changes from your original script)
+# api/auth.php (FIXED with absolute path for doveadm)
 cat > "$WEB_ROOT/api/auth.php" <<'APIAUTH'
 <?php
 header('Content-Type: application/json');
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); echo json_encode(['error' => 'Method not allowed']); exit; }
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['error' => 'Method not allowed']);
+    exit;
+}
+
 $input = json_decode(file_get_contents('php://input'), true);
 $email = $input['email'] ?? '';
 $password = $input['password'] ?? '';
-if (empty($email) || empty($password)) { http_response_code(400); echo json_encode(['error' => 'Email and password required']); exit; }
+
+if (empty($email) || empty($password)) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Email and password are required.']);
+    exit;
+}
+
 require_once('/etc/mail-config/db_config.php');
 $mysqli = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
-if ($mysqli->connect_error) { http_response_code(500); echo json_encode(['error' => 'Database connection failed']); exit; }
+
+if ($mysqli->connect_error) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Database connection failed.']);
+    exit;
+}
+
 $stmt = $mysqli->prepare("SELECT password FROM virtual_users WHERE email = ? AND active = 1");
 $stmt->bind_param("s", $email);
 $stmt->execute();
 $result = $stmt->get_result();
+
 if ($row = $result->fetch_assoc()) {
     $stored_pass = $row['password'];
-    $verify_cmd = sprintf("echo %s | doveadm pw -t %s 2>&1", escapeshellarg($password), escapeshellarg($stored_pass));
+
+    // FIX: Use the full path /usr/bin/doveadm to avoid PATH issues.
+    $verify_cmd = sprintf(
+        "/usr/bin/doveadm pw -p %s -t %s 2>&1",
+        escapeshellarg($password),
+        escapeshellarg($stored_pass)
+    );
     $verify_output = shell_exec($verify_cmd);
+
     if (strpos($verify_output, 'verified') !== false) {
         session_start();
         $_SESSION['user'] = $email;
@@ -125,6 +151,7 @@ if ($row = $result->fetch_assoc()) {
     http_response_code(401);
     echo json_encode(['error' => 'Invalid credentials']);
 }
+
 $stmt->close();
 $mysqli->close();
 APIAUTH
