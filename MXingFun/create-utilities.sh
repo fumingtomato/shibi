@@ -950,107 +950,166 @@ sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/mailwizz-info
 chmod +x /usr/local/bin/mailwizz-info
 
 # ===================================================================
-# 12. WEB CONSOLE DOMAIN MANAGEMENT UTILITY
+# 12. WEB CONSOLE DOMAIN MANAGEMENT UTILITY (v3 - Full Automation)
 # ===================================================================
 
 print_header "Creating Web Console Backend Utility"
 
-sudo cat > /usr/local/bin/manage-domain <<'EOF'
+cat > /usr/local/bin/manage-domain <<'EOF'
 #!/bin/bash
-# Backend utility for web console domain management (v2 - JSON output only)
+# Backend utility for web console domain management (v3 - Full Automation)
 
 ACTION=$1
 DOMAIN=$2
 TYPE=$3 # --wordpress or --blank
+LOG_FILE="/tmp/${DOMAIN}_install.log"
+
+# Function to log progress
+log_progress() {
+    echo "$(date +'%H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# Clear previous log
+> "$LOG_FILE"
 
 if [ -z "$ACTION" ] || [ -z "$DOMAIN" ]; then
-    echo '{"status": "error", "message": "Usage: manage-domain <add|delete> <domain> [--wordpress|--blank]"}'
+    log_progress "ERROR: Invalid arguments received."
     exit 1
 fi
 
-# Load mail server config and DB password
+# Load configs
 source /etc/mail-config/install.conf
 DB_PASS=$(cat /etc/mail-config/db_password)
+CF_API_KEY=$(grep 'CF_API_KEY=' /etc/mail-config/install.conf | cut -d'"' -f2)
+CF_EMAIL=$(grep 'CF_EMAIL=' /etc/mail-config/install.conf | cut -d'"' -f2)
+
+# --- Cloudflare API Function ---
+add_cf_record() {
+    local record_type="$1"
+    local record_name="$2"
+    local record_content="$3"
+    local proxied="${4:-false}"
+
+    log_progress "Attempting to get Zone ID for $DOMAIN_NAME..."
+    ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" \
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_API_KEY" -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+    if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" == "null" ]; then
+        log_progress "ERROR: Could not find Cloudflare Zone ID for $DOMAIN_NAME."
+        return 1
+    fi
+    log_progress "Cloudflare Zone ID found: $ZONE_ID"
+
+    log_progress "Adding $record_type record for $record_name..."
+    response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_API_KEY" -H "Content-Type: application/json" \
+        --data "{\"type\":\"$record_type\",\"name\":\"$record_name\",\"content\":\"$record_content\",\"ttl\":1,\"proxied\":$proxied}")
+
+    success=$(echo "$response" | jq -r '.success')
+    if [ "$success" != "true" ]; then
+        error=$(echo "$response" | jq -r '.errors[0].message')
+        log_progress "ERROR: Cloudflare API failed: $error"
+        return 1
+    fi
+    log_progress "Successfully added $record_type record."
+    return 0
+}
+
 
 add_domain() {
-    # Send progress to standard error so it doesn't corrupt JSON output
-    echo "Adding domain: $DOMAIN" >&2
-    
-    # 1. Add to mail server database
+    log_progress "Starting setup for new domain: $DOMAIN"
+
+    log_progress "Step 1: Adding domain to mail server database..."
     mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN');"
+    log_progress "Step 1: Complete."
 
-    # 2. Create web directory
-    WEB_ROOT="/var/www/$DOMAIN"
-    mkdir -p "$WEB_ROOT"
-    chown www-data:www-data "$WEB_ROOT"
+    log_progress "Step 2: Creating web directory /var/www/$DOMAIN..."
+    mkdir -p "/var/www/$DOMAIN"
+    chown www-data:www-data "/var/www/$DOMAIN"
+    log_progress "Step 2: Complete."
 
-    # 3. Create Nginx config
+    log_progress "Step 3: Configuring DNS records in Cloudflare..."
+    add_cf_record "A" "$DOMAIN" "$PRIMARY_IP" false
+    if [ $? -ne 0 ]; then exit 1; fi
+    add_cf_record "CNAME" "www" "$DOMAIN" false
+    if [ $? -ne 0 ]; then exit 1; fi
+    log_progress "Step 3: Complete."
+
+    log_progress "Step 4: Creating Nginx configuration..."
     PHP_SOCK_PATH=$(find /var/run/php/ -name "php*-fpm.sock" | head -n 1)
     cat > "/etc/nginx/sites-available/$DOMAIN" <<NGINX
 server {
     listen 80;
     server_name $DOMAIN www.$DOMAIN;
-    root $WEB_ROOT;
+    root /var/www/$DOMAIN;
     index index.php index.html;
-    location / {
-        try_files \$uri \$uri/ /index.php?\$args;
-    }
-    location ~ \.php$ {
+    location / { try_files \$uri \$uri/ /index.php?\$args; }
+    location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:$PHP_SOCK_PATH;
     }
 }
 NGINX
     ln -sf "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/"
+    systemctl reload nginx
+    log_progress "Step 4: Complete."
+
+    log_progress "Step 5: Waiting 20 seconds for DNS to propagate before requesting SSL..."
+    sleep 20
+
+    log_progress "Step 6: Requesting Let's Encrypt SSL certificate..."
+    certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect --quiet
+    if [ $? -eq 0 ]; then
+        log_progress "Step 6: SSL certificate obtained successfully."
+    else
+        log_progress "WARNING: Failed to obtain SSL certificate automatically. You may need to run 'certbot --nginx' manually later."
+    fi
 
     if [ "$TYPE" == "--wordpress" ]; then
-        echo "Setting up WordPress for $DOMAIN" >&2
+        log_progress "Step 7: Installing WordPress..."
         WP_DB_NAME=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_wp
         WP_DB_USER=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_usr
         WP_DB_PASS=$(openssl rand -base64 16)
-        
-        mysql -u mailuser -p"$DB_PASS" mailserver <<MYSQL_WP
-CREATE DATABASE $WP_DB_NAME;
-CREATE USER '$WP_DB_USER'@'localhost' IDENTIFIED BY '$WP_DB_PASS';
+
+        mysql -u root <<MYSQL_WP
+CREATE DATABASE IF NOT EXISTS $WP_DB_NAME;
+CREATE USER IF NOT EXISTS '$WP_DB_USER'@'localhost' IDENTIFIED BY '$WP_DB_PASS';
 GRANT ALL PRIVILEGES ON $WP_DB_NAME.* TO '$WP_DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 MYSQL_WP
-
-        cd "$WEB_ROOT"
+        cd "/var/www/$DOMAIN"
         /usr/local/bin/wp core download --allow-root
         /usr/local/bin/wp config create --dbname="$WP_DB_NAME" --dbuser="$WP_DB_USER" --dbpass="$WP_DB_PASS" --allow-root
-        /usr/local/bin/wp core install --url="http://$DOMAIN" --title="Welcome to $DOMAIN" --admin_user="admin" --admin_password="password" --admin_email="admin@$DOMAIN" --skip-email --allow-root
-        chown -R www-data:www-data "$WEB_ROOT"
-        echo "WordPress installed. User: admin, Pass: password" >&2
+        /usr/local/bin/wp core install --url="https://$DOMAIN" --title="Welcome to $DOMAIN" --admin_user="admin" --admin_password="password" --admin_email="admin@$DOMAIN" --skip-email --allow-root
+        chown -R www-data:www-data "/var/www/$DOMAIN"
+        log_progress "Step 7: WordPress installed. User: admin, Pass: password"
     else
-        echo "Creating blank site for $DOMAIN" >&2
-        echo "<h1>Welcome to $DOMAIN</h1>" > "$WEB_ROOT/index.html"
-        chown www-data:www-data "$WEB_ROOT/index.html"
+        log_progress "Step 7: Creating blank index page..."
+        echo "<h1>Welcome to $DOMAIN</h1><p>Site configured successfully.</p>" > "/var/www/$DOMAIN/index.html"
+        chown www-data:www-data "/var/www/$DOMAIN/index.html"
+        log_progress "Step 7: Complete."
     fi
-    
-    # 4. Get SSL and reload Nginx
-    certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect --quiet
-    systemctl reload nginx
-    # Final JSON output
-    echo '{"status": "success", "message": "Domain '$DOMAIN' added successfully."}'
+
+    log_progress "SUCCESS: Domain setup is complete!"
 }
 
 delete_domain() {
-    echo "Deleting domain: $DOMAIN" >&2
+    log_progress "Deleting domain: $DOMAIN"
+    # Add logic here to remove Cloudflare records if desired
     mysql -u mailuser -p"$DB_PASS" mailserver -e "DELETE FROM virtual_domains WHERE name = '$DOMAIN';"
     rm -f "/etc/nginx/sites-enabled/$DOMAIN"
     rm -f "/etc/nginx/sites-available/$DOMAIN"
     rm -rf "/var/www/$DOMAIN"
     WP_DB_NAME=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_wp
-    mysql -u mailuser -p"$DB_PASS" mailserver -e "DROP DATABASE IF EXISTS $WP_DB_NAME;"
+    mysql -u root -e "DROP DATABASE IF EXISTS $WP_DB_NAME;"
     systemctl reload nginx
-    echo '{"status": "success", "message": "Domain '$DOMAIN' deleted successfully."}'
+    log_progress "SUCCESS: Domain deleted."
 }
 
 case "$ACTION" in
     add) add_domain ;;
     delete) delete_domain ;;
-    *) echo '{"status": "error", "message": "Invalid action."}'; exit 1 ;;
+    *) log_progress "ERROR: Invalid action." ; exit 1 ;;
 esac
 EOF
 
