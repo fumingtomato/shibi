@@ -286,9 +286,8 @@ ALL ALL=(root) NOPASSWD: /usr/local/bin/assign-ip
 # Allow reading specific files
 ALL ALL=(root) NOPASSWD: /bin/cat /root/.mail_db_password
 ALL ALL=(root) NOPASSWD: /bin/cat /root/mail-installer/install.conf
-SUDOERS
 
-# ADD THIS LINE FOR THE NEW WEB CONSOLE
+# Allow web server to manage domains for the new console
 www-data ALL=(root) NOPASSWD: /usr/local/bin/manage-domain
 SUDOERS
 
