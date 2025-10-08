@@ -2,7 +2,7 @@
 
 # =================================================================
 # THE DEFINITIVE, HARDENED, ALL-IN-ONE BULK MAIL SERVER INSTALLER
-# Version: 24.1.3 - FINAL (Robust Firewall Fix)
+# Version: 24.1.4 - FINAL (Robust Cloudflare JSON Fix)
 # This script is fully self-contained and includes ALL original features
 # and management commands. All silent failure points, Python
 # environment, service file, Nginx, hostname, and firewall issues are fixed.
@@ -379,17 +379,60 @@ run_cloudflare_dns_setup() {
 
     if [[ ${#CF_API_KEY} -gt 37 ]]; then AUTH_HEADER="Authorization: Bearer $CF_API_KEY"; else AUTH_HEADER="X-Auth-Email: $CF_EMAIL;X-Auth-Key: $CF_API_KEY"; fi
     ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_NAME" -H "$AUTH_HEADER" -H "Content-Type: application/json" | jq -r '.result[0].id')
-    if [ "$ZONE_ID" == "null" ]; then print_error "Cloudflare Zone ID not found for $DOMAIN_NAME."; return; fi
-    add_cf_record() { curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" -H "$AUTH_HEADER" -H "Content-Type: application/json" --data "{\"type\":\"$1\",\"name\":\"$2\",\"content\":\"$3\",\"proxied\":false, \"priority\":10}"; }
+    if [ "$ZONE_ID" == "null" ]; then print_error "Cloudflare Zone ID not found for $DOMAIN_NAME."; return 1; fi
+    
+    # FIX: Use jq to safely create JSON payloads for Cloudflare API
+    add_cf_record() {
+        local type="$1" name="$2" content="$3"
+        # MX records need a priority field
+        if [[ "$type" == "MX" ]]; then
+            priority=10
+        else
+            priority=null
+        fi
+
+        json_payload=$(jq -n \
+            --arg type "$type" \
+            --arg name "$name" \
+            --arg content "$content" \
+            --argjson priority "$priority" \
+            '{type: $type, name: $name, content: $content, proxied: false, priority: $priority}')
+
+        # The API endpoint for MX records doesn't use the priority field in the main JSON body in the same way.
+        # This simplified payload works for A, TXT, and MX.
+        json_payload=$(jq -n \
+            --arg type "$type" \
+            --arg name "$name" \
+            --arg content "$content" \
+            '{type: $type, name: $name, content: $content, proxied: false}')
+        
+        # For MX records, we add priority separately if needed by the API, but typically it's part of the content or a specific field.
+        # Let's create a universal payload and add priority only for MX
+        if [[ "$type" == "MX" ]]; then
+           json_payload=$(echo "$json_payload" | jq '. + {priority: 10}')
+        fi
+
+        response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+            -H "$AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            --data "$json_payload")
+
+        if ! echo "$response" | jq -e '.success' > /dev/null; then
+            print_error "Failed to create DNS record: $name ($type)"
+            print_error "Cloudflare response: $(echo "$response" | jq '.errors')"
+            # Do not exit, just report the error
+        fi
+    }
+    
     print_message "Adding DNS records to Cloudflare..."
-    add_cf_record "A" "$HOSTNAME" "$PRIMARY_IP" > /dev/null
-    for i in "${!IP_ADDRESSES[@]}"; do if [ "$i" -eq 0 ]; then continue; fi; add_cf_record "A" "${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME" "${IP_ADDRESSES[$i]}" > /dev/null; done
-    add_cf_record "MX" "$DOMAIN_NAME" "$HOSTNAME" > /dev/null
+    add_cf_record "A" "$HOSTNAME" "$PRIMARY_IP"
+    for i in "${!IP_ADDRESSES[@]}"; do if [ "$i" -eq 0 ]; then continue; fi; add_cf_record "A" "${MAIL_SUBDOMAIN}${i}.$DOMAIN_NAME" "${IP_ADDRESSES[$i]}"; done
+    add_cf_record "MX" "$DOMAIN_NAME" "$HOSTNAME"
     DKIM_KEY=$(cat /etc/opendkim/keys/$DOMAIN_NAME/mail.txt | grep -o 'p=[^"]*' | sed 's/."//' | cut -c 3- | tr -d ' \n\t')
-    add_cf_record "TXT" "mail._domainkey" "v=DKIM1; k=rsa; p=$DKIM_KEY" > /dev/null
+    add_cf_record "TXT" "mail._domainkey" "v=DKIM1; k=rsa; p=$DKIM_KEY"
     SPF_RECORD="v=spf1 mx $(for ip in "${IP_ADDRESSES[@]}"; do echo -n "ip4:$ip "; done)~all"
-    add_cf_record "TXT" "$DOMAIN_NAME" "$SPF_RECORD" > /dev/null
-    add_cf_record "TXT" "_dmarc" "v=DMARC1; p=none; rua=mailto:dmarc@$DOMAIN_NAME" > /dev/null
+    add_cf_record "TXT" "$DOMAIN_NAME" "$SPF_RECORD"
+    add_cf_record "TXT" "_dmarc" "v=DMARC1; p=none; rua=mailto:dmarc@$DOMAIN_NAME"
     print_message "✓ Cloudflare DNS records created."
 }
 
