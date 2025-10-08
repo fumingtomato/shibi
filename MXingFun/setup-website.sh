@@ -402,7 +402,7 @@ cat > "$WEB_ROOT/js/colors.js" << 'JS'
 JS
 
 # user-settings.html (NEW with progress tracking)
-cat > "$WEB_ROOT/user-settings.html" <<'EOF'
+sudo cat > /var/www/3fuming1server001.com/user-settings.html <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -418,12 +418,15 @@ cat > "$WEB_ROOT/user-settings.html" <<'EOF'
         .tab-button.active { background: var(--primary-color); color: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         .tab-button:disabled { opacity: 0.5; cursor: not-allowed; }
         .tab-content { display: none; }
-        .tab-content.active { display: block; }
+        .tab-content.active { display: block; animation: fadeIn 0.5s; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         .message { padding: 15px; border-radius: 5px; margin-bottom: 20px; display: none; }
         .message.success { background: #d4edda; color: #155724; }
         .message.error { background: #f8d7da; color: #721c24; }
+        .item-list { list-style: none; margin-top: 20px; padding: 0; }
         .item-list li { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #eee; }
         .delete-btn { background: #e74c3c; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; }
+        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: end; }
         #progress-box { display: none; margin-top: 20px; background-color: #2c3e50; color: #ecf0f1; font-family: monospace; padding: 15px; border-radius: 5px; height: 300px; overflow-y: auto; white-space: pre-wrap; }
     </style>
 </head>
@@ -440,49 +443,59 @@ cat > "$WEB_ROOT/user-settings.html" <<'EOF'
             <button class="tab-button active" id="loginTabBtn" onclick="showTab('login')">Login</button>
             <button class="tab-button" id="domainsTabBtn" onclick="showTab('domains')" disabled>Domains</button>
             <button class="tab-button" id="usersTabBtn" onclick="showTab('users')" disabled>Users</button>
+            <button class="tab-button" id="aliasesTabBtn" onclick="showTab('aliases')" disabled>Aliases</button>
             <button class="tab-button" id="settingsTabBtn" onclick="showTab('settings')" disabled>Settings</button>
         </div>
-
+        
         <div class="tab-content active" id="loginTab">
             <h2>Login</h2>
-            <form id="loginForm">
-                <div class="form-group"><label>Email:</label><input type="email" id="loginEmail" required></div>
-                <div class="form-group"><label>Password:</label><input type="password" id="loginPassword" required></div>
-                <button type="submit" class="btn">Login</button>
-            </form>
+            <form id="loginForm"><div class="form-group"><label>Email:</label><input type="email" id="loginEmail" required></div><div class="form-group"><label>Password:</label><input type="password" id="loginPassword" required></div><button type="submit" class="btn">Login</button></form>
         </div>
-
+        
         <div class="tab-content" id="domainsTab">
             <h2>Manage Domains</h2>
-            <form id="addDomainForm" class="card">
-                <div class="form-grid">
-                    <div class="form-group"><label>Domain Name:</label><input type="text" id="newDomain" required></div>
-                    <div class="form-group"><label>Site Type:</label><select id="siteType"><option value="wordpress">WordPress</option><option value="blank">Blank Site</option></select></div>
-                </div>
-                <button type="submit" class="btn">Add Domain</button>
-            </form>
+            <form id="addDomainForm" class="card"><div class="form-grid"><div class="form-group"><label>Domain Name:</label><input type="text" id="newDomain" required></div><div class="form-group"><label>Site Type:</label><select id="siteType"><option value="wordpress">WordPress</option><option value="blank">Blank Site</option></select></div></div><button type="submit" class="btn">Add Domain</button></form>
             <div id="progress-box"></div>
             <h3>Existing Domains</h3><ul class="item-list" id="domainList"></ul>
         </div>
 
-        <div class="tab-content" id="usersTab"><h2>Manage Users</h2></div>
-        <div class="tab-content" id="settingsTab"><h2>Settings</h2></div>
+        <div class="tab-content" id="usersTab">
+            <h2>Manage Users</h2>
+            <form id="addUserForm" class="card"><div class="form-grid"><div class="form-group"><label>Email Address:</label><input type="text" id="newUserEmailPrefix" placeholder="user" style="width: 40%; display: inline-block;"> @<select id="newUserEmailDomain" style="width: 55%; display: inline-block; padding: 12px; border: 1px solid #e9ecef; border-radius: 5px;"></select></div><div class="form-group"><label>Password:</label><input type="password" id="newUserPassword" required></div></div><button type="submit" class="btn">Add User</button></form>
+            <h3>Existing Users</h3><ul class="item-list" id="userList"></ul>
+        </div>
+
+        <div class="tab-content" id="aliasesTab">
+             <h2>Manage Aliases</h2>
+            <form id="addAliasForm" class="card"><div class="form-grid"><div class="form-group"><label>Alias (From):</label><input type="text" id="aliasSourcePrefix" placeholder="alias" style="width: 40%; display: inline-block;"> @<select id="aliasSourceDomain" style="width: 55%; display: inline-block; padding: 12px; border: 1px solid #e9ecef; border-radius: 5px;"></select></div><div class="form-group"><label>Destination (To):</label><input type="email" id="aliasDestination" placeholder="user@example.com" required></div></div><button type="submit" class="btn">Add Alias</button></form>
+            <h3>Existing Aliases</h3><ul class="item-list" id="aliasList"></ul>
+        </div>
+
+        <div class="tab-content" id="settingsTab">
+            <h2>Settings</h2>
+            <div class="card"><h3>Change Password</h3><form id="passwordForm"><div class="form-group"><label>Current Password:</label><input type="password" id="currentPassword" required></div><div class="form-group"><label>New Password:</label><input type="password" id="newPassword" required></div><button type="submit" class="btn">Change Password</button></form></div>
+            <div class="card"><h3>Theme Colors (Global)</h3><form id="colorForm"><div class="color-picker-group"><div class="form-group"><label>Primary:</label><input type="color" id="primaryColor"></div><div class="form-group"><label>Secondary:</label><input type="color" id="secondaryColor"></div></div><button type="submit" class="btn">Save Colors</button></form></div>
+        </div>
     </div>
+
     <script>
         const MANAGE_API = '/api/manage.php';
         const PROGRESS_API = '/api/progress.php';
         let progressInterval;
-
+    
         document.addEventListener('DOMContentLoaded', checkSession);
-
+    
         function showTab(tabName) {
             if (tabName !== 'login' && !sessionStorage.getItem('user')) return;
             document.querySelectorAll('.tab-content, .tab-button').forEach(el => el.classList.remove('active'));
             document.getElementById(tabName + 'Tab').classList.add('active');
             document.getElementById(tabName + 'TabBtn').classList.add('active');
+            // Load data for the activated tab
             if (tabName === 'domains') loadDomains();
+            if (tabName === 'users') loadUsers();
+            if (tabName === 'aliases') loadAliases();
         }
-
+    
         function showMessage(msg, type = 'success') {
             const box = document.getElementById('messageBox');
             box.textContent = msg;
@@ -490,22 +503,22 @@ cat > "$WEB_ROOT/user-settings.html" <<'EOF'
             box.style.display = 'block';
             setTimeout(() => box.style.display = 'none', 7000);
         }
-
+    
         function checkSession() {
             fetch('/api/session.php').then(r => r.json()).then(data => {
                 if (data.authenticated) {
                     sessionStorage.setItem('user', data.user);
                     document.getElementById('userInfo').style.display = 'flex';
                     document.getElementById('userEmail').textContent = data.user;
-                    ['domains', 'users', 'settings'].forEach(id => document.getElementById(id + 'TabBtn').disabled = false);
+                    ['domains', 'users', 'aliases', 'settings'].forEach(id => document.getElementById(id + 'TabBtn').disabled = false);
                     document.getElementById('loginTabBtn').textContent = 'Logout';
                     document.getElementById('loginTabBtn').onclick = logout;
                 }
             });
         }
-
+    
         function logout() { fetch('/api/logout.php').then(() => { sessionStorage.removeItem('user'); window.location.reload(); }); }
-
+    
         document.getElementById('loginForm').addEventListener('submit', async e => {
             e.preventDefault();
             const res = await fetch('/api/auth.php', { method: 'POST', body: JSON.stringify({ email: loginEmail.value, password: loginPassword.value }) });
@@ -516,62 +529,92 @@ cat > "$WEB_ROOT/user-settings.html" <<'EOF'
             } else { showMessage(data.error || 'Login failed', 'error'); }
         });
 
+        async function apiPost(action, body) {
+            const res = await fetch(MANAGE_API + `?action=${action}`, { method: 'POST', body: JSON.stringify(body) });
+            const data = await res.json();
+            if (data.status !== 'success') {
+                showMessage(data.message || 'An error occurred', 'error');
+                return null;
+            }
+            return data;
+        }
+    
+        // --- Domain Management ---
         async function loadDomains() {
             const res = await fetch(MANAGE_API + '?action=getDomains');
             const data = await res.json();
             if (data.status === 'success') {
-                document.getElementById('domainList').innerHTML = data.data.map(d => `<li>${d.name} <button class="delete-btn" onclick="deleteDomain('${d.name}')">Delete</button></li>`).join('');
+                const domains = data.data.map(d => d.name);
+                document.getElementById('domainList').innerHTML = domains.map(d => `<li>${d} <button class="delete-btn" onclick="deleteDomain('${d}')">Delete</button></li>`).join('');
+                const options = domains.map(d => `<option value="${d}">${d}</option>`).join('');
+                document.getElementById('newUserEmailDomain').innerHTML = options;
+                document.getElementById('aliasSourceDomain').innerHTML = options;
             }
         }
-
         document.getElementById('addDomainForm').addEventListener('submit', async e => {
             e.preventDefault();
-            const res = await fetch(MANAGE_API + '?action=addDomain', { method: 'POST', body: JSON.stringify({ domain: newDomain.value, type: siteType.value }) });
-            const data = await res.json();
-            if (data.status === 'success') {
+            const data = await apiPost('addDomain', { domain: newDomain.value, type: siteType.value });
+            if (data) {
                 showMessage('Process started! See progress below.');
                 trackProgress(data.logFile);
-            } else { showMessage(data.message, 'error'); }
+            }
         });
-
         async function deleteDomain(domain) {
             if (!confirm(`This will permanently delete ${domain}. Are you sure?`)) return;
-            trackProgress(domain + '_install.log'); // Reuse progress tracker for deletion
-            const res = await fetch(MANAGE_API + '?action=deleteDomain', { method: 'POST', body: JSON.stringify({ domain }) });
-            await res.json(); // Wait for it to kick off
+            trackProgress(domain + '_install.log');
+            await apiPost('deleteDomain', { domain });
         }
-
         function trackProgress(logFile) {
             const progressBox = document.getElementById('progress-box');
             progressBox.style.display = 'block';
             progressBox.innerHTML = 'Starting...';
             document.getElementById('addDomainForm').querySelector('button').disabled = true;
-
             clearInterval(progressInterval);
             progressInterval = setInterval(async () => {
                 try {
                     const res = await fetch(PROGRESS_API + '?logFile=' + logFile);
                     if(!res.ok) return;
                     const data = await res.json();
-
                     if (data.log) {
                         progressBox.innerHTML = data.log.replace(/\n/g, '<br>');
                         progressBox.scrollTop = progressBox.scrollHeight;
                     }
-
                     if (data.done) {
                         clearInterval(progressInterval);
                         document.getElementById('addDomainForm').querySelector('button').disabled = false;
                         loadDomains();
-                        if(data.log.includes("ERROR")){
-                            showMessage("Process finished with errors. Check log for details.", 'error');
-                        } else {
-                            showMessage("Process finished successfully!", 'success');
-                        }
+                        if(data.log.includes("ERROR")){ showMessage("Process finished with errors.", 'error'); }
+                        else { showMessage("Process finished successfully!", 'success'); }
                     }
-                } catch(e) { /* Ignore parsing errors if file not ready */ }
+                } catch(e) {}
             }, 2000);
         }
+
+        // --- User Management ---
+        async function loadUsers() {
+            const res = await fetch(MANAGE_API + '?action=getUsers');
+            const data = await res.json();
+            if (data.status === 'success') {
+                document.getElementById('userList').innerHTML = data.data.map(u => `<li>${u.email} <button class="delete-btn" onclick="deleteUser('${u.email}')">Delete</button></li>`).join('');
+            }
+        }
+        document.getElementById('addUserForm').addEventListener('submit', async e => {
+            e.preventDefault();
+            const email = document.getElementById('newUserEmailPrefix').value + '@' + document.getElementById('newUserEmailDomain').value;
+            const data = await apiPost('addUser', { email: email, password: newUserPassword.value });
+            if(data) { showMessage(data.message); loadUsers(); e.target.reset(); }
+        });
+        async function deleteUser(email) {
+            if (!confirm(`Delete user ${email}?`)) return;
+            const data = await apiPost('deleteUser', { email });
+            if (data) { showMessage(data.message); loadUsers(); }
+        }
+
+        // --- Alias & Settings Management ---
+        async function loadAliases() { /* Add logic if needed */ }
+        document.getElementById('addAliasForm').addEventListener('submit', async e => { e.preventDefault(); /* Add logic if needed */ });
+        document.getElementById('passwordForm').addEventListener('submit', async e => { e.preventDefault(); /* Add logic if needed */ });
+        document.getElementById('colorForm').addEventListener('submit', async e => { e.preventDefault(); /* Add logic if needed */ });
     </script>
 </body>
 </html>
