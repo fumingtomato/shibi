@@ -321,6 +321,13 @@ if ! command -v certbot &> /dev/null; then
     apt-get install -y certbot python3-certbot-nginx > /dev/null 2>&1
 fi
 
+# Define MAIL_PREFIX to ensure correct subdomain names are used
+if [ ! -z "$MAIL_SUBDOMAIN" ]; then
+    MAIL_PREFIX="$MAIL_SUBDOMAIN"
+else
+    MAIL_PREFIX="mail" # Fallback to "mail" if not set
+fi
+
 # Build list of ALL domains for SSL
 SSL_DOMAINS="$DOMAIN_NAME www.$DOMAIN_NAME $HOSTNAME"
 # Add numbered subdomains if multiple IPs
