@@ -950,6 +950,129 @@ sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /usr/local/bin/mailwizz-info
 chmod +x /usr/local/bin/mailwizz-info
 
 # ===================================================================
+# 12. WEB CONSOLE DOMAIN MANAGEMENT UTILITY
+# ===================================================================
+
+print_header "Creating Web Console Backend Utility"
+
+cat > /usr/local/bin/manage-domain <<'EOF'
+#!/bin/bash
+# Backend utility for web console domain management
+
+ACTION=$1
+DOMAIN=$2
+TYPE=$3 # --wordpress or --blank
+
+if [ -z "$ACTION" ] || [ -z "$DOMAIN" ]; then
+    echo '{"status": "error", "message": "Usage: manage-domain <add|delete> <domain> [--wordpress|--blank]"}'
+    exit 1
+fi
+
+# Load mail server config
+source /etc/mail-config/install.conf
+# Load DB password
+DB_PASS=$(cat /etc/mail-config/db_password)
+
+add_domain() {
+    echo "Adding domain: $DOMAIN"
+    
+    # 1. Add to mail server database
+    mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN');"
+
+    # 2. Create web directory
+    WEB_ROOT="/var/www/$DOMAIN"
+    mkdir -p "$WEB_ROOT"
+    chown www-data:www-data "$WEB_ROOT"
+
+    # 3. Create Nginx config
+    cat > "/etc/nginx/sites-available/$DOMAIN" <<NGINX
+server {
+    listen 80;
+    server_name $DOMAIN www.$DOMAIN;
+    root $WEB_ROOT;
+    index index.php index.html;
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php\$(php -v | head -n1 | cut -d' ' -f2 | cut -d'.' -f1,2)-fpm.sock;
+    }
+}
+NGINX
+    ln -sf "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/"
+
+    if [ "$TYPE" == "--wordpress" ]; then
+        echo "Setting up WordPress for $DOMAIN"
+        # Create WP database and user
+        WP_DB_NAME=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_wp
+        WP_DB_USER=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_usr
+        WP_DB_PASS=$(openssl rand -base64 16)
+        
+        mysql -u mailuser -p"$DB_PASS" mailserver <<MYSQL_WP
+CREATE DATABASE $WP_DB_NAME;
+CREATE USER '$WP_DB_USER'@'localhost' IDENTIFIED BY '$WP_DB_PASS';
+GRANT ALL PRIVILEGES ON $WP_DB_NAME.* TO '$WP_DB_USER'@'localhost';
+FLUSH PRIVILEGES;
+MYSQL_WP
+
+        # Download and configure WordPress
+        cd "$WEB_ROOT"
+        wp core download --allow-root
+        wp config create --dbname="$WP_DB_NAME" --dbuser="$WP_DB_USER" --dbpass="$WP_DB_PASS" --allow-root
+        wp core install --url="http://$DOMAIN" --title="Welcome to $DOMAIN" --admin_user="admin" --admin_password="password" --admin_email="admin@$DOMAIN" --skip-email --allow-root
+        chown -R www-data:www-data "$WEB_ROOT"
+        echo "WordPress installed. User: admin, Pass: password"
+    else
+        echo "Creating blank site for $DOMAIN"
+        echo "<h1>Welcome to $DOMAIN</h1>" > "$WEB_ROOT/index.html"
+        chown www-data:www-data "$WEB_ROOT/index.html"
+    fi
+    
+    # 4. Get SSL and reload Nginx
+    certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect --quiet
+    systemctl reload nginx
+    echo '{"status": "success", "message": "Domain '$DOMAIN' added successfully."}'
+}
+
+delete_domain() {
+    echo "Deleting domain: $DOMAIN"
+    # 1. Remove from mail server database
+    mysql -u mailuser -p"$DB_PASS" mailserver -e "DELETE FROM virtual_domains WHERE name = '$DOMAIN';"
+    
+    # 2. Delete Nginx config
+    rm -f "/etc/nginx/sites-enabled/$DOMAIN"
+    rm -f "/etc/nginx/sites-available/$DOMAIN"
+    
+    # 3. Delete web directory
+    rm -rf "/var/www/$DOMAIN"
+    
+    # 4. (Optional) Delete WordPress database
+    WP_DB_NAME=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_wp
+    mysql -u mailuser -p"$DB_PASS" mailserver -e "DROP DATABASE IF EXISTS $WP_DB_NAME;"
+    
+    systemctl reload nginx
+    echo '{"status": "success", "message": "Domain '$DOMAIN' deleted successfully."}'
+}
+
+case "$ACTION" in
+    add)
+        add_domain
+        ;;
+    delete)
+        delete_domain
+        ;;
+    *)
+        echo '{"status": "error", "message": "Invalid action."}'
+        exit 1
+        ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/manage-domain
+print_message "✓ Web console backend utility created"
+
+# ===================================================================
 # COMPLETION
 # ===================================================================
 
