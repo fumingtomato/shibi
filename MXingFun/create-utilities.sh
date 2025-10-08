@@ -955,9 +955,9 @@ chmod +x /usr/local/bin/mailwizz-info
 
 print_header "Creating Web Console Backend Utility"
 
-cat > /usr/local/bin/manage-domain <<'EOF'
+sudo cat > /usr/local/bin/manage-domain <<'EOF'
 #!/bin/bash
-# Backend utility for web console domain management
+# Backend utility for web console domain management (v2 - JSON output only)
 
 ACTION=$1
 DOMAIN=$2
@@ -968,13 +968,13 @@ if [ -z "$ACTION" ] || [ -z "$DOMAIN" ]; then
     exit 1
 fi
 
-# Load mail server config
+# Load mail server config and DB password
 source /etc/mail-config/install.conf
-# Load DB password
 DB_PASS=$(cat /etc/mail-config/db_password)
 
 add_domain() {
-    echo "Adding domain: $DOMAIN"
+    # Send progress to standard error so it doesn't corrupt JSON output
+    echo "Adding domain: $DOMAIN" >&2
     
     # 1. Add to mail server database
     mysql -u mailuser -p"$DB_PASS" mailserver -e "INSERT IGNORE INTO virtual_domains (name) VALUES ('$DOMAIN');"
@@ -985,6 +985,7 @@ add_domain() {
     chown www-data:www-data "$WEB_ROOT"
 
     # 3. Create Nginx config
+    PHP_SOCK_PATH=$(find /var/run/php/ -name "php*-fpm.sock" | head -n 1)
     cat > "/etc/nginx/sites-available/$DOMAIN" <<NGINX
 server {
     listen 80;
@@ -996,15 +997,14 @@ server {
     }
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php\$(php -v | head -n1 | cut -d' ' -f2 | cut -d'.' -f1,2)-fpm.sock;
+        fastcgi_pass unix:$PHP_SOCK_PATH;
     }
 }
 NGINX
     ln -sf "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/"
 
     if [ "$TYPE" == "--wordpress" ]; then
-        echo "Setting up WordPress for $DOMAIN"
-        # Create WP database and user
+        echo "Setting up WordPress for $DOMAIN" >&2
         WP_DB_NAME=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_wp
         WP_DB_USER=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_usr
         WP_DB_PASS=$(openssl rand -base64 16)
@@ -1016,15 +1016,14 @@ GRANT ALL PRIVILEGES ON $WP_DB_NAME.* TO '$WP_DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 MYSQL_WP
 
-        # Download and configure WordPress
         cd "$WEB_ROOT"
-        wp core download --allow-root
-        wp config create --dbname="$WP_DB_NAME" --dbuser="$WP_DB_USER" --dbpass="$WP_DB_PASS" --allow-root
-        wp core install --url="http://$DOMAIN" --title="Welcome to $DOMAIN" --admin_user="admin" --admin_password="password" --admin_email="admin@$DOMAIN" --skip-email --allow-root
+        /usr/local/bin/wp core download --allow-root
+        /usr/local/bin/wp config create --dbname="$WP_DB_NAME" --dbuser="$WP_DB_USER" --dbpass="$WP_DB_PASS" --allow-root
+        /usr/local/bin/wp core install --url="http://$DOMAIN" --title="Welcome to $DOMAIN" --admin_user="admin" --admin_password="password" --admin_email="admin@$DOMAIN" --skip-email --allow-root
         chown -R www-data:www-data "$WEB_ROOT"
-        echo "WordPress installed. User: admin, Pass: password"
+        echo "WordPress installed. User: admin, Pass: password" >&2
     else
-        echo "Creating blank site for $DOMAIN"
+        echo "Creating blank site for $DOMAIN" >&2
         echo "<h1>Welcome to $DOMAIN</h1>" > "$WEB_ROOT/index.html"
         chown www-data:www-data "$WEB_ROOT/index.html"
     fi
@@ -1032,40 +1031,26 @@ MYSQL_WP
     # 4. Get SSL and reload Nginx
     certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect --quiet
     systemctl reload nginx
+    # Final JSON output
     echo '{"status": "success", "message": "Domain '$DOMAIN' added successfully."}'
 }
 
 delete_domain() {
-    echo "Deleting domain: $DOMAIN"
-    # 1. Remove from mail server database
+    echo "Deleting domain: $DOMAIN" >&2
     mysql -u mailuser -p"$DB_PASS" mailserver -e "DELETE FROM virtual_domains WHERE name = '$DOMAIN';"
-    
-    # 2. Delete Nginx config
     rm -f "/etc/nginx/sites-enabled/$DOMAIN"
     rm -f "/etc/nginx/sites-available/$DOMAIN"
-    
-    # 3. Delete web directory
     rm -rf "/var/www/$DOMAIN"
-    
-    # 4. (Optional) Delete WordPress database
     WP_DB_NAME=$(echo "$DOMAIN" | tr . _ | cut -c1-16)_wp
     mysql -u mailuser -p"$DB_PASS" mailserver -e "DROP DATABASE IF EXISTS $WP_DB_NAME;"
-    
     systemctl reload nginx
     echo '{"status": "success", "message": "Domain '$DOMAIN' deleted successfully."}'
 }
 
 case "$ACTION" in
-    add)
-        add_domain
-        ;;
-    delete)
-        delete_domain
-        ;;
-    *)
-        echo '{"status": "error", "message": "Invalid action."}'
-        exit 1
-        ;;
+    add) add_domain ;;
+    delete) delete_domain ;;
+    *) echo '{"status": "error", "message": "Invalid action."}'; exit 1 ;;
 esac
 EOF
 
