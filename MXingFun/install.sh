@@ -651,8 +651,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     > /dev/null 2>&1
 
 # Install WP-CLI for web console functionality
-echo "Installing WP-CLI..."
 if [ ! -f /usr/local/bin/wp ]; then
+    echo "Installing WP-CLI..."
     wget https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -q -O /usr/local/bin/wp
     chmod +x /usr/local/bin/wp
     print_message "✓ WP-CLI installed"
