@@ -288,6 +288,10 @@ ALL ALL=(root) NOPASSWD: /bin/cat /root/.mail_db_password
 ALL ALL=(root) NOPASSWD: /bin/cat /root/mail-installer/install.conf
 SUDOERS
 
+# ADD THIS LINE FOR THE NEW WEB CONSOLE
+www-data ALL=(root) NOPASSWD: /usr/local/bin/manage-domain
+SUDOERS
+
 chmod 440 /etc/sudoers.d/mail-commands
 
 # ===================================================================
